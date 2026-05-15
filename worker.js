@@ -170,6 +170,310 @@ function getMimeType(filename) {
 }
 
 /**
+ * Safely decode a URL pathname segment/path for R2 keys.
+ * Browsers percent-encode non-ASCII path chars (for example Chinese names),
+ * while R2 keys are stored as the original UTF-8 strings.
+ */
+function safeDecodePath(path) {
+  try {
+    return decodeURIComponent(path);
+  } catch (e) {
+    return path;
+  }
+}
+
+/**
+ * Encode filename for Content-Disposition according to RFC 5987.
+ */
+function encodeRFC5987ValueChars(value) {
+  return encodeURIComponent(value).replace(/['()*]/g, char =>
+    '%' + char.charCodeAt(0).toString(16).toUpperCase()
+  );
+}
+
+function createAttachmentDisposition(filename) {
+  const fallback = filename
+    .replace(/[^\x20-\x7E]/g, '_')
+    .replace(/["\\]/g, '_') || 'download';
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeRFC5987ValueChars(filename)}`;
+}
+
+function createInlineDisposition(filename) {
+  const fallback = filename
+    .replace(/[^\x20-\x7E]/g, '_')
+    .replace(/["\\]/g, '_') || 'preview';
+  return `inline; filename="${fallback}"; filename*=UTF-8''${encodeRFC5987ValueChars(filename)}`;
+}
+
+const DIRECTORY_CACHE_PREFIX = 'cache:dir:';
+
+function normalizeDirectoryPath(path) {
+  let normalized = path || '/';
+  if (!normalized.startsWith('/')) normalized = '/' + normalized;
+  normalized = normalized.replace(/\/+/g, '/');
+  if (normalized.length > 1 && normalized.endsWith('/')) {
+    normalized = normalized.slice(0, -1);
+  }
+  return normalized || '/';
+}
+
+function normalizeItemPath(path) {
+  let normalized = path || '/';
+  if (!normalized.startsWith('/')) normalized = '/' + normalized;
+  normalized = normalized.replace(/\/+/g, '/');
+  if (normalized.length > 1 && normalized.endsWith('/')) {
+    normalized = normalized.slice(0, -1);
+  }
+  return normalized;
+}
+
+function directoryPathToR2Prefix(path) {
+  const normalized = normalizeDirectoryPath(path);
+  return normalized === '/' ? '' : normalized.slice(1) + '/';
+}
+
+function r2KeyToPath(key) {
+  return normalizeItemPath('/' + (key || '').replace(/^\/+/, ''));
+}
+
+function parentPathFromItemPath(path) {
+  const normalized = normalizeItemPath(path);
+  if (normalized === '/') return '/';
+  const slashIndex = normalized.lastIndexOf('/');
+  return slashIndex <= 0 ? '/' : normalized.slice(0, slashIndex);
+}
+
+function nameFromItemPath(path) {
+  const normalized = normalizeItemPath(path);
+  if (normalized === '/') return '';
+  return normalized.slice(normalized.lastIndexOf('/') + 1);
+}
+
+function parentPathFromR2Key(key) {
+  return parentPathFromItemPath(r2KeyToPath(key));
+}
+
+function isoDateString(value) {
+  if (!value) return new Date().toISOString();
+  if (typeof value.toISOString === 'function') return value.toISOString();
+  return new Date(value).toISOString();
+}
+
+function cacheItemsToResponse(items, currentPath) {
+  const folders = [];
+  const files = [];
+
+  for (const item of items) {
+    if (item.itemType === 'folder') {
+      folders.push({
+        name: item.name,
+        path: item.path
+      });
+    } else {
+      files.push({
+        name: item.name,
+        path: item.path,
+        size: item.size || 0,
+        sizeFormatted: formatFileSize(item.size || 0),
+        lastModified: item.lastModified,
+        previewType: item.previewType || null
+      });
+    }
+  }
+
+  folders.sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
+  files.sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
+
+  return { success: true, files, folders, currentPath };
+}
+
+async function listDirectoryFromR2(env, dirPath) {
+  const currentPath = normalizeDirectoryPath(dirPath);
+  const prefix = directoryPathToR2Prefix(currentPath);
+  const folderMap = new Map();
+  const fileMap = new Map();
+  let cursor;
+
+  do {
+    const listed = await env.R2_BUCKET.list({ prefix, delimiter: '/', cursor });
+
+    if (listed.delimitedPrefixes) {
+      for (const folderPath of listed.delimitedPrefixes) {
+        const path = r2KeyToPath(folderPath.slice(0, -1));
+        const name = folderPath.slice(prefix.length, -1);
+        if (name) {
+          folderMap.set(path, {
+            itemType: 'folder',
+            name,
+            path,
+            parentPath: currentPath,
+            r2Key: folderPath.slice(0, -1),
+            size: 0,
+            contentType: null,
+            previewType: null,
+            lastModified: null
+          });
+        }
+      }
+    }
+
+    if (listed.objects) {
+      for (const obj of listed.objects) {
+        const name = obj.key.slice(prefix.length);
+        if (!name || name === '.folder' || name.includes('/')) continue;
+
+        const path = r2KeyToPath(obj.key);
+        fileMap.set(path, {
+          itemType: 'file',
+          name,
+          path,
+          parentPath: currentPath,
+          r2Key: obj.key,
+          size: obj.size || 0,
+          contentType: obj.httpMetadata?.contentType || getMimeType(name),
+          previewType: getPreviewType(name),
+          lastModified: isoDateString(obj.uploaded)
+        });
+      }
+    }
+
+    cursor = listed.truncated ? listed.cursor : null;
+  } while (cursor);
+
+  const items = [...folderMap.values(), ...fileMap.values()];
+  return {
+    ...cacheItemsToResponse(items, currentPath),
+    items
+  };
+}
+
+function directoryCacheKey(dirPath) {
+  return DIRECTORY_CACHE_PREFIX + normalizeDirectoryPath(dirPath);
+}
+
+async function readDirectoryCache(env, dirPath) {
+  const currentPath = normalizeDirectoryPath(dirPath);
+  const cachedValue = await env.KV_STORE.get(directoryCacheKey(currentPath), 'json');
+  let cached = cachedValue;
+
+  if (!cached) return null;
+  if (typeof cached === 'string') {
+    cached = JSON.parse(cached);
+  }
+  if (cached.currentPath !== currentPath) return null;
+
+  const files = Array.isArray(cached.files) ? cached.files : [];
+  const folders = Array.isArray(cached.folders) ? cached.folders : [];
+  return {
+    success: true,
+    files,
+    folders,
+    currentPath,
+    cached: true,
+    refreshedAt: cached.refreshedAt || null
+  };
+}
+
+async function writeDirectoryCache(env, dirPath, listing) {
+  const currentPath = normalizeDirectoryPath(dirPath);
+  const payload = {
+    success: true,
+    files: listing.files || [],
+    folders: listing.folders || [],
+    currentPath,
+    refreshedAt: Date.now()
+  };
+
+  await env.KV_STORE.put(directoryCacheKey(currentPath), JSON.stringify(payload));
+  return {
+    ...payload,
+    cached: false
+  };
+}
+
+async function deleteDirectoryCache(env, dirPath) {
+  await env.KV_STORE.delete(directoryCacheKey(dirPath));
+}
+
+async function deleteDirectoryCacheTree(env, dirPath) {
+  const currentPath = normalizeDirectoryPath(dirPath);
+  const exactKey = directoryCacheKey(currentPath);
+  const prefix = currentPath === '/'
+    ? DIRECTORY_CACHE_PREFIX
+    : exactKey + '/';
+
+  await env.KV_STORE.delete(exactKey);
+
+  let cursor;
+  do {
+    const listed = await env.KV_STORE.list({ prefix, cursor });
+    const keys = listed.keys || [];
+    for (const key of keys) {
+      await env.KV_STORE.delete(key.name);
+    }
+    cursor = listed.list_complete ? null : listed.cursor;
+  } while (cursor);
+}
+
+async function invalidateCachePath(env, path) {
+  try {
+    const itemPath = normalizeItemPath(path);
+    const parentPath = parentPathFromItemPath(itemPath);
+    await deleteDirectoryCache(env, parentPath);
+    await deleteDirectoryCacheTree(env, itemPath);
+  } catch (e) {
+    console.warn('KV directory cache invalidation failed:', e.message);
+  }
+}
+
+async function refreshDirectoryCache(env, dirPath) {
+  const currentPath = normalizeDirectoryPath(dirPath);
+  const listing = await listDirectoryFromR2(env, currentPath);
+
+  try {
+    const previous = await readDirectoryCache(env, currentPath).catch(() => null);
+    const newFolderPaths = new Set((listing.folders || []).map(folder => folder.path));
+
+    if (previous) {
+      for (const folder of previous.folders || []) {
+        if (!newFolderPaths.has(folder.path)) {
+          await deleteDirectoryCacheTree(env, folder.path);
+        }
+      }
+    }
+
+    return await writeDirectoryCache(env, currentPath, listing);
+  } catch (e) {
+    console.warn('KV directory cache refresh failed:', e.message);
+    return {
+      success: true,
+      files: listing.files,
+      folders: listing.folders,
+      currentPath,
+      cached: false,
+      cacheWarning: e.message
+    };
+  }
+}
+
+async function syncFileCacheIfParentCached(env, key, metadata = {}) {
+  try {
+    await deleteDirectoryCache(env, parentPathFromR2Key(key));
+  } catch (e) {
+    console.warn('KV file cache sync failed:', e.message);
+  }
+}
+
+async function syncFolderCacheIfParentCached(env, key) {
+  try {
+    const path = r2KeyToPath(key);
+    await deleteDirectoryCache(env, parentPathFromItemPath(path));
+  } catch (e) {
+    console.warn('KV folder cache sync failed:', e.message);
+  }
+}
+
+/**
  * Check if file is previewable
  */
 function getPreviewType(filename) {
@@ -348,47 +652,36 @@ async function handleListFiles(request, env, path) {
   if (auth instanceof Response) return auth;
   
   try {
-    // Normalize path
-    let prefix = path || '';
-    if (prefix && !prefix.endsWith('/')) prefix += '/';
-    if (prefix.startsWith('/')) prefix = prefix.slice(1);
-    
-    const listed = await env.R2_BUCKET.list({ prefix, delimiter: '/' });
-    
-    const files = [];
-    const folders = [];
-    
-    // Process folders (common prefixes)
-    if (listed.delimitedPrefixes) {
-      for (const folderPath of listed.delimitedPrefixes) {
-        const name = folderPath.slice(prefix.length, -1);
-        if (name) {
-          folders.push({ name, path: '/' + folderPath.slice(0, -1) });
-        }
-      }
+    const currentPath = normalizeDirectoryPath(path);
+    let cached = null;
+    try {
+      cached = await readDirectoryCache(env, currentPath);
+    } catch (cacheError) {
+      console.warn('KV directory cache read failed:', cacheError.message);
     }
-    
-    // Process files
-    if (listed.objects) {
-      for (const obj of listed.objects) {
-        const name = obj.key.slice(prefix.length);
-        if (name && !name.includes('/')) {
-          const previewType = getPreviewType(name);
-          files.push({
-            name,
-            path: '/' + obj.key,
-            size: obj.size,
-            sizeFormatted: formatFileSize(obj.size),
-            lastModified: obj.uploaded.toISOString(),
-            previewType
-          });
-        }
-      }
+
+    if (cached) {
+      return jsonResponse(cached);
     }
-    
-    return jsonResponse({ success: true, files, folders, currentPath: '/' + prefix.slice(0, -1) || '/' });
+
+    const fresh = await refreshDirectoryCache(env, currentPath);
+    return jsonResponse(fresh);
   } catch (e) {
     return jsonResponse({ success: false, message: '获取文件列表失败: ' + e.message }, 500);
+  }
+}
+
+async function handleRefreshDirectoryCache(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const body = await request.json().catch(() => ({}));
+    const currentPath = normalizeDirectoryPath(body.path || '/');
+    const refreshed = await refreshDirectoryCache(env, currentPath);
+    return jsonResponse(refreshed);
+  } catch (e) {
+    return jsonResponse({ success: false, message: '刷新缓存失败: ' + e.message }, 500);
   }
 }
 
@@ -413,6 +706,12 @@ async function handleUploadFile(request, env, path) {
     
     await env.R2_BUCKET.put(key, file.stream(), {
       httpMetadata: { contentType: file.type || getMimeType(file.name) }
+    });
+
+    await syncFileCacheIfParentCached(env, key, {
+      size: file.size || 0,
+      contentType: file.type || getMimeType(file.name),
+      lastModified: new Date().toISOString()
     });
     
     return jsonResponse({ success: true, message: '文件上传成功', path: '/' + key });
@@ -446,6 +745,7 @@ async function handleDeleteFile(request, env, path) {
     
     // Try to delete the file itself
     await env.R2_BUCKET.delete(key);
+    await invalidateCachePath(env, r2KeyToPath(key));
     
     return jsonResponse({ success: true, message: '删除成功' });
   } catch (e) {
@@ -473,18 +773,61 @@ async function handleRenameFile(request, env, path) {
     
     // Get the old file
     const oldObject = await env.R2_BUCKET.get(oldKey);
-    if (!oldObject) {
+    if (oldObject) {
+      // Copy to new location
+      await env.R2_BUCKET.put(newKey, oldObject.body, {
+        httpMetadata: oldObject.httpMetadata
+      });
+
+      // Delete old file
+      await env.R2_BUCKET.delete(oldKey);
+      await invalidateCachePath(env, r2KeyToPath(oldKey));
+
+      const newObject = await env.R2_BUCKET.head(newKey);
+      await syncFileCacheIfParentCached(env, newKey, {
+        size: newObject?.size || oldObject.size || 0,
+        contentType: newObject?.httpMetadata?.contentType || oldObject.httpMetadata?.contentType || getMimeType(newName),
+        lastModified: isoDateString(newObject?.uploaded || new Date())
+      });
+
+      return jsonResponse({ success: true, message: '重命名成功', newPath: '/' + newKey });
+    }
+
+    const oldPrefix = oldKey.endsWith('/') ? oldKey : oldKey + '/';
+    const folderCheck = await env.R2_BUCKET.list({ prefix: oldPrefix, limit: 1 });
+    if (!folderCheck.objects || folderCheck.objects.length === 0) {
       return jsonResponse({ success: false, message: '文件不存在' }, 404);
     }
-    
-    // Copy to new location
-    await env.R2_BUCKET.put(newKey, oldObject.body, {
-      httpMetadata: oldObject.httpMetadata
-    });
-    
-    // Delete old file
-    await env.R2_BUCKET.delete(oldKey);
-    
+
+    const newPrefix = newKey.endsWith('/') ? newKey : newKey + '/';
+    let cursor;
+    do {
+      const batch = await env.R2_BUCKET.list({ prefix: oldPrefix, cursor });
+      const oldKeys = [];
+
+      if (batch.objects && batch.objects.length > 0) {
+        for (const obj of batch.objects) {
+          const targetKey = newPrefix + obj.key.slice(oldPrefix.length);
+          const source = await env.R2_BUCKET.get(obj.key);
+          if (source) {
+            await env.R2_BUCKET.put(targetKey, source.body, {
+              httpMetadata: source.httpMetadata
+            });
+            oldKeys.push(obj.key);
+          }
+        }
+      }
+
+      if (oldKeys.length > 0) {
+        await env.R2_BUCKET.delete(oldKeys);
+      }
+
+      cursor = batch.truncated ? batch.cursor : null;
+    } while (cursor);
+
+    await invalidateCachePath(env, r2KeyToPath(oldKey));
+    await syncFolderCacheIfParentCached(env, newKey);
+
     return jsonResponse({ success: true, message: '重命名成功', newPath: '/' + newKey });
   } catch (e) {
     return jsonResponse({ success: false, message: '重命名失败: ' + e.message }, 500);
@@ -508,6 +851,7 @@ async function handleCreateFolder(request, env) {
     
     // Create an empty placeholder file to represent the folder
     await env.R2_BUCKET.put(folderPath + '.folder', new Uint8Array(0));
+    await syncFolderCacheIfParentCached(env, folderPath.slice(0, -1));
     
     return jsonResponse({ success: true, message: '文件夹创建成功', path: '/' + folderPath.slice(0, -1) });
   } catch (e) {
@@ -535,7 +879,7 @@ async function handleDownloadFile(request, env, path) {
     return new Response(object.body, {
       headers: {
         'Content-Type': object.httpMetadata?.contentType || getMimeType(filename),
-        'Content-Disposition': `attachment; filename="${encodeURIComponent(filename)}"`,
+        'Content-Disposition': createAttachmentDisposition(filename),
         'Content-Length': object.size
       }
     });
@@ -555,20 +899,40 @@ async function handlePreviewFile(request, env, path) {
     let key = path || '';
     if (key.startsWith('/')) key = key.slice(1);
     
-    const object = await env.R2_BUCKET.get(key);
+    const object = await env.R2_BUCKET.get(key, {
+      range: request.headers
+    });
     if (!object) {
       return jsonResponse({ success: false, message: '文件不存在' }, 404);
     }
     
     const filename = key.split('/').pop();
     const contentType = object.httpMetadata?.contentType || getMimeType(filename);
+    const headers = new Headers({
+      'Content-Type': contentType,
+      'Content-Disposition': createInlineDisposition(filename),
+      'Cache-Control': 'private, max-age=3600',
+      'Accept-Ranges': 'bytes'
+    });
+
+    if (object.httpEtag) {
+      headers.set('ETag', object.httpEtag);
+    }
+
+    if (object.range && typeof object.range.offset === 'number') {
+      const end = object.range.end ?? object.size - 1;
+      headers.set('Content-Range', `bytes ${object.range.offset}-${end}/${object.size}`);
+      headers.set('Content-Length', String(end - object.range.offset + 1));
+      return new Response(object.body, {
+        status: 206,
+        headers
+      });
+    }
+
+    headers.set('Content-Length', String(object.size));
     
     return new Response(object.body, {
-      headers: {
-        'Content-Type': contentType,
-        'Content-Length': object.size,
-        'Cache-Control': 'private, max-age=3600'
-      }
+      headers
     });
   } catch (e) {
     return jsonResponse({ success: false, message: '预览失败: ' + e.message }, 500);
@@ -710,7 +1074,7 @@ async function handleShareDownload(request, env, shareId) {
     return new Response(object.body, {
       headers: {
         'Content-Type': object.httpMetadata?.contentType || getMimeType(share.fileName),
-        'Content-Disposition': `attachment; filename="${encodeURIComponent(share.fileName)}"`,
+        'Content-Disposition': createAttachmentDisposition(share.fileName),
         'Content-Length': object.size
       }
     });
@@ -1800,7 +2164,7 @@ const LOGIN_PAGE = `
     <div class="login-card">
       <div class="login-header">
         <div class="login-logo">EdgeStash</div>
-        <div class="login-subtitle">基于 Cloudflare 的云盘服务</div>
+        <div class="logibtitle">基于 Cloudflare 的云盘服务</div>
       </div>
       
       <div class="login-tabs">
@@ -1811,7 +2175,7 @@ const LOGIN_PAGE = `
       <form id="loginForm" onsubmit="handleLogin(event)">
         <div id="emailField" class="form-group" style="display: none;">
           <label class="form-label">邮箱</label>
-          <input type="email" id="email" class="form-input" placeholder="请输入邮箱">
+          <input type="l" id="email" class="form-input" placeholder="请输入邮箱">
         </div>
         
         <div class="form-group">
@@ -1828,8 +2192,7 @@ const LOGIN_PAGE = `
   
   <div class="toast-container" id="toastContainer"></div>
   
-  <script>
-    let isAdminLogin = true;
+   let isAdminLogin = true;
     
     function switchLoginTab(type) {
       isAdminLogin = type === 'admin';
@@ -1874,7 +2237,7 @@ const LOGIN_PAGE = `
     function showToast(message, type = 'info') {
       const container = document.getElementById('toastContainer');
       const toast = document.createElement('div');
-      toast.className = 'toast toast-' + type;
+      toast.className = 'toast t type;
       toast.textContent = message;
       container.appendChild(toast);
       
@@ -1896,7 +2259,7 @@ const INDEX_PAGE = `
   <title>EdgeStash - 云盘</title>
   ${CSS_STYLES}
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
+  <script src="https://cdn.jsdelivt/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
 </head>
 <body>
   <div class="header">
@@ -1923,7 +2286,7 @@ const INDEX_PAGE = `
     <div class="card">
       <div id="fileList" class="file-grid"></div>
       <div id="emptyState" class="empty-state" style="display: none;">
-        <div class="empty-icon">📂</div>
+        <div class="empon">📂</div>
         <div>此文件夹为空</div>
       </div>
     </div>
@@ -1938,7 +2301,7 @@ const INDEX_PAGE = `
       </div>
       <form onsubmit="createFolder(event)">
         <div class="form-group">
-          <label class="form-label">文件夹名称</label>
+          <label class="form-label">文件夹名称label>
           <input type="text" id="folderName" class="form-input" placeholder="请输入文件夹名称" required>
         </div>
         <button type="submit" class="btn btn-primary" style="width: 100%;">创建</button>
@@ -1951,7 +2314,7 @@ const INDEX_PAGE = `
     <div class="modal">
       <div class="modal-header">
         <div class="modal-title">重命名</div>
-        <button class="modal-close" onclick="closeModal('renameModal')">&times;</button>
+        <button class="modal-close" onclick="closeModal('renameModal')">utton>
       </div>
       <form onsubmit="renameFile(event)">
         <div class="form-group">
@@ -1967,7 +2330,7 @@ const INDEX_PAGE = `
   <!-- Share Modal -->
   <div class="modal-overlay" id="shareModal">
     <div class="modal">
-      <div class="modal-header">
+  lass="modal-header">
         <div class="modal-title">创建分享链接</div>
         <button class="modal-close" onclick="closeModal('shareModal')">&times;</button>
       </div>
@@ -1977,7 +2340,7 @@ const INDEX_PAGE = `
           <input type="text" id="sharePassword" class="form-input" placeholder="可选">
         </div>
         <div class="form-group">
-          <label class="form-label">有效期</label>
+          <label class="form-label">æ
           <select id="shareExpiry" class="form-select">
             <option value="1h">1小时</option>
             <option value="1d" selected>1天</option>
@@ -1991,8 +2354,7 @@ const INDEX_PAGE = `
     </div>
   </div>
   
-  <!-- Share Result Modal -->
-  <div class="modal-overlay" id="shareResultModal">
+  <!-- Share Result iv class="modal-overlay" id="shareResultModal">
     <div class="modal">
       <div class="modal-header">
         <div class="modal-title">分享链接已创建</div>
@@ -2002,7 +2364,7 @@ const INDEX_PAGE = `
         <label class="form-label">分享链接</label>
         <input type="text" id="shareResultUrl" class="form-input" readonly>
       </div>
-      <button class="btn btn-primary" style="width: 100%;" onclick="copyShareLink()">复制链接</button>
+      <button class="btn btn-primary" style="width: 100%;" onclipyShareLink()">复制链接</button>
     </div>
   </div>
   
@@ -2031,12 +2393,24 @@ const INDEX_PAGE = `
   
   <script>
     let currentPath = '/';
+
+    function encodePathForUrl(path) {
+      if (!path || path === '/') return '/';
+      return path.split('/').map((part, index) => {
+        if (index === 0 && part === '') return '';
+        return encodeURIComponent(part);
+      }).join('/');
+    }
+
+    function apiFileUrl(prefix, path) {
+      return prefix + encodePathForUrl(path);
+    }
     
     async function checkAuth() {
       try {
         const response = await fetch('/api/auth/check');
         const data = await response.json();
-        if (!data.authenticated) {
+     (!data.authenticated) {
           window.location.href = '/login.html';
         }
       } catch (error) {
@@ -2047,7 +2421,7 @@ const INDEX_PAGE = `
     async function loadFiles() {
       showLoading(true);
       try {
-        const response = await fetch('/api/files' + currentPath);
+        const response = await fetch(apiFileUrl('/api/files', currentPath));
         const data = await response.json();
         
         if (!data.success) {
@@ -2071,7 +2445,7 @@ const INDEX_PAGE = `
       const breadcrumb = document.getElementById('breadcrumb');
       const parts = currentPath.split('/').filter(p => p);
       
-      let html = '<a href="#" class="breadcrumb-item" onclick="navigateTo(\\'/\\')">🏠 根目录</a>';
+      let html = '<a href="#" class="breadcrumb-item" ogateTo(\\'/\\')">🏠 根目录</a>';
       
       let path = '';
       parts.forEach((part, index) => {
@@ -2085,7 +2459,7 @@ const INDEX_PAGE = `
         }
       });
       
-      breadcrumb.innerHTML = html;
+      mb.innerHTML = html;
     }
     
     function renderFiles(folders, files) {
@@ -2111,7 +2485,7 @@ const INDEX_PAGE = `
             <div class="file-meta">文件夹</div>
             <div class="file-actions">
               <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation(); showRenameModal('\${folder.path}', '\${escapeHtml(folder.name)}')">重命名</button>
-              <button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); deleteFile('\${folder.path}')">删除</button>
+              <button class="btn btn-sm btn-k="event.stopPropagation(); deleteFile('\${folder.path}')">删除</button>
             </div>
           </div>
         \`;
@@ -2123,16 +2497,16 @@ const INDEX_PAGE = `
         const previewable = file.previewType ? 'true' : 'false';
         const previewType = file.previewType || '';
         html += \`
-          <div class="file-item" ondblclick="handleFileClick('\${file.path}', '\${previewType}', '\${escapeHtml(file.name)}')" data-previewable="\${previewable}">
+          <div class="file-item" ondblclick="handleFileClick('\${file.path}', '\${previewType}', '\${escapeHtml(file.name)}')" data-preview="\${previewable}">
             <div class="file-icon">\${icon}</div>
             <div class="file-name">\${escapeHtml(file.name)}</div>
             <div class="file-meta">\${file.sizeFormatted}\${previewType ? ' <span class="badge badge-info">可预览</span>' : ''}</div>
             <div class="file-actions">
-              \${previewType ? '<button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); previewFile(\\'' + file.path + '\\', \\'' + previewType + '\\', \\'' + escapeHtml(file.name) + '\\')">预览</button>' : ''}
+              \${previewType ? '<button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); previewFile(\\'' + file.path + '\\', \\'' + previewType + '\\', \\'' + escapeHtml(file.name) +">预览</button>' : ''}
               <button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); downloadFile('\${file.path}')">下载</button>
               <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation(); showShareModal('\${file.path}')">分享</button>
               <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation(); showRenameModal('\${file.path}', '\${escapeHtml(file.name)}')">重命名</button>
-              <button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); deleteFile('\${file.path}')">删除</button>
+              <button class="btn btn-sm btn-nger" onclick="event.stopPropagation(); deleteFile('\${file.path}')">删除</button>
             </div>
           </div>
         \`;
@@ -2152,7 +2526,7 @@ const INDEX_PAGE = `
     function getFileIcon(filename) {
       const ext = filename.split('.').pop().toLowerCase();
       const icons = {
-        'pdf': '📕',
+    'pdf': '📕',
         'doc': '📘', 'docx': '📘',
         'xls': '📗', 'xlsx': '📗',
         'ppt': '📙', 'pptx': '📙',
@@ -2160,7 +2534,7 @@ const INDEX_PAGE = `
         'mp3': '🎵', 'wav': '🎵', 'flac': '🎵',
         'mp4': '🎬', 'avi': '🎬', 'mkv': '🎬', 'mov': '🎬',
         'zip': '📦', 'rar': '📦', '7z': '📦', 'tar': '📦', 'gz': '📦',
-        'js': '📜', 'ts': '📜', 'py': '📜', 'java': '📜', 'cpp': '📜', 'c': '📜',
+        'js': '📜', 'ts': '📜', 'py': '📜', 'java': 📜', 'c': '📜',
         'html': '🌐', 'css': '🎨', 'json': '📋',
         'txt': '📄', 'md': '📝'
       };
@@ -2177,7 +2551,7 @@ const INDEX_PAGE = `
     async function previewFile(path, previewType, filename) {
       const overlay = document.getElementById('previewOverlay');
       const content = document.getElementById('previewContent');
-      const filenameEl = document.getElementById('previewFilename');
+      const fiocument.getElementById('previewFilename');
       const downloadBtn = document.getElementById('previewDownloadBtn');
       
       filenameEl.textContent = filename;
@@ -2188,10 +2562,10 @@ const INDEX_PAGE = `
       overlay.classList.add('active');
       
       try {
-        const previewUrl = '/api/preview' + path;
+        const previewUrl = apiFileUrl('/api/preview', path);
         
         switch (previewType) {
-          case 'image':
+    case 'image':
             content.innerHTML = '<img class="preview-image" src="' + previewUrl + '" alt="' + escapeHtml(filename) + '">';
             break;
             
@@ -2272,7 +2646,7 @@ const INDEX_PAGE = `
           const formData = new FormData();
           formData.append('file', file);
           
-          const response = await fetch('/api/files' + currentPath, {
+          const response = await fetch(apiFileUrl('/api/files', currentPath), {
             method: 'POST',
             body: formData
           });
@@ -2284,7 +2658,7 @@ const INDEX_PAGE = `
           } else {
             showToast('文件 ' + file.name + ' 上传失败: ' + data.message, 'error');
           }
-        } catch (error) {
+    tch (error) {
           showToast('文件 ' + file.name + ' 上传失败: ' + error.message, 'error');
         }
       }
@@ -2301,8 +2675,7 @@ const INDEX_PAGE = `
     async function createFolder(event) {
       event.preventDefault();
       const name = document.getElementById('folderName').value.trim();
-      
-      if (!name) {
+     !name) {
         showToast('请输入文件夹名称', 'error');
         return;
       }
@@ -2337,8 +2710,7 @@ const INDEX_PAGE = `
     }
     
     function showRenameModal(path, currentName) {
-      document.getElementById('renameFilePath').value = path;
-      document.getElementById('newFileName').value = currentName;
+      document.getElementById('renameFilePath').v     document.getElementById('newFileName').value = currentName;
       document.getElementById('renameModal').classList.add('active');
     }
     
@@ -2353,10 +2725,10 @@ const INDEX_PAGE = `
       }
       
       showLoading(true);
-      closeModal('renameModal');
+      closeModal('r;
       
       try {
-        const response = await fetch('/api/files' + path, {
+        const response = await fetch(apiFileUrl('/api/files', path), {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ newName })
@@ -2371,7 +2743,7 @@ const INDEX_PAGE = `
           showToast('重命名失败: ' + data.message, 'error');
         }
       } catch (error) {
-        showToast('重命名失败: ' + error.message, 'error');
+        shast('重命名失败: ' + error.message, 'error');
       } finally {
         showLoading(false);
       }
@@ -2383,7 +2755,7 @@ const INDEX_PAGE = `
       showLoading(true);
       
       try {
-        const response = await fetch('/api/files' + path, {
+        const response = await fetch(apiFileUrl('/api/files', path), {
           method: 'DELETE'
         });
         
@@ -2403,7 +2775,7 @@ const INDEX_PAGE = `
     }
     
     async function downloadFile(path) {
-      window.open('/api/download' + path, '_blank');
+      window.open(apiFileUrl('/api/download', path), '_blank');
     }
     
     function showShareModal(path) {
@@ -2452,7 +2824,7 @@ const INDEX_PAGE = `
       showToast('链接已复制到剪贴板', 'success');
     }
     
-    async function logout() {
+    asc function logout() {
       try {
         await fetch('/api/logout', { method: 'POST' });
         window.location.href = '/login.html';
@@ -2509,7 +2881,7 @@ const ADMIN_PAGE = `
     <div class="logo">EdgeStash 管理后台</div>
     <div class="header-actions">
       <button class="btn btn-secondary" onclick="window.location.href='/'">返回云盘</button>
-      <button class="btn btn-secondary" onclick="logout()">退出登录</button>
+      <button class="btn btn-secondlick="logout()">退出登录</button>
     </div>
   </div>
   
@@ -2555,7 +2927,7 @@ const ADMIN_PAGE = `
                 <th>下载次数</th>
                 <th>状态</th>
                 <th>操作</th>
-              </tr>
+        </tr>
             </thead>
             <tbody id="sharesTable"></tbody>
           </table>
@@ -2573,7 +2945,7 @@ const ADMIN_PAGE = `
         <div class="table-container">
           <table>
             <thead>
-              <tr>
+          <tr>
                 <th>邮箱</th>
                 <th>角色</th>
                 <th>创建时间</th>
@@ -2601,8 +2973,7 @@ const ADMIN_PAGE = `
         </div>
         <div class="form-group">
           <label class="form-label">密码</label>
-          <input type="text" id="newUserPassword" class="form-input" placeholder="请输入密码" required>
-        </div>
+          <input type="text" id="newUserPassword" class="form-input" placeholder="请输入密码" re    </div>
         <button type="submit" class="btn btn-primary" style="width: 100%;">添加用户</button>
       </form>
     </div>
@@ -2619,7 +2990,7 @@ const ADMIN_PAGE = `
       try {
         const response = await fetch('/api/auth/check');
         const data = await response.json();
-        if (!data.authenticated || data.role !== 'admin') {
+        if (!data.authent| data.role !== 'admin') {
           window.location.href = '/login.html';
         }
       } catch (error) {
@@ -2685,8 +3056,7 @@ const ADMIN_PAGE = `
                 <button class="btn btn-sm btn-danger" onclick="deleteShare('\${share.shareId}')">删除</button>
               </td>
             </tr>
-          \`).join('');
-        }
+          \`).join(       }
       } catch (error) {
         showToast('加载分享列表失败', 'error');
       } finally {
@@ -2714,7 +3084,7 @@ const ADMIN_PAGE = `
               <td>\${user.role === 'admin' ? '管理员' : '普通用户'}</td>
               <td>\${user.createdAt ? new Date(user.createdAt).toLocaleString() : '-'}</td>
               <td>
-                <button class="btn btn-sm btn-danger" onclick="deleteUser('\${encodeURIComponent(user.email)}')">撤销授权</button>
+                <button class="btn btn-sm btn-danger" oleteUser('\${encodeURIComponent(user.email)}')">撤销授权</button>
               </td>
             </tr>
           \`).join('');
@@ -2730,8 +3100,7 @@ const ADMIN_PAGE = `
       document.getElementById('newUserEmail').value = '';
       document.getElementById('newUserPassword').value = '';
       document.getElementById('addUserModal').classList.add('active');
-    }
-    
+  
     async function addUser(event) {
       event.preventDefault();
       const email = document.getElementById('newUserEmail').value;
@@ -2764,8 +3133,7 @@ const ADMIN_PAGE = `
     
     async function deleteUser(email) {
       if (!confirm('确定要撤销该用户的授权吗？')) return;
-      
-      showLoading(true);
+       showLoading(true);
       
       try {
         const response = await fetch('/api/admin/users/' + email, {
@@ -2783,7 +3151,7 @@ const ADMIN_PAGE = `
       } catch (error) {
         showToast('删除失败: ' + error.message, 'error');
       } finally {
-        showLoading(false);
+       ng(false);
       }
     }
     
@@ -2803,7 +3171,7 @@ const ADMIN_PAGE = `
           showToast('分享链接已删除', 'success');
           loadShares();
         } else {
-          showToast('删除失败: ' + data.message, 'error');
+          showToast('å data.message, 'error');
         }
       } catch (error) {
         showToast('删除失败: ' + error.message, 'error');
@@ -2822,8 +3190,7 @@ const ADMIN_PAGE = `
     }
     
     async function logout() {
-      try {
-        await fetch('/api/logout', { method: 'POST' });
+          await fetch('/api/logout', { method: 'POST' });
         window.location.href = '/login.html';
       } catch (error) {
         window.location.href = '/login.html';
@@ -2881,8 +3248,7 @@ const SHARE_PAGE = `
         <div>加载中...</div>
       </div>
       
-      <div id="expiredState" style="display: none;">
-        <div class="share-icon">⚠️</div>
+      <div id="expiredState" style="display: noneiv class="share-icon">⚠️</div>
         <div class="share-expired">分享链接已过期或不存在</div>
         <p style="color: var(--text-muted); margin-top: 16px;">请联系分享者获取新的链接</p>
       </div>
@@ -2893,7 +3259,7 @@ const SHARE_PAGE = `
         <div class="share-filesize" id="fileSize"></div>
         
         <div id="passwordForm" style="display: none;">
-          <div class="form-group">
+      <div class="form-group">
             <label class="form-label">请输入分享密码</label>
             <input type="password" id="sharePassword" class="form-input" placeholder="输入密码">
           </div>
@@ -2909,8 +3275,7 @@ const SHARE_PAGE = `
   <div class="toast-container" id="toastContainer"></div>
   
   <script>
-    let shareId = '';
-    let requiresPassword = false;
+    let shareId = '';resPassword = false;
     
     async function loadShareInfo() {
       // Get share ID from URL
@@ -2960,7 +3325,7 @@ const SHARE_PAGE = `
       }
       
       try {
-        const response = await fetch('/api/share/' + shareId + '/download', {
+        const response = await fetch(' shareId + '/download', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ password })
@@ -2971,9 +3336,12 @@ const SHARE_PAGE = `
           const contentDisposition = response.headers.get('Content-Disposition');
           let filename = 'download';
           if (contentDisposition) {
-            const match = contentDisposition.match(/filename\\*?=(?:UTF-8'')?["']?([^"';\\n]+)/i);
-            if (match) {
-              filename = decodeURIComponent(match[1]);
+            const utf8Match = contentDisposition.match(/filename\\*=UTF-8''([^;\\n]+)/i);
+            const fallbackMatch = contentDisposition.match(/filename=["']?([^"';\\n]+)/i);
+            if (utf8Match) {
+              filename = decodeURIComponent(utf8Match[1]);
+            } else if (fallbackMatch) {
+              filename = fallbackMatch[1];
             }
           }
           
@@ -3002,7 +3370,7 @@ const SHARE_PAGE = `
       const container = document.getElementById('toastContainer');
       const toast = document.createElement('div');
       toast.className = 'toast toast-' + type;
-      toast.textContent = message;
+      toast.textContesage;
       container.appendChild(toast);
       
       setTimeout(() => {
@@ -3011,6 +3379,1313 @@ const SHARE_PAGE = `
     }
     
     // Initialize
+    loadShareInfo();
+  </script>
+</body>
+</html>
+`;
+
+const FIXED_LOGIN_PAGE = `
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录 - EdgeStash</title>
+  ${CSS_STYLES}
+</head>
+<body>
+  <div class="login-container">
+    <div class="login-card">
+      <div class="login-header">
+        <div class="login-logo">EdgeStash</div>
+        <div class="login-subtitle">基于 Cloudflare 的云盘服务</div>
+      </div>
+
+      <div class="login-tabs">
+        <button type="button" class="login-tab active" onclick="switchLoginTab('admin')">管理员登录</button>
+        <button type="button" class="login-tab" onclick="switchLoginTab('user')">用户登录</button>
+      </div>
+
+      <form id="loginForm" onsubmit="handleLogin(event)">
+        <div id="emailField" class="form-group" style="display: none;">
+          <label class="form-label" for="email">邮箱</label>
+          <input type="email" id="email" class="form-input" placeholder="请输入邮箱">
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="password">密码</label>
+          <input type="password" id="password" class="form-input" placeholder="请输入密码" required>
+        </div>
+
+        <button type="submit" class="btn btn-primary" style="width: 100%;">登录</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="toast-container" id="toastContainer"></div>
+
+  <script>
+    let isAdminLogin = true;
+
+    function switchLoginTab(type) {
+      isAdminLogin = type === 'admin';
+      const tabs = document.querySelectorAll('.login-tab');
+      tabs[0].classList.toggle('active', isAdminLogin);
+      tabs[1].classList.toggle('active', !isAdminLogin);
+      document.getElementById('emailField').style.display = isAdminLogin ? 'none' : 'block';
+    }
+
+    async function handleLogin(event) {
+      event.preventDefault();
+
+      const password = document.getElementById('password').value;
+      const email = document.getElementById('email').value.trim();
+
+      try {
+        const response = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            isAdmin: isAdminLogin,
+            email: isAdminLogin ? undefined : email,
+            password
+          })
+        });
+
+        const data = await response.json();
+        if (data.success) {
+          showToast('登录成功', 'success');
+          window.setTimeout(function () {
+            window.location.href = '/';
+          }, 300);
+        } else {
+          showToast(data.message || '登录失败', 'error');
+        }
+      } catch (error) {
+        showToast('登录失败: ' + error.message, 'error');
+      }
+    }
+
+    function showToast(message, type) {
+      const container = document.getElementById('toastContainer');
+      const toast = document.createElement('div');
+      toast.className = 'toast toast-' + (type || 'info');
+      toast.textContent = message;
+      container.appendChild(toast);
+      window.setTimeout(function () {
+        toast.remove();
+      }, 3000);
+    }
+  </script>
+</body>
+</html>
+`;
+
+const FIXED_INDEX_PAGE = `
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EdgeStash - 云盘</title>
+  ${CSS_STYLES}
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
+</head>
+<body>
+  <div class="header">
+    <div class="logo">EdgeStash</div>
+    <div class="header-actions">
+      <button type="button" class="btn btn-secondary" onclick="refreshCurrentDirectory()">刷新</button>
+      <button type="button" class="btn btn-secondary" onclick="window.location.href='/admin.html'">管理后台</button>
+      <button type="button" class="btn btn-secondary" onclick="logout()">退出登录</button>
+    </div>
+  </div>
+
+  <div class="container">
+    <div class="breadcrumb" id="breadcrumb"></div>
+
+    <div class="toolbar">
+      <button type="button" class="btn btn-primary" onclick="showNewFolderModal()">📁 新建文件夹</button>
+      <button type="button" class="btn btn-primary" onclick="document.getElementById('fileInput').click()">📤 上传文件</button>
+      <input type="file" id="fileInput" multiple style="display: none;" onchange="handleFileUpload(event)">
+    </div>
+
+    <div class="card">
+      <div id="fileList" class="file-grid"></div>
+      <div id="emptyState" class="empty-state" style="display: none;">
+        <div class="empty-icon">📂</div>
+        <div>此文件夹为空</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="newFolderModal">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">新建文件夹</div>
+        <button type="button" class="modal-close" onclick="closeModal('newFolderModal')">&times;</button>
+      </div>
+      <form onsubmit="createFolder(event)">
+        <div class="form-group">
+          <label class="form-label" for="folderName">文件夹名称</label>
+          <input type="text" id="folderName" class="form-input" placeholder="请输入文件夹名称" required>
+        </div>
+        <button type="submit" class="btn btn-primary" style="width: 100%;">创建</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="renameModal">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">重命名</div>
+        <button type="button" class="modal-close" onclick="closeModal('renameModal')">&times;</button>
+      </div>
+      <form onsubmit="renameFile(event)">
+        <div class="form-group">
+          <label class="form-label" for="newFileName">新名称</label>
+          <input type="text" id="newFileName" class="form-input" required>
+        </div>
+        <input type="hidden" id="renameFilePath">
+        <button type="submit" class="btn btn-primary" style="width: 100%;">确认</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="shareModal">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">创建分享链接</div>
+        <button type="button" class="modal-close" onclick="closeModal('shareModal')">&times;</button>
+      </div>
+      <form onsubmit="createShare(event)">
+        <div class="form-group">
+          <label class="form-label" for="sharePassword">分享密码（留空则无密码）</label>
+          <input type="text" id="sharePassword" class="form-input" placeholder="可选">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="shareExpiry">有效期</label>
+          <select id="shareExpiry" class="form-select">
+            <option value="1h">1小时</option>
+            <option value="1d" selected>1天</option>
+            <option value="1m">1个月</option>
+            <option value="permanent">永久有效</option>
+          </select>
+        </div>
+        <input type="hidden" id="shareFilePath">
+        <button type="submit" class="btn btn-primary" style="width: 100%;">创建分享链接</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="shareResultModal">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">分享链接已创建</div>
+        <button type="button" class="modal-close" onclick="closeModal('shareResultModal')">&times;</button>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="shareResultUrl">分享链接</label>
+        <input type="text" id="shareResultUrl" class="form-input" readonly>
+      </div>
+      <button type="button" class="btn btn-primary" style="width: 100%;" onclick="copyShareLink()">复制链接</button>
+    </div>
+  </div>
+
+  <div class="preview-overlay" id="previewOverlay">
+    <div class="preview-header">
+      <div class="preview-filename" id="previewFilename"></div>
+      <div class="preview-actions">
+        <button type="button" class="btn btn-primary" id="previewDownloadBtn">下载</button>
+        <button type="button" class="btn btn-secondary" onclick="closePreview()">关闭</button>
+      </div>
+    </div>
+    <div class="preview-content" id="previewContent"></div>
+  </div>
+
+  <div class="toast-container" id="toastContainer"></div>
+  <div class="loading-overlay" id="loadingOverlay" style="display: none;"><div class="spinner"></div></div>
+
+  <script>
+    let currentPath = '/';
+
+    function encodePathForUrl(path) {
+      if (!path || path === '/') return '/';
+      return path.split('/').map(function (part, index) {
+        if (index === 0 && part === '') return '';
+        return encodeURIComponent(part);
+      }).join('/');
+    }
+
+    function apiFileUrl(prefix, path) {
+      return prefix + encodePathForUrl(path);
+    }
+
+    async function checkAuth() {
+      try {
+        const response = await fetch('/api/auth/check');
+        const data = await response.json();
+        if (!data.authenticated) {
+          window.location.href = '/login.html';
+        }
+      } catch (error) {
+        window.location.href = '/login.html';
+      }
+    }
+
+    async function loadFiles() {
+      showLoading(true);
+      try {
+        const response = await fetch(apiFileUrl('/api/files', currentPath));
+        const data = await response.json();
+        if (!data.success) {
+          if (response.status === 401) {
+            window.location.href = '/login.html';
+            return;
+          }
+          throw new Error(data.message || '加载失败');
+        }
+        currentPath = data.currentPath || currentPath;
+        renderBreadcrumb();
+        renderFiles(data.folders || [], data.files || []);
+      } catch (error) {
+        showToast('加载文件失败: ' + error.message, 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    async function refreshCurrentDirectory() {
+      showLoading(true);
+      try {
+        const response = await fetch('/api/cache/refresh', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: currentPath })
+        });
+        const data = await response.json();
+        if (!data.success) {
+          throw new Error(data.message || '刷新失败');
+        }
+        currentPath = data.currentPath || currentPath;
+        renderBreadcrumb();
+        renderFiles(data.folders || [], data.files || []);
+        showToast('已刷新当前目录', 'success');
+      } catch (error) {
+        showToast('刷新失败: ' + error.message, 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    function renderBreadcrumb() {
+      const breadcrumb = document.getElementById('breadcrumb');
+      breadcrumb.replaceChildren();
+
+      const root = document.createElement('a');
+      root.href = '#';
+      root.className = 'breadcrumb-item';
+      root.textContent = '根目录';
+      root.addEventListener('click', function (event) {
+        event.preventDefault();
+        navigateTo('/');
+      });
+      breadcrumb.appendChild(root);
+
+      let path = '';
+      currentPath.split('/').filter(Boolean).forEach(function (part, index, parts) {
+        const separator = document.createElement('span');
+        separator.className = 'breadcrumb-separator';
+        separator.textContent = '/';
+        breadcrumb.appendChild(separator);
+
+        path += '/' + part;
+        if (index === parts.length - 1) {
+          const active = document.createElement('span');
+          active.className = 'breadcrumb-item active';
+          active.textContent = part;
+          breadcrumb.appendChild(active);
+        } else {
+          const link = document.createElement('a');
+          link.href = '#';
+          link.className = 'breadcrumb-item';
+          link.textContent = part;
+          const targetPath = path;
+          link.addEventListener('click', function (event) {
+            event.preventDefault();
+            navigateTo(targetPath);
+          });
+          breadcrumb.appendChild(link);
+        }
+      });
+    }
+
+    function renderFiles(folders, files) {
+      const fileList = document.getElementById('fileList');
+      const emptyState = document.getElementById('emptyState');
+      fileList.replaceChildren();
+
+      if (folders.length === 0 && files.length === 0) {
+        emptyState.style.display = 'block';
+        return;
+      }
+
+      emptyState.style.display = 'none';
+      folders.forEach(function (folder) {
+        fileList.appendChild(createFileCard({
+          name: folder.name,
+          path: folder.path,
+          typeLabel: '📁',
+          meta: '文件夹',
+          isFolder: true
+        }));
+      });
+
+      files.forEach(function (file) {
+        fileList.appendChild(createFileCard({
+          name: file.name,
+          path: file.path,
+          typeLabel: getFileIcon(file.name),
+          meta: file.sizeFormatted || '',
+          previewType: file.previewType || '',
+          isFolder: false
+        }));
+      });
+    }
+
+    function createFileCard(item) {
+      const card = document.createElement('div');
+      card.className = 'file-item';
+      card.addEventListener('dblclick', function () {
+        if (item.isFolder) {
+          navigateTo(item.path);
+        } else {
+          handleFileClick(item.path, item.previewType, item.name);
+        }
+      });
+
+      const icon = document.createElement('div');
+      icon.className = 'file-icon';
+      icon.textContent = item.typeLabel;
+      card.appendChild(icon);
+
+      const name = document.createElement('div');
+      name.className = 'file-name';
+      name.textContent = item.name;
+      card.appendChild(name);
+
+      const meta = document.createElement('div');
+      meta.className = 'file-meta';
+      meta.textContent = item.meta;
+      if (item.previewType) {
+        const badge = document.createElement('span');
+        badge.className = 'badge badge-info';
+        badge.textContent = ' 可预览';
+        meta.appendChild(badge);
+      }
+      card.appendChild(meta);
+
+      const actions = document.createElement('div');
+      actions.className = 'file-actions';
+      if (item.isFolder) {
+        actions.appendChild(createActionButton('打开', 'btn-primary', function () {
+          navigateTo(item.path);
+        }));
+        actions.appendChild(createActionButton('删除', 'btn-danger', function () {
+          deleteFile(item.path);
+        }));
+      } else {
+        if (item.previewType) {
+          actions.appendChild(createActionButton('预览', 'btn-primary', function () {
+            previewFile(item.path, item.previewType, item.name);
+          }));
+        }
+        actions.appendChild(createActionButton('下载', 'btn-primary', function () {
+          downloadFile(item.path);
+        }));
+        actions.appendChild(createActionButton('分享', 'btn-secondary', function () {
+          showShareModal(item.path);
+        }));
+        actions.appendChild(createActionButton('重命名', 'btn-secondary', function () {
+          showRenameModal(item.path, item.name);
+        }));
+        actions.appendChild(createActionButton('删除', 'btn-danger', function () {
+          deleteFile(item.path);
+        }));
+      }
+      card.appendChild(actions);
+      return card;
+    }
+
+    function createActionButton(label, className, handler) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'btn btn-sm ' + className;
+      button.textContent = label;
+      button.addEventListener('click', function (event) {
+        event.stopPropagation();
+        handler();
+      });
+      return button;
+    }
+
+    function getFileIcon(filename) {
+      const ext = (filename.split('.').pop() || '').toLowerCase();
+      const icons = {
+        pdf: '📕',
+        doc: '📘',
+        docx: '📘',
+        xls: '📗',
+        xlsx: '📗',
+        ppt: '📙',
+        pptx: '📙',
+        jpg: '🖼️',
+        jpeg: '🖼️',
+        png: '🖼️',
+        gif: '🖼️',
+        svg: '🖼️',
+        webp: '🖼️',
+        mp3: '🎵',
+        wav: '🎵',
+        flac: '🎵',
+        m4a: '🎵',
+        mp4: '🎬',
+        webm: '🎬',
+        zip: '📦',
+        rar: '📦',
+        '7z': '📦',
+        tar: '📦',
+        gz: '📦',
+        txt: '📄',
+        md: '📝',
+        json: '📋',
+        js: '📜',
+        ts: '📜',
+        css: '🎨',
+        html: '🌐'
+      };
+      return icons[ext] || '📄';
+    }
+
+    function navigateTo(path) {
+      currentPath = path || '/';
+      loadFiles();
+    }
+
+    function handleFileClick(path, previewType, filename) {
+      if (previewType) {
+        previewFile(path, previewType, filename);
+      } else {
+        downloadFile(path);
+      }
+    }
+
+    async function previewFile(path, previewType, filename) {
+      const overlay = document.getElementById('previewOverlay');
+      const content = document.getElementById('previewContent');
+      const filenameEl = document.getElementById('previewFilename');
+      const downloadBtn = document.getElementById('previewDownloadBtn');
+
+      filenameEl.textContent = filename;
+      downloadBtn.onclick = function () {
+        downloadFile(path);
+      };
+      content.innerHTML = '<div class="preview-loading"><div class="spinner"></div><div>加载中...</div></div>';
+      overlay.classList.add('active');
+
+      const previewUrl = apiFileUrl('/api/preview', path);
+      try {
+        if (previewType === 'image') {
+          const img = document.createElement('img');
+          img.className = 'preview-image';
+          img.src = previewUrl;
+          img.alt = filename;
+          content.replaceChildren(img);
+        } else if (previewType === 'pdf') {
+          const iframe = document.createElement('iframe');
+          iframe.className = 'preview-pdf';
+          iframe.src = previewUrl + '#toolbar=1';
+          content.replaceChildren(iframe);
+        } else if (previewType === 'video') {
+          const video = document.createElement('video');
+          video.className = 'preview-video';
+          video.controls = true;
+          video.autoplay = true;
+          video.src = previewUrl;
+          content.replaceChildren(video);
+        } else if (previewType === 'audio') {
+          const audio = document.createElement('audio');
+          audio.className = 'preview-audio';
+          audio.controls = true;
+          audio.autoplay = true;
+          audio.src = previewUrl;
+          content.replaceChildren(audio);
+        } else if (previewType === 'word') {
+          if (!window.mammoth) throw new Error('文档预览组件加载失败');
+          const response = await fetch(previewUrl);
+          if (!response.ok) throw new Error('文件读取失败');
+          const buffer = await response.arrayBuffer();
+          const result = await window.mammoth.convertToHtml({ arrayBuffer: buffer });
+          const wrapper = document.createElement('div');
+          wrapper.className = 'preview-markdown';
+          wrapper.innerHTML = result.value;
+          content.replaceChildren(wrapper);
+        } else if (previewType === 'text') {
+          const response = await fetch(previewUrl);
+          if (!response.ok) throw new Error('文件读取失败');
+          const buffer = await response.arrayBuffer();
+          const text = decodeTextBuffer(buffer);
+          const ext = (filename.split('.').pop() || '').toLowerCase();
+          if (ext === 'md' && window.marked) {
+            const wrapper = document.createElement('div');
+            wrapper.className = 'preview-markdown';
+            wrapper.innerHTML = window.marked.parse(text);
+            content.replaceChildren(wrapper);
+          } else {
+            const pre = document.createElement('pre');
+            pre.className = 'preview-text';
+            if (ext === 'json') {
+              try {
+                pre.textContent = JSON.stringify(JSON.parse(text), null, 2);
+              } catch (error) {
+                pre.textContent = text;
+              }
+            } else {
+              pre.textContent = text;
+            }
+            content.replaceChildren(pre);
+          }
+        } else {
+          showPreviewError('不支持预览此文件类型');
+        }
+      } catch (error) {
+        showPreviewError('预览加载失败: ' + error.message);
+      }
+    }
+
+    function decodeTextBuffer(buffer) {
+      const bytes = new Uint8Array(buffer);
+      if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+        return new TextDecoder('utf-8').decode(bytes.subarray(3));
+      }
+      if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+        return new TextDecoder('utf-16le').decode(bytes.subarray(2));
+      }
+      if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+        return new TextDecoder('utf-16be').decode(bytes.subarray(2));
+      }
+
+      try {
+        return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      } catch (error) {
+        try {
+          return new TextDecoder('gb18030').decode(bytes);
+        } catch (gbError) {
+          return new TextDecoder('utf-8').decode(bytes);
+        }
+      }
+    }
+
+    function showPreviewError(message) {
+      const content = document.getElementById('previewContent');
+      const error = document.createElement('div');
+      error.className = 'preview-error';
+      error.textContent = message;
+      content.replaceChildren(error);
+    }
+
+    function closePreview() {
+      document.getElementById('previewOverlay').classList.remove('active');
+      document.getElementById('previewContent').replaceChildren();
+    }
+
+    document.addEventListener('keydown', function (event) {
+      if (event.key === 'Escape') closePreview();
+    });
+
+    async function handleFileUpload(event) {
+      const files = Array.from(event.target.files || []);
+      if (files.length === 0) return;
+
+      showLoading(true);
+      for (const file of files) {
+        try {
+          const formData = new FormData();
+          formData.append('file', file);
+          const response = await fetch(apiFileUrl('/api/files', currentPath), {
+            method: 'POST',
+            body: formData
+          });
+          const data = await response.json();
+          if (data.success) {
+            showToast('文件 ' + file.name + ' 上传成功', 'success');
+          } else {
+            showToast('文件 ' + file.name + ' 上传失败: ' + (data.message || '未知错误'), 'error');
+          }
+        } catch (error) {
+          showToast('文件 ' + file.name + ' 上传失败: ' + error.message, 'error');
+        }
+      }
+      event.target.value = '';
+      showLoading(false);
+      loadFiles();
+    }
+
+    function showNewFolderModal() {
+      document.getElementById('folderName').value = '';
+      document.getElementById('newFolderModal').classList.add('active');
+    }
+
+    async function createFolder(event) {
+      event.preventDefault();
+      const name = document.getElementById('folderName').value.trim();
+      if (!name) {
+        showToast('请输入文件夹名称', 'error');
+        return;
+      }
+
+      showLoading(true);
+      closeModal('newFolderModal');
+      try {
+        let folderPath = currentPath;
+        if (!folderPath.endsWith('/')) folderPath += '/';
+        folderPath += name;
+        const response = await fetch('/api/folders', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: folderPath })
+        });
+        const data = await response.json();
+        if (data.success) {
+          showToast('文件夹创建成功', 'success');
+          loadFiles();
+        } else {
+          showToast('创建失败: ' + (data.message || '未知错误'), 'error');
+        }
+      } catch (error) {
+        showToast('创建失败: ' + error.message, 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    function showRenameModal(path, currentName) {
+      document.getElementById('renameFilePath').value = path;
+      document.getElementById('newFileName').value = currentName;
+      document.getElementById('renameModal').classList.add('active');
+    }
+
+    async function renameFile(event) {
+      event.preventDefault();
+      const path = document.getElementById('renameFilePath').value;
+      const newName = document.getElementById('newFileName').value.trim();
+      if (!newName) {
+        showToast('请输入新名称', 'error');
+        return;
+      }
+
+      showLoading(true);
+      closeModal('renameModal');
+      try {
+        const response = await fetch(apiFileUrl('/api/files', path), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ newName })
+        });
+        const data = await response.json();
+        if (data.success) {
+          showToast('重命名成功', 'success');
+          loadFiles();
+        } else {
+          showToast('重命名失败: ' + (data.message || '未知错误'), 'error');
+        }
+      } catch (error) {
+        showToast('重命名失败: ' + error.message, 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    async function deleteFile(path) {
+      if (!window.confirm('确定要删除吗？此操作不可恢复。')) return;
+      showLoading(true);
+      try {
+        const response = await fetch(apiFileUrl('/api/files', path), { method: 'DELETE' });
+        const data = await response.json();
+        if (data.success) {
+          showToast('删除成功', 'success');
+          loadFiles();
+        } else {
+          showToast('删除失败: ' + (data.message || '未知错误'), 'error');
+        }
+      } catch (error) {
+        showToast('删除失败: ' + error.message, 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    function downloadFile(path) {
+      window.open(apiFileUrl('/api/download', path), '_blank');
+    }
+
+    function showShareModal(path) {
+      document.getElementById('shareFilePath').value = path;
+      document.getElementById('sharePassword').value = '';
+      document.getElementById('shareExpiry').value = '1d';
+      document.getElementById('shareModal').classList.add('active');
+    }
+
+    async function createShare(event) {
+      event.preventDefault();
+      const filePath = document.getElementById('shareFilePath').value;
+      const password = document.getElementById('sharePassword').value;
+      const expiresIn = document.getElementById('shareExpiry').value;
+
+      showLoading(true);
+      closeModal('shareModal');
+      try {
+        const response = await fetch('/api/share', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filePath: filePath, password: password, expiresIn: expiresIn })
+        });
+        const data = await response.json();
+        if (data.success) {
+          document.getElementById('shareResultUrl').value = window.location.origin + data.shareUrl;
+          document.getElementById('shareResultModal').classList.add('active');
+        } else {
+          showToast('创建分享链接失败: ' + (data.message || '未知错误'), 'error');
+        }
+      } catch (error) {
+        showToast('创建分享链接失败: ' + error.message, 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    function copyShareLink() {
+      const input = document.getElementById('shareResultUrl');
+      input.select();
+      const text = input.value;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () {
+          showToast('链接已复制', 'success');
+        }).catch(function () {
+          document.execCommand('copy');
+          showToast('链接已复制', 'success');
+        });
+      } else {
+        document.execCommand('copy');
+        showToast('链接已复制', 'success');
+      }
+    }
+
+    async function logout() {
+      try {
+        await fetch('/api/logout', { method: 'POST' });
+      } finally {
+        window.location.href = '/login.html';
+      }
+    }
+
+    function closeModal(id) {
+      document.getElementById(id).classList.remove('active');
+    }
+
+    function showLoading(show) {
+      document.getElementById('loadingOverlay').style.display = show ? 'flex' : 'none';
+    }
+
+    function showToast(message, type) {
+      const container = document.getElementById('toastContainer');
+      const toast = document.createElement('div');
+      toast.className = 'toast toast-' + (type || 'info');
+      toast.textContent = message;
+      container.appendChild(toast);
+      window.setTimeout(function () {
+        toast.remove();
+      }, 3000);
+    }
+
+    checkAuth();
+    loadFiles();
+  </script>
+</body>
+</html>
+`;
+
+const FIXED_ADMIN_PAGE = `
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>管理后台 - EdgeStash</title>
+  ${CSS_STYLES}
+</head>
+<body>
+  <div class="header">
+    <div class="logo">EdgeStash 管理后台</div>
+    <div class="header-actions">
+      <button type="button" class="btn btn-secondary" onclick="window.location.href='/'">返回云盘</button>
+      <button type="button" class="btn btn-secondary" onclick="logout()">退出登录</button>
+    </div>
+  </div>
+
+  <div class="container">
+    <div class="tabs">
+      <button type="button" class="tab active" onclick="switchTab('stats', event)">统计数据</button>
+      <button type="button" class="tab" onclick="switchTab('shares', event)">分享链接</button>
+      <button type="button" class="tab" onclick="switchTab('users', event)">授权用户</button>
+    </div>
+
+    <div id="statsTab" class="tab-content active">
+      <div class="stats-grid">
+        <div class="stat-card"><div class="stat-value" id="totalShares">0</div><div class="stat-label">总分享链接数</div></div>
+        <div class="stat-card"><div class="stat-value" id="totalViews">0</div><div class="stat-label">总浏览次数</div></div>
+        <div class="stat-card"><div class="stat-value" id="totalDownloads">0</div><div class="stat-label">总下载次数</div></div>
+      </div>
+    </div>
+
+    <div id="sharesTab" class="tab-content">
+      <div class="card">
+        <div class="card-header"><div class="card-title">分享链接管理</div></div>
+        <div class="table-container">
+          <table>
+            <thead><tr><th>文件名</th><th>分享ID</th><th>密码保护</th><th>浏览次数</th><th>下载次数</th><th>状态</th><th>操作</th></tr></thead>
+            <tbody id="sharesTable"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div id="usersTab" class="tab-content">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">授权用户管理</div>
+          <button type="button" class="btn btn-primary" onclick="showAddUserModal()">添加用户</button>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead><tr><th>邮箱</th><th>角色</th><th>创建时间</th><th>操作</th></tr></thead>
+            <tbody id="usersTable"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="addUserModal">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">添加授权用户</div>
+        <button type="button" class="modal-close" onclick="closeModal('addUserModal')">&times;</button>
+      </div>
+      <form onsubmit="addUser(event)">
+        <div class="form-group">
+          <label class="form-label" for="newUserEmail">邮箱</label>
+          <input type="email" id="newUserEmail" class="form-input" placeholder="请输入邮箱" required>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="newUserPassword">密码</label>
+          <input type="text" id="newUserPassword" class="form-input" placeholder="请输入密码" required>
+        </div>
+        <button type="submit" class="btn btn-primary" style="width: 100%;">添加用户</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="toast-container" id="toastContainer"></div>
+  <div class="loading-overlay" id="loadingOverlay" style="display: none;"><div class="spinner"></div></div>
+
+  <script>
+    async function checkAdminAuth() {
+      try {
+        const response = await fetch('/api/auth/check');
+        const data = await response.json();
+        if (!data.authenticated || data.role !== 'admin') {
+          window.location.href = '/login.html';
+        }
+      } catch (error) {
+        window.location.href = '/login.html';
+      }
+    }
+
+    function switchTab(tab, event) {
+      document.querySelectorAll('.tab').forEach(function (item) {
+        item.classList.remove('active');
+      });
+      document.querySelectorAll('.tab-content').forEach(function (item) {
+        item.classList.remove('active');
+      });
+      event.target.classList.add('active');
+      document.getElementById(tab + 'Tab').classList.add('active');
+      if (tab === 'stats') loadStats();
+      if (tab === 'shares') loadShares();
+      if (tab === 'users') loadUsers();
+    }
+
+    async function loadStats() {
+      try {
+        const response = await fetch('/api/admin/stats');
+        const data = await response.json();
+        if (data.success) {
+          document.getElementById('totalShares').textContent = data.totalShares;
+          document.getElementById('totalViews').textContent = data.totalViews;
+          document.getElementById('totalDownloads').textContent = data.totalDownloads;
+        }
+      } catch (error) {
+        showToast('加载统计数据失败: ' + error.message, 'error');
+      }
+    }
+
+    async function loadShares() {
+      showLoading(true);
+      try {
+        const response = await fetch('/api/admin/shares');
+        const data = await response.json();
+        const tbody = document.getElementById('sharesTable');
+        tbody.replaceChildren();
+        if (!data.success) throw new Error(data.message || '加载失败');
+        if (data.shares.length === 0) {
+          appendEmptyRow(tbody, 7, '暂无分享链接');
+          return;
+        }
+        data.shares.forEach(function (share) {
+          const tr = document.createElement('tr');
+          appendCell(tr, share.fileName);
+          appendCell(tr, share.shareId);
+          appendCell(tr, share.passwordHash ? '是' : '否');
+          appendCell(tr, String(share.viewCount || 0));
+          appendCell(tr, String(share.downloadCount || 0));
+          appendCell(tr, share.isExpired ? '已过期' : '有效');
+          const actions = document.createElement('td');
+          actions.appendChild(createSmallButton('复制链接', 'btn-secondary', function () {
+            copyShareLink(share.shareId);
+          }));
+          actions.appendChild(createSmallButton('删除', 'btn-danger', function () {
+            deleteShare(share.shareId);
+          }));
+          tr.appendChild(actions);
+          tbody.appendChild(tr);
+        });
+      } catch (error) {
+        showToast('加载分享列表失败: ' + error.message, 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    async function loadUsers() {
+      showLoading(true);
+      try {
+        const response = await fetch('/api/admin/users');
+        const data = await response.json();
+        const tbody = document.getElementById('usersTable');
+        tbody.replaceChildren();
+        if (!data.success) throw new Error(data.message || '加载失败');
+        if (data.users.length === 0) {
+          appendEmptyRow(tbody, 4, '暂无授权用户');
+          return;
+        }
+        data.users.forEach(function (user) {
+          const tr = document.createElement('tr');
+          appendCell(tr, user.email);
+          appendCell(tr, user.role === 'admin' ? '管理员' : '普通用户');
+          appendCell(tr, user.createdAt ? new Date(user.createdAt).toLocaleString() : '-');
+          const actions = document.createElement('td');
+          actions.appendChild(createSmallButton('撤销授权', 'btn-danger', function () {
+            deleteUser(user.email);
+          }));
+          tr.appendChild(actions);
+          tbody.appendChild(tr);
+        });
+      } catch (error) {
+        showToast('加载用户列表失败: ' + error.message, 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    function appendCell(tr, value) {
+      const td = document.createElement('td');
+      td.textContent = value == null ? '' : value;
+      tr.appendChild(td);
+    }
+
+    function appendEmptyRow(tbody, colspan, message) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = colspan;
+      td.style.textAlign = 'center';
+      td.style.color = 'var(--text-muted)';
+      td.textContent = message;
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    }
+
+    function createSmallButton(label, className, handler) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'btn btn-sm ' + className;
+      button.textContent = label;
+      button.addEventListener('click', handler);
+      return button;
+    }
+
+    function showAddUserModal() {
+      document.getElementById('newUserEmail').value = '';
+      document.getElementById('newUserPassword').value = '';
+      document.getElementById('addUserModal').classList.add('active');
+    }
+
+    async function addUser(event) {
+      event.preventDefault();
+      const email = document.getElementById('newUserEmail').value.trim();
+      const password = document.getElementById('newUserPassword').value;
+      showLoading(true);
+      closeModal('addUserModal');
+      try {
+        const response = await fetch('/api/admin/users', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: email, password: password })
+        });
+        const data = await response.json();
+        if (data.success) {
+          showToast('用户添加成功', 'success');
+          loadUsers();
+        } else {
+          showToast('添加失败: ' + (data.message || '未知错误'), 'error');
+        }
+      } catch (error) {
+        showToast('添加失败: ' + error.message, 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    async function deleteUser(email) {
+      if (!window.confirm('确定要撤销该用户的授权吗？')) return;
+      showLoading(true);
+      try {
+        const response = await fetch('/api/admin/users/' + encodeURIComponent(email), { method: 'DELETE' });
+        const data = await response.json();
+        if (data.success) {
+          showToast('用户已删除', 'success');
+          loadUsers();
+        } else {
+          showToast('删除失败: ' + (data.message || '未知错误'), 'error');
+        }
+      } catch (error) {
+        showToast('删除失败: ' + error.message, 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    async function deleteShare(shareId) {
+      if (!window.confirm('确定要删除该分享链接吗？')) return;
+      showLoading(true);
+      try {
+        const response = await fetch('/api/admin/shares/' + encodeURIComponent(shareId), { method: 'DELETE' });
+        const data = await response.json();
+        if (data.success) {
+          showToast('分享链接已删除', 'success');
+          loadShares();
+        } else {
+          showToast('删除失败: ' + (data.message || '未知错误'), 'error');
+        }
+      } catch (error) {
+        showToast('删除失败: ' + error.message, 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    function copyShareLink(shareId) {
+      const url = window.location.origin + '/s/' + shareId;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).then(function () {
+          showToast('链接已复制', 'success');
+        }).catch(function () {
+          showToast('复制失败', 'error');
+        });
+      } else {
+        showToast(url, 'info');
+      }
+    }
+
+    async function logout() {
+      try {
+        await fetch('/api/logout', { method: 'POST' });
+      } finally {
+        window.location.href = '/login.html';
+      }
+    }
+
+    function closeModal(id) {
+      document.getElementById(id).classList.remove('active');
+    }
+
+    function showLoading(show) {
+      document.getElementById('loadingOverlay').style.display = show ? 'flex' : 'none';
+    }
+
+    function showToast(message, type) {
+      const container = document.getElementById('toastContainer');
+      const toast = document.createElement('div');
+      toast.className = 'toast toast-' + (type || 'info');
+      toast.textContent = message;
+      container.appendChild(toast);
+      window.setTimeout(function () {
+        toast.remove();
+      }, 3000);
+    }
+
+    checkAdminAuth();
+    loadStats();
+  </script>
+</body>
+</html>
+`;
+
+const FIXED_SHARE_PAGE = `
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>文件分享 - EdgeStash</title>
+  ${CSS_STYLES}
+</head>
+<body>
+  <div class="share-container">
+    <div class="share-card">
+      <div id="loadingState">
+        <div class="spinner" style="margin: 0 auto 20px;"></div>
+        <div>加载中...</div>
+      </div>
+
+      <div id="expiredState" style="display: none;">
+        <div class="share-expired">分享链接已过期或不存在</div>
+        <p style="color: var(--text-muted); margin-top: 16px;">请联系分享者获取新的链接</p>
+      </div>
+
+      <div id="shareContent" style="display: none;">
+        <div class="share-icon">📄</div>
+        <div class="share-filename" id="fileName"></div>
+        <div class="share-filesize" id="fileSize"></div>
+        <div id="passwordForm" style="display: none;">
+          <div class="form-group">
+            <label class="form-label" for="sharePassword">请输入分享密码</label>
+            <input type="password" id="sharePassword" class="form-input" placeholder="输入密码">
+          </div>
+        </div>
+        <button type="button" class="btn btn-primary" style="width: 100%; margin-top: 20px;" onclick="downloadFile()">下载文件</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast-container" id="toastContainer"></div>
+
+  <script>
+    let shareId = '';
+    let requiresPassword = false;
+
+    async function loadShareInfo() {
+      const parts = window.location.pathname.split('/').filter(Boolean);
+      shareId = parts[1] || '';
+      if (!shareId) {
+        showExpired();
+        return;
+      }
+
+      try {
+        const response = await fetch('/api/share/' + encodeURIComponent(shareId));
+        const data = await response.json();
+        if (!data.success) {
+          showExpired();
+          return;
+        }
+        document.getElementById('loadingState').style.display = 'none';
+        document.getElementById('shareContent').style.display = 'block';
+        document.getElementById('fileName').textContent = data.fileName;
+        document.getElementById('fileSize').textContent = data.fileSizeFormatted;
+        requiresPassword = !!data.requiresPassword;
+        document.getElementById('passwordForm').style.display = requiresPassword ? 'block' : 'none';
+      } catch (error) {
+        showExpired();
+      }
+    }
+
+    function showExpired() {
+      document.getElementById('loadingState').style.display = 'none';
+      document.getElementById('expiredState').style.display = 'block';
+    }
+
+    async function downloadFile() {
+      const password = document.getElementById('sharePassword') ? document.getElementById('sharePassword').value : '';
+      if (requiresPassword && !password) {
+        showToast('请输入分享密码', 'error');
+        return;
+      }
+
+      try {
+        const response = await fetch('/api/share/' + encodeURIComponent(shareId) + '/download', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: password })
+        });
+        if (!response.ok) {
+          const data = await response.json();
+          showToast(data.message || '下载失败', 'error');
+          return;
+        }
+
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = getFilenameFromDisposition(response.headers.get('Content-Disposition'));
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        showToast('下载开始', 'success');
+      } catch (error) {
+        showToast('下载失败: ' + error.message, 'error');
+      }
+    }
+
+    function getFilenameFromDisposition(header) {
+      if (!header) return 'download';
+      const utf8Match = header.match(/filename\\*=UTF-8''([^;\\n]+)/i);
+      if (utf8Match) {
+        try {
+          return decodeURIComponent(utf8Match[1]);
+        } catch (error) {
+          return utf8Match[1];
+        }
+      }
+      const fallbackMatch = header.match(/filename=["']?([^"';\\n]+)/i);
+      return fallbackMatch ? fallbackMatch[1] : 'download';
+    }
+
+    function showToast(message, type) {
+      const container = document.getElementById('toastContainer');
+      const toast = document.createElement('div');
+      toast.className = 'toast toast-' + (type || 'info');
+      toast.textContent = message;
+      container.appendChild(toast);
+      window.setTimeout(function () {
+        toast.remove();
+      }, 3000);
+    }
+
     loadShareInfo();
   </script>
 </body>
@@ -3054,10 +4729,14 @@ export default {
         if (path === '/api/auth/check') {
           return await handleCheckAuth(request, env);
         }
+
+        if (path === '/api/cache/refresh' && method === 'POST') {
+          return await handleRefreshDirectoryCache(request, env);
+        }
         
         // File management routes
         if (path.startsWith('/api/files')) {
-          const filePath = path.slice('/api/files'.length) || '/';
+          const filePath = safeDecodePath(path.slice('/api/files'.length) || '/');
           
           if (method === 'GET') {
             return await handleListFiles(request, env, filePath);
@@ -3080,13 +4759,13 @@ export default {
         
         // Download route
         if (path.startsWith('/api/download')) {
-          const filePath = path.slice('/api/download'.length);
+          const filePath = safeDecodePath(path.slice('/api/download'.length));
           return await handleDownloadFile(request, env, filePath);
         }
         
         // Preview route
         if (path.startsWith('/api/preview')) {
-          const filePath = path.slice('/api/preview'.length);
+          const filePath = safeDecodePath(path.slice('/api/preview'.length));
           return await handlePreviewFile(request, env, filePath);
         }
         
@@ -3137,21 +4816,21 @@ export default {
       
       // Share page route
       if (path.startsWith('/s/')) {
-        return htmlResponse(SHARE_PAGE);
+        return htmlResponse(FIXED_SHARE_PAGE);
       }
       
       // Static page routes
       if (path === '/login.html' || path === '/login') {
-        return htmlResponse(LOGIN_PAGE);
+        return htmlResponse(FIXED_LOGIN_PAGE);
       }
       
       if (path === '/admin.html' || path === '/admin') {
-        // Check if user is admin
+        // Check iadmin
         const auth = await verifyAuth(request, env);
         if (!auth || auth.role !== 'admin') {
           return Response.redirect(url.origin + '/login.html', 302);
         }
-        return htmlResponse(ADMIN_PAGE);
+        return htmlResponse(FIXED_ADMIN_PAGE);
       }
       
       // Root and index - check auth
@@ -3160,7 +4839,7 @@ export default {
         if (!auth) {
           return Response.redirect(url.origin + '/login.html', 302);
         }
-        return htmlResponse(INDEX_PAGE);
+        return htmlResponse(FIXED_INDEX_PAGE);
       }
       
       // Default: redirect to root
