@@ -40,6 +40,14 @@ async function hashPassword(password) {
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+async function sha256Hex(value) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(value);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 /**
  * Create a JWT token
  */
@@ -725,28 +733,7 @@ async function handleDeleteFile(request, env, path) {
   if (auth instanceof Response) return auth;
   
   try {
-    let key = path || '';
-    if (key.startsWith('/')) key = key.slice(1);
-    
-    // Check if it's a folder (has objects with this prefix)
-    const listed = await env.R2_BUCKET.list({ prefix: key + '/', limit: 1 });
-    
-    if (listed.objects && listed.objects.length > 0) {
-      // It's a folder, delete all contents recursively
-      let cursor;
-      do {
-        const batch = await env.R2_BUCKET.list({ prefix: key + '/', cursor });
-        if (batch.objects && batch.objects.length > 0) {
-          await env.R2_BUCKET.delete(batch.objects.map(obj => obj.key));
-        }
-        cursor = batch.truncated ? batch.cursor : null;
-      } while (cursor);
-    }
-    
-    // Try to delete the file itself
-    await env.R2_BUCKET.delete(key);
-    await invalidateCachePath(env, r2KeyToPath(key));
-    
+    await deleteItemAtPath(env, path);
     return jsonResponse({ success: true, message: '删除成功' });
   } catch (e) {
     return jsonResponse({ success: false, message: '删除失败: ' + e.message }, 500);
@@ -831,6 +818,281 @@ async function handleRenameFile(request, env, path) {
     return jsonResponse({ success: true, message: '重命名成功', newPath: '/' + newKey });
   } catch (e) {
     return jsonResponse({ success: false, message: '重命名失败: ' + e.message }, 500);
+  }
+}
+
+function itemPathToR2Key(path) {
+  const normalized = normalizeItemPath(path);
+  return normalized === '/' ? '' : normalized.slice(1);
+}
+
+function joinItemPath(parentPath, name) {
+  const parent = normalizeDirectoryPath(parentPath);
+  return parent === '/' ? '/' + name : parent + '/' + name;
+}
+
+async function folderExists(env, folderPath) {
+  const normalized = normalizeDirectoryPath(folderPath);
+  if (normalized === '/') return true;
+
+  const prefix = directoryPathToR2Prefix(normalized);
+  const listed = await env.R2_BUCKET.list({ prefix, limit: 1 });
+  return !!(listed.objects && listed.objects.length > 0);
+}
+
+async function destinationExists(env, key, isFolder) {
+  if (isFolder) {
+    const listed = await env.R2_BUCKET.list({ prefix: key + '/', limit: 1 });
+    return !!(listed.objects && listed.objects.length > 0);
+  }
+  return !!(await env.R2_BUCKET.head(key));
+}
+
+function copyNameCandidate(name, index) {
+  const suffix = index === 1 ? ' - 副本' : ' - 副本 ' + index;
+  const dotIndex = name.lastIndexOf('.');
+  if (dotIndex > 0) {
+    return name.slice(0, dotIndex) + suffix + name.slice(dotIndex);
+  }
+  return name + suffix;
+}
+
+async function findAvailableDestinationKey(env, desiredKey, isFolder) {
+  if (!(await destinationExists(env, desiredKey, isFolder))) {
+    return desiredKey;
+  }
+
+  const slashIndex = desiredKey.lastIndexOf('/');
+  const parent = slashIndex >= 0 ? desiredKey.slice(0, slashIndex + 1) : '';
+  const name = slashIndex >= 0 ? desiredKey.slice(slashIndex + 1) : desiredKey;
+
+  for (let index = 1; index <= 999; index++) {
+    const candidate = parent + copyNameCandidate(name, index);
+    if (!(await destinationExists(env, candidate, isFolder))) {
+      return candidate;
+    }
+  }
+
+  throw new Error('目标目录中存在太多同名项目');
+}
+
+async function deleteItemAtPath(env, path) {
+  const key = itemPathToR2Key(path);
+  if (!key) throw new Error('不能操作根目录');
+
+  const listed = await env.R2_BUCKET.list({ prefix: key + '/', limit: 1 });
+  if (listed.objects && listed.objects.length > 0) {
+    let cursor;
+    do {
+      const batch = await env.R2_BUCKET.list({ prefix: key + '/', cursor });
+      if (batch.objects && batch.objects.length > 0) {
+        await deleteR2Keys(env, batch.objects.map(obj => obj.key));
+      }
+      cursor = batch.truncated ? batch.cursor : null;
+    } while (cursor);
+  }
+
+  await env.R2_BUCKET.delete(key);
+  await invalidateCachePath(env, r2KeyToPath(key));
+}
+
+async function deleteR2Keys(env, keys) {
+  for (let index = 0; index < keys.length; index += 1000) {
+    await env.R2_BUCKET.delete(keys.slice(index, index + 1000));
+  }
+}
+
+async function copyR2Object(env, sourceKey, targetKey) {
+  const object = await env.R2_BUCKET.get(sourceKey);
+  if (!object) return false;
+
+  await env.R2_BUCKET.put(targetKey, object.body, {
+    httpMetadata: object.httpMetadata,
+    customMetadata: object.customMetadata
+  });
+  return true;
+}
+
+async function copyOrMoveItem(env, sourcePath, destinationPath, shouldMove) {
+  const normalizedSourcePath = normalizeItemPath(sourcePath);
+  const normalizedDestinationPath = normalizeDirectoryPath(destinationPath);
+  const sourceKey = itemPathToR2Key(normalizedSourcePath);
+  const name = nameFromItemPath(normalizedSourcePath);
+
+  if (!sourceKey || !name) throw new Error('不能操作根目录');
+  if (!(await folderExists(env, normalizedDestinationPath))) {
+    throw new Error('目标文件夹不存在: ' + normalizedDestinationPath);
+  }
+
+  const sourceObject = await env.R2_BUCKET.head(sourceKey);
+  const sourcePrefix = sourceKey + '/';
+  const folderCheck = sourceObject ? null : await env.R2_BUCKET.list({ prefix: sourcePrefix, limit: 1 });
+  const isFolder = !sourceObject && !!(folderCheck.objects && folderCheck.objects.length > 0);
+
+  if (!sourceObject && !isFolder) {
+    throw new Error('项目不存在: ' + normalizedSourcePath);
+  }
+
+  const desiredPath = joinItemPath(normalizedDestinationPath, name);
+  let targetKey = itemPathToR2Key(desiredPath);
+  if (shouldMove && targetKey === sourceKey) {
+    return { sourcePath: normalizedSourcePath, targetPath: normalizedSourcePath, skipped: true };
+  }
+  targetKey = await findAvailableDestinationKey(env, targetKey, isFolder);
+  const targetPath = r2KeyToPath(targetKey);
+
+  if (isFolder) {
+    const targetPrefix = targetKey + '/';
+    if (targetPrefix.startsWith(sourcePrefix) || sourcePrefix.startsWith(targetPrefix)) {
+      throw new Error('不能把文件夹复制或移动到自身或其子目录中');
+    }
+
+    const copiedKeys = [];
+    let cursor;
+    do {
+      const batch = await env.R2_BUCKET.list({ prefix: sourcePrefix, cursor });
+      if (batch.objects && batch.objects.length > 0) {
+        for (const obj of batch.objects) {
+          const relativeKey = obj.key.slice(sourcePrefix.length);
+          const copied = await copyR2Object(env, obj.key, targetPrefix + relativeKey);
+          if (copied) copiedKeys.push(obj.key);
+        }
+      }
+      cursor = batch.truncated ? batch.cursor : null;
+    } while (cursor);
+
+    if (shouldMove && copiedKeys.length > 0) {
+      await deleteR2Keys(env, copiedKeys);
+    }
+  } else {
+    await copyR2Object(env, sourceKey, targetKey);
+    if (shouldMove) {
+      await env.R2_BUCKET.delete(sourceKey);
+    }
+  }
+
+  if (shouldMove) {
+    await invalidateCachePath(env, normalizedSourcePath);
+  }
+  await invalidateCachePath(env, targetPath);
+
+  return { sourcePath: normalizedSourcePath, targetPath };
+}
+
+async function handleBatchFileOperation(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const body = await request.json();
+    const operation = body.operation;
+    const items = Array.isArray(body.items) ? body.items : [];
+    const destinationPath = normalizeDirectoryPath(body.destinationPath || '/');
+
+    if (!['copy', 'move', 'delete'].includes(operation)) {
+      return jsonResponse({ success: false, message: '不支持的批量操作' }, 400);
+    }
+
+    if (items.length === 0) {
+      return jsonResponse({ success: false, message: '请选择要操作的文件或文件夹' }, 400);
+    }
+
+    if (operation !== 'delete' && !(await folderExists(env, destinationPath))) {
+      return jsonResponse({ success: false, message: '目标文件夹不存在' }, 400);
+    }
+
+    const results = [];
+    const errors = [];
+
+    for (const item of items) {
+      const itemPath = normalizeItemPath(typeof item === 'string' ? item : item.path);
+      try {
+        if (!itemPath || itemPath === '/') {
+          throw new Error('不能操作根目录');
+        }
+
+        if (operation === 'delete') {
+          await deleteItemAtPath(env, itemPath);
+          results.push({ path: itemPath });
+        } else {
+          const result = await copyOrMoveItem(env, itemPath, destinationPath, operation === 'move');
+          results.push(result);
+        }
+      } catch (error) {
+        errors.push({ path: itemPath, message: error.message });
+      }
+    }
+
+    if (errors.length > 0) {
+      return jsonResponse({
+        success: results.length > 0,
+        message: results.length > 0 ? '部分项目操作失败' : '批量操作失败',
+        results,
+        errors
+      }, results.length > 0 ? 207 : 400);
+    }
+
+    return jsonResponse({ success: true, message: '批量操作成功', results });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '批量操作失败: ' + e.message }, 500);
+  }
+}
+
+function addFolderPathsFromR2Key(folderPaths, key) {
+  const parts = (key || '').split('/').filter(Boolean);
+  const folderParts = parts.slice(0, -1);
+
+  for (let index = 0; index < folderParts.length; index++) {
+    folderPaths.add('/' + folderParts.slice(0, index + 1).join('/'));
+  }
+}
+
+async function handleSearchFolders(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const url = new URL(request.url);
+    const query = (url.searchParams.get('q') || '').trim().toLowerCase();
+    const requestedLimit = Number(url.searchParams.get('limit') || 50);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(100, Math.max(1, requestedLimit))
+      : 50;
+    const folderPaths = new Set(['/']);
+    let cursor;
+    let scanned = 0;
+    const maxScannedObjects = 20000;
+
+    do {
+      const listed = await env.R2_BUCKET.list({ cursor, limit: 1000 });
+      const objects = listed.objects || [];
+      for (const obj of objects) {
+        addFolderPathsFromR2Key(folderPaths, obj.key);
+      }
+      scanned += objects.length;
+      cursor = listed.truncated ? listed.cursor : null;
+    } while (cursor && scanned < maxScannedObjects);
+
+    const folders = Array.from(folderPaths)
+      .filter(path => {
+        if (!query) return true;
+        return path.toLowerCase().includes(query) || nameFromItemPath(path).toLowerCase().includes(query);
+      })
+      .sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
+      .slice(0, limit)
+      .map(path => ({
+        path,
+        name: path === '/' ? '根目录' : nameFromItemPath(path)
+      }));
+
+    return jsonResponse({
+      success: true,
+      folders,
+      truncated: !!cursor,
+      scanned
+    });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '搜索文件夹失败: ' + e.message }, 500);
   }
 }
 
@@ -937,6 +1199,86 @@ async function handlePreviewFile(request, env, path) {
   } catch (e) {
     return jsonResponse({ success: false, message: '预览失败: ' + e.message }, 500);
   }
+}
+
+function isTxtReaderPath(path) {
+  return typeof path === 'string' && path.toLowerCase().endsWith('.txt');
+}
+
+async function readerProgressKey(auth, path) {
+  const normalizedPath = normalizeItemPath(path);
+  const pathHash = await sha256Hex(normalizedPath);
+  if (auth.role === 'admin') {
+    return `reader:admin:${pathHash}`;
+  }
+  return `reader:user:${auth.email}:${pathHash}`;
+}
+
+function normalizeReaderNumber(value, fallback, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(max, Math.max(min, number));
+}
+
+async function handleGetReaderProgress(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const url = new URL(request.url);
+    const filePath = normalizeItemPath(url.searchParams.get('path') || '');
+
+    if (!filePath || filePath === '/' || !isTxtReaderPath(filePath)) {
+      return jsonResponse({ success: false, message: '只支持保存 txt 文件阅读进度' }, 400);
+    }
+
+    const key = await readerProgressKey(auth, filePath);
+    const progress = await env.KV_STORE.get(key, 'json');
+    return jsonResponse({ success: true, progress: progress || null });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '读取阅读进度失败: ' + e.message }, 500);
+  }
+}
+
+async function handlePutReaderProgress(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const body = await request.json();
+    const filePath = normalizeItemPath(body.path || '');
+
+    if (!filePath || filePath === '/' || !isTxtReaderPath(filePath)) {
+      return jsonResponse({ success: false, message: '只支持保存 txt 文件阅读进度' }, 400);
+    }
+
+    const value = {
+      path: filePath,
+      charOffset: Math.floor(normalizeReaderNumber(body.charOffset, 0, 0, Number.MAX_SAFE_INTEGER)),
+      progress: normalizeReaderNumber(body.progress, 0, 0, 1),
+      scrollTop: normalizeReaderNumber(body.scrollTop, 0, 0, Number.MAX_SAFE_INTEGER),
+      scrollHeight: normalizeReaderNumber(body.scrollHeight, 0, 0, Number.MAX_SAFE_INTEGER),
+      updatedAt: Date.now()
+    };
+
+    const key = await readerProgressKey(auth, filePath);
+    await env.KV_STORE.put(key, JSON.stringify(value));
+
+    return jsonResponse({ success: true, progress: value });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '保存阅读进度失败: ' + e.message }, 500);
+  }
+}
+
+async function deleteReaderProgressForUser(env, email) {
+  const prefix = `reader:user:${email}:`;
+  let cursor;
+
+  do {
+    const listed = await env.KV_STORE.list({ prefix, cursor });
+    await Promise.all(listed.keys.map(key => env.KV_STORE.delete(key.name)));
+    cursor = listed.list_complete ? null : listed.cursor;
+  } while (cursor);
 }
 
 // ============================================================================
@@ -1229,6 +1571,7 @@ async function handleDeleteUser(request, env, email) {
   try {
     const decodedEmail = decodeURIComponent(email);
     await env.KV_STORE.delete(`user:${decodedEmail}`);
+    await deleteReaderProgressForUser(env, decodedEmail);
     
     return jsonResponse({ success: true, message: '用户已删除' });
   } catch (e) {
@@ -1334,6 +1677,20 @@ const CSS_STYLES = `
   .btn-sm {
     padding: 6px 12px;
     font-size: 12px;
+  }
+
+  .icon-btn {
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    flex: 0 0 34px;
+  }
+
+  .action-icon {
+    display: block;
+    width: 16px;
+    height: 16px;
+    pointer-events: none;
   }
   
   /* Forms */
@@ -1536,6 +1893,12 @@ const CSS_STYLES = `
     justify-content: center;
     padding: 20px;
   }
+
+  .preview-content.reader-mode {
+    align-items: stretch;
+    justify-content: flex-start;
+    padding: 0;
+  }
   
   .preview-image {
     max-width: 100%;
@@ -1555,6 +1918,20 @@ const CSS_STYLES = `
     line-height: 1.6;
     white-space: pre-wrap;
     word-wrap: break-word;
+  }
+
+  .preview-reader {
+    width: 100%;
+    height: 100%;
+    overflow: auto;
+    background: var(--surface);
+    color: var(--text);
+    padding: 28px;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 18px;
+    line-height: 1.85;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
   
   .preview-pdf {
@@ -1777,11 +2154,27 @@ const CSS_STYLES = `
     cursor: pointer;
     transition: all 0.2s ease;
     border: 1px solid transparent;
+    position: relative;
   }
   
   .file-item:hover {
     border-color: var(--primary);
     transform: translateY(-2px);
+  }
+
+  .file-item.selected {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.25);
+  }
+
+  .file-select {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    width: 18px;
+    height: 18px;
+    accent-color: var(--primary);
+    cursor: pointer;
   }
   
   .file-icon {
@@ -1809,6 +2202,7 @@ const CSS_STYLES = `
     margin-top: 12px;
     justify-content: center;
     flex-wrap: wrap;
+    max-width: 100%;
   }
   
   /* Stats Cards */
@@ -2127,6 +2521,68 @@ const CSS_STYLES = `
     gap: 12px;
     margin-bottom: 20px;
     flex-wrap: wrap;
+  }
+
+  .batch-toolbar {
+    display: none;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 20px;
+    padding: 12px;
+    background: var(--surface);
+    border: 1px solid var(--surface-light);
+    border-radius: 8px;
+    flex-wrap: wrap;
+  }
+
+  .batch-toolbar.active {
+    display: flex;
+  }
+
+  .batch-count {
+    color: var(--text-muted);
+    margin-right: auto;
+    font-size: 14px;
+  }
+
+  .folder-search-results {
+    display: none;
+    margin-top: 8px;
+    max-height: 220px;
+    overflow: auto;
+    border: 1px solid var(--surface-light);
+    border-radius: 8px;
+    background: var(--background);
+  }
+
+  .folder-search-results.active {
+    display: block;
+  }
+
+  .folder-search-item {
+    width: 100%;
+    padding: 10px 12px;
+    border: none;
+    border-bottom: 1px solid var(--surface-light);
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+    text-align: left;
+    font-size: 14px;
+  }
+
+  .folder-search-item:last-child {
+    border-bottom: none;
+  }
+
+  .folder-search-item:hover {
+    background: var(--surface-light);
+  }
+
+  .folder-search-empty {
+    padding: 10px 12px;
+    color: var(--text-muted);
+    font-size: 14px;
   }
   
   /* Upload Area */
@@ -3509,7 +3965,19 @@ const FIXED_INDEX_PAGE = `
     <div class="toolbar">
       <button type="button" class="btn btn-primary" onclick="showNewFolderModal()">📁 新建文件夹</button>
       <button type="button" class="btn btn-primary" onclick="document.getElementById('fileInput').click()">📤 上传文件</button>
+      <button type="button" class="btn btn-secondary" onclick="toggleSelectAll(true)">全选</button>
       <input type="file" id="fileInput" multiple style="display: none;" onchange="handleFileUpload(event)">
+    </div>
+
+    <div class="batch-toolbar" id="batchToolbar">
+      <label class="batch-count">
+        <input type="checkbox" id="selectAllCheckbox" onchange="toggleSelectAll(this.checked)">
+        已选择 <span id="selectedCount">0</span> 项
+      </label>
+      <button type="button" class="btn btn-sm btn-secondary" onclick="showBatchTargetModal('copy')">复制</button>
+      <button type="button" class="btn btn-sm btn-secondary" onclick="showBatchTargetModal('move')">移动</button>
+      <button type="button" class="btn btn-sm btn-danger" onclick="batchDelete()">删除</button>
+      <button type="button" class="btn btn-sm btn-secondary" onclick="clearSelection()">取消选择</button>
     </div>
 
     <div class="card">
@@ -3594,6 +4062,28 @@ const FIXED_INDEX_PAGE = `
     </div>
   </div>
 
+  <div class="modal-overlay" id="batchTargetModal">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title" id="batchTargetTitle">批量操作</div>
+        <button type="button" class="modal-close" onclick="closeModal('batchTargetModal')">&times;</button>
+      </div>
+      <form onsubmit="submitBatchTarget(event)">
+        <div class="form-group">
+          <label class="form-label" for="batchFolderSearch">搜索文件夹</label>
+          <input type="text" id="batchFolderSearch" class="form-input" placeholder="输入文件夹名称或路径">
+          <div class="folder-search-results" id="batchFolderSearchResults"></div>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="batchDestinationPath">目标文件夹路径</label>
+          <input type="text" id="batchDestinationPath" class="form-input" placeholder="/ 或 /文件夹/子文件夹" required>
+        </div>
+        <input type="hidden" id="batchOperation">
+        <button type="submit" class="btn btn-primary" style="width: 100%;">确认</button>
+      </form>
+    </div>
+  </div>
+
   <div class="preview-overlay" id="previewOverlay">
     <div class="preview-header">
       <div class="preview-filename" id="previewFilename"></div>
@@ -3610,6 +4100,19 @@ const FIXED_INDEX_PAGE = `
 
   <script>
     let currentPath = '/';
+    let currentReader = null;
+    let readerSaveTimer = null;
+    const selectedItems = new Map();
+    let folderSearchTimer = null;
+    let folderSearchRequestId = 0;
+    const ACTION_ICONS = {
+      open: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v1"/><path d="M3 7v10a2 2 0 0 0 2 2h13.4a2 2 0 0 0 1.9-1.4l1.5-5A2 2 0 0 0 19.9 10H7.4a2 2 0 0 0-1.9 1.4L3 18"/></svg>',
+      preview: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>',
+      download: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>',
+      share: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 10.6l6.8-4.2"/><path d="M8.6 13.4l6.8 4.2"/></svg>',
+      rename: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
+      delete: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>'
+    };
 
     function encodePathForUrl(path) {
       if (!path || path === '/') return '/';
@@ -3648,6 +4151,7 @@ const FIXED_INDEX_PAGE = `
           throw new Error(data.message || '加载失败');
         }
         currentPath = data.currentPath || currentPath;
+        clearSelection(false);
         renderBreadcrumb();
         renderFiles(data.folders || [], data.files || []);
       } catch (error) {
@@ -3670,6 +4174,7 @@ const FIXED_INDEX_PAGE = `
           throw new Error(data.message || '刷新失败');
         }
         currentPath = data.currentPath || currentPath;
+        clearSelection(false);
         renderBreadcrumb();
         renderFiles(data.folders || [], data.files || []);
         showToast('已刷新当前目录', 'success');
@@ -3758,6 +4263,9 @@ const FIXED_INDEX_PAGE = `
     function createFileCard(item) {
       const card = document.createElement('div');
       card.className = 'file-item';
+      if (selectedItems.has(item.path)) {
+        card.classList.add('selected');
+      }
       card.addEventListener('dblclick', function () {
         if (item.isFolder) {
           navigateTo(item.path);
@@ -3765,6 +4273,19 @@ const FIXED_INDEX_PAGE = `
           handleFileClick(item.path, item.previewType, item.name);
         }
       });
+
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.className = 'file-select';
+      checkbox.checked = selectedItems.has(item.path);
+      checkbox.setAttribute('aria-label', '选择 ' + item.name);
+      checkbox.addEventListener('click', function (event) {
+        event.stopPropagation();
+      });
+      checkbox.addEventListener('change', function () {
+        toggleItemSelection(item, checkbox.checked, card);
+      });
+      card.appendChild(checkbox);
 
       const icon = document.createElement('div');
       icon.className = 'file-icon';
@@ -3790,28 +4311,28 @@ const FIXED_INDEX_PAGE = `
       const actions = document.createElement('div');
       actions.className = 'file-actions';
       if (item.isFolder) {
-        actions.appendChild(createActionButton('打开', 'btn-primary', function () {
+        actions.appendChild(createActionButton('open', '打开', 'btn-primary', function () {
           navigateTo(item.path);
         }));
-        actions.appendChild(createActionButton('删除', 'btn-danger', function () {
+        actions.appendChild(createActionButton('delete', '删除', 'btn-danger', function () {
           deleteFile(item.path);
         }));
       } else {
         if (item.previewType) {
-          actions.appendChild(createActionButton('预览', 'btn-primary', function () {
+          actions.appendChild(createActionButton('preview', '预览', 'btn-primary', function () {
             previewFile(item.path, item.previewType, item.name);
           }));
         }
-        actions.appendChild(createActionButton('下载', 'btn-primary', function () {
+        actions.appendChild(createActionButton('download', '下载', 'btn-primary', function () {
           downloadFile(item.path);
         }));
-        actions.appendChild(createActionButton('分享', 'btn-secondary', function () {
+        actions.appendChild(createActionButton('share', '分享', 'btn-secondary', function () {
           showShareModal(item.path);
         }));
-        actions.appendChild(createActionButton('重命名', 'btn-secondary', function () {
+        actions.appendChild(createActionButton('rename', '重命名', 'btn-secondary', function () {
           showRenameModal(item.path, item.name);
         }));
-        actions.appendChild(createActionButton('删除', 'btn-danger', function () {
+        actions.appendChild(createActionButton('delete', '删除', 'btn-danger', function () {
           deleteFile(item.path);
         }));
       }
@@ -3819,16 +4340,80 @@ const FIXED_INDEX_PAGE = `
       return card;
     }
 
-    function createActionButton(label, className, handler) {
+    function createActionButton(actionKey, label, className, handler) {
       const button = document.createElement('button');
       button.type = 'button';
-      button.className = 'btn btn-sm ' + className;
-      button.textContent = label;
+      button.className = 'btn btn-sm icon-btn ' + className;
+      button.title = label;
+      button.setAttribute('aria-label', label);
+      button.innerHTML = ACTION_ICONS[actionKey] || label;
       button.addEventListener('click', function (event) {
         event.stopPropagation();
         handler();
       });
       return button;
+    }
+
+    function toggleItemSelection(item, checked, card) {
+      if (checked) {
+        selectedItems.set(item.path, {
+          path: item.path,
+          name: item.name,
+          isFolder: !!item.isFolder
+        });
+      } else {
+        selectedItems.delete(item.path);
+      }
+      if (card) {
+        card.classList.toggle('selected', checked);
+      }
+      updateBatchToolbar();
+    }
+
+    function toggleSelectAll(checked) {
+      document.querySelectorAll('.file-select').forEach(function (checkbox) {
+        checkbox.checked = checked;
+        checkbox.dispatchEvent(new Event('change'));
+      });
+    }
+
+    function clearSelection(updateOnly) {
+      selectedItems.clear();
+      document.querySelectorAll('.file-select').forEach(function (checkbox) {
+        checkbox.checked = false;
+        const card = checkbox.closest('.file-item');
+        if (card) card.classList.remove('selected');
+      });
+      if (updateOnly !== false) {
+        updateBatchToolbar();
+      } else {
+        const toolbar = document.getElementById('batchToolbar');
+        const selectedCount = document.getElementById('selectedCount');
+        const selectAll = document.getElementById('selectAllCheckbox');
+        if (toolbar) toolbar.classList.remove('active');
+        if (selectedCount) selectedCount.textContent = '0';
+        if (selectAll) {
+          selectAll.checked = false;
+          selectAll.indeterminate = false;
+        }
+      }
+    }
+
+    function updateBatchToolbar() {
+      const count = selectedItems.size;
+      const toolbar = document.getElementById('batchToolbar');
+      const selectedCount = document.getElementById('selectedCount');
+      const selectAll = document.getElementById('selectAllCheckbox');
+      const total = document.querySelectorAll('.file-select').length;
+
+      toolbar.classList.toggle('active', count > 0);
+      selectedCount.textContent = String(count);
+      selectAll.checked = total > 0 && count === total;
+      selectAll.indeterminate = count > 0 && count < total;
+    }
+
+    function getSelectedItems() {
+      return Array.from(selectedItems.values());
     }
 
     function getFileIcon(filename) {
@@ -3888,6 +4473,8 @@ const FIXED_INDEX_PAGE = `
       const filenameEl = document.getElementById('previewFilename');
       const downloadBtn = document.getElementById('previewDownloadBtn');
 
+      stopReaderProgressTracking();
+      content.classList.remove('reader-mode');
       filenameEl.textContent = filename;
       downloadBtn.onclick = function () {
         downloadFile(path);
@@ -3938,7 +4525,9 @@ const FIXED_INDEX_PAGE = `
           const buffer = await response.arrayBuffer();
           const text = decodeTextBuffer(buffer);
           const ext = (filename.split('.').pop() || '').toLowerCase();
-          if (ext === 'md' && window.marked) {
+          if (ext === 'txt') {
+            await renderTxtReader(content, path, text);
+          } else if (ext === 'md' && window.marked) {
             const wrapper = document.createElement('div');
             wrapper.className = 'preview-markdown';
             wrapper.innerHTML = window.marked.parse(text);
@@ -3963,6 +4552,157 @@ const FIXED_INDEX_PAGE = `
       } catch (error) {
         showPreviewError('预览加载失败: ' + error.message);
       }
+    }
+
+    async function renderTxtReader(content, path, text) {
+      content.classList.add('reader-mode');
+
+      const reader = document.createElement('div');
+      reader.className = 'preview-reader';
+      reader.tabIndex = 0;
+      const textNode = document.createTextNode(text);
+      reader.appendChild(textNode);
+      content.replaceChildren(reader);
+
+      const state = { path, text, reader, textNode };
+      currentReader = state;
+
+      await restoreReaderProgress(state);
+      reader.addEventListener('scroll', function () {
+        scheduleReaderProgressSave(state);
+      }, { passive: true });
+    }
+
+    async function restoreReaderProgress(state) {
+      try {
+        const response = await fetch('/api/reader/progress?path=' + encodeURIComponent(state.path));
+        if (!response.ok) return;
+
+        const data = await response.json();
+        const saved = data.progress;
+        if (!saved) return;
+
+        await waitForReaderLayout();
+
+        const restoredByChar = scrollReaderToCharOffset(state, saved.charOffset);
+        if (!restoredByChar) {
+          scrollReaderToProgress(state, saved.progress);
+        }
+      } catch (error) {
+        console.warn('Reader progress restore failed:', error);
+      }
+    }
+
+    function waitForReaderLayout() {
+      return new Promise(function (resolve) {
+        requestAnimationFrame(function () {
+          requestAnimationFrame(resolve);
+        });
+      });
+    }
+
+    function scrollReaderToCharOffset(state, charOffset) {
+      const textLength = state.text.length;
+      if (!Number.isFinite(charOffset) || textLength === 0) return false;
+
+      const offset = Math.max(0, Math.min(textLength, Math.floor(charOffset)));
+      if (offset === 0) {
+        state.reader.scrollTop = 0;
+        return true;
+      }
+
+      const range = document.createRange();
+      const start = Math.max(0, Math.min(offset, textLength - 1));
+      const end = Math.min(textLength, start + 1);
+      range.setStart(state.textNode, start);
+      range.setEnd(state.textNode, end);
+
+      const rect = range.getBoundingClientRect();
+      if (range.detach) range.detach();
+
+      if (!rect || (rect.width === 0 && rect.height === 0)) return false;
+
+      const readerRect = state.reader.getBoundingClientRect();
+      state.reader.scrollTop += rect.top - readerRect.top - 28;
+      return true;
+    }
+
+    function scrollReaderToProgress(state, progress) {
+      const safeProgress = Number.isFinite(progress) ? Math.max(0, Math.min(1, progress)) : 0;
+      const maxScrollTop = Math.max(0, state.reader.scrollHeight - state.reader.clientHeight);
+      state.reader.scrollTop = maxScrollTop * safeProgress;
+    }
+
+    function scheduleReaderProgressSave(state) {
+      if (currentReader !== state) return;
+      if (readerSaveTimer) clearTimeout(readerSaveTimer);
+      readerSaveTimer = setTimeout(function () {
+        readerSaveTimer = null;
+        saveReaderProgress(state);
+      }, 500);
+    }
+
+    function stopReaderProgressTracking() {
+      if (readerSaveTimer) {
+        clearTimeout(readerSaveTimer);
+        readerSaveTimer = null;
+      }
+
+      const state = currentReader;
+      currentReader = null;
+      if (state) {
+        saveReaderProgress(state);
+      }
+    }
+
+    async function saveReaderProgress(state) {
+      try {
+        const maxScrollTop = Math.max(0, state.reader.scrollHeight - state.reader.clientHeight);
+        const progress = maxScrollTop > 0 ? state.reader.scrollTop / maxScrollTop : 0;
+        const payload = {
+          path: state.path,
+          charOffset: getReaderCharOffset(state),
+          progress,
+          scrollTop: state.reader.scrollTop,
+          scrollHeight: state.reader.scrollHeight
+        };
+
+        await fetch('/api/reader/progress', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          keepalive: true
+        });
+      } catch (error) {
+        console.warn('Reader progress save failed:', error);
+      }
+    }
+
+    function getReaderCharOffset(state) {
+      const rect = state.reader.getBoundingClientRect();
+      const x = rect.left + Math.min(48, Math.max(8, state.reader.clientWidth - 8));
+      const y = rect.top + 32;
+      let offset = null;
+
+      if (document.caretPositionFromPoint) {
+        const position = document.caretPositionFromPoint(x, y);
+        if (position && position.offsetNode === state.textNode) {
+          offset = position.offset;
+        }
+      } else if (document.caretRangeFromPoint) {
+        const range = document.caretRangeFromPoint(x, y);
+        if (range && range.startContainer === state.textNode) {
+          offset = range.startOffset;
+        }
+      }
+
+      if (!Number.isFinite(offset)) {
+        const maxScrollTop = Math.max(0, state.reader.scrollHeight - state.reader.clientHeight);
+        const progress = maxScrollTop > 0 ? state.reader.scrollTop / maxScrollTop : 0;
+        offset = Math.floor(state.text.length * progress);
+      }
+
+      return Math.max(0, Math.min(state.text.length, Math.floor(offset)));
     }
 
     function decodeTextBuffer(buffer) {
@@ -3997,8 +4737,11 @@ const FIXED_INDEX_PAGE = `
     }
 
     function closePreview() {
+      stopReaderProgressTracking();
       document.getElementById('previewOverlay').classList.remove('active');
-      document.getElementById('previewContent').replaceChildren();
+      const content = document.getElementById('previewContent');
+      content.classList.remove('reader-mode');
+      content.replaceChildren();
     }
 
     document.addEventListener('keydown', function (event) {
@@ -4127,6 +4870,152 @@ const FIXED_INDEX_PAGE = `
       }
     }
 
+    function initializeBatchFolderSearch() {
+      const input = document.getElementById('batchFolderSearch');
+      if (!input) return;
+
+      input.addEventListener('input', function () {
+        if (folderSearchTimer) clearTimeout(folderSearchTimer);
+        folderSearchTimer = window.setTimeout(function () {
+          searchBatchFolders(input.value);
+        }, 300);
+      });
+
+      input.addEventListener('focus', function () {
+        searchBatchFolders(input.value);
+      });
+    }
+
+    function clearBatchFolderSearchResults() {
+      const results = document.getElementById('batchFolderSearchResults');
+      if (!results) return;
+      results.classList.remove('active');
+      results.replaceChildren();
+    }
+
+    async function searchBatchFolders(query) {
+      const results = document.getElementById('batchFolderSearchResults');
+      if (!results) return;
+
+      const requestId = ++folderSearchRequestId;
+      results.classList.add('active');
+      results.replaceChildren(createFolderSearchMessage('搜索中...'));
+
+      try {
+        const response = await fetch('/api/folders/search?q=' + encodeURIComponent(query || '') + '&limit=50');
+        const data = await response.json();
+        if (requestId !== folderSearchRequestId) return;
+        results.replaceChildren();
+
+        if (!data.success) {
+          results.appendChild(createFolderSearchMessage(data.message || '搜索失败'));
+          return;
+        }
+
+        if (!data.folders || data.folders.length === 0) {
+          results.appendChild(createFolderSearchMessage('没有匹配的文件夹'));
+          return;
+        }
+
+        data.folders.forEach(function (folder) {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'folder-search-item';
+          button.textContent = folder.path;
+          button.addEventListener('click', function () {
+            document.getElementById('batchDestinationPath').value = folder.path;
+            document.getElementById('batchFolderSearch').value = folder.path;
+            clearBatchFolderSearchResults();
+          });
+          results.appendChild(button);
+        });
+
+        if (data.truncated) {
+          results.appendChild(createFolderSearchMessage('仅显示前 50 条结果，请输入更精确的关键词'));
+        }
+      } catch (error) {
+        if (requestId !== folderSearchRequestId) return;
+        results.replaceChildren(createFolderSearchMessage('搜索失败: ' + error.message));
+      }
+    }
+
+    function createFolderSearchMessage(message) {
+      const div = document.createElement('div');
+      div.className = 'folder-search-empty';
+      div.textContent = message;
+      return div;
+    }
+
+    function showBatchTargetModal(operation) {
+      const items = getSelectedItems();
+      if (items.length === 0) {
+        showToast('请先选择文件或文件夹', 'error');
+        return;
+      }
+
+      document.getElementById('batchOperation').value = operation;
+      document.getElementById('batchDestinationPath').value = currentPath;
+      document.getElementById('batchFolderSearch').value = '';
+      clearBatchFolderSearchResults();
+      document.getElementById('batchTargetTitle').textContent = operation === 'copy' ? '复制到' : '移动到';
+      document.getElementById('batchTargetModal').classList.add('active');
+      searchBatchFolders('');
+    }
+
+    async function submitBatchTarget(event) {
+      event.preventDefault();
+      const operation = document.getElementById('batchOperation').value;
+      const destinationPath = document.getElementById('batchDestinationPath').value.trim() || '/';
+      closeModal('batchTargetModal');
+      await runBatchOperation(operation, destinationPath);
+    }
+
+    async function batchDelete() {
+      const items = getSelectedItems();
+      if (items.length === 0) {
+        showToast('请先选择文件或文件夹', 'error');
+        return;
+      }
+
+      if (!window.confirm('确定要删除选中的 ' + items.length + ' 项吗？此操作不可恢复。')) return;
+      await runBatchOperation('delete', '/');
+    }
+
+    async function runBatchOperation(operation, destinationPath) {
+      const items = getSelectedItems();
+      if (items.length === 0) return;
+
+      showLoading(true);
+      try {
+        const response = await fetch('/api/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            operation: operation,
+            destinationPath: destinationPath,
+            items: items
+          })
+        });
+        const data = await response.json();
+        if (data.success) {
+          const failed = Array.isArray(data.errors) ? data.errors.length : 0;
+          showToast(failed > 0 ? '部分项目操作失败，已完成其余项目' : '批量操作成功', failed > 0 ? 'info' : 'success');
+          if (failed > 0 && data.errors[0]) {
+            showToast(data.errors[0].path + ': ' + data.errors[0].message, 'error');
+          }
+          clearSelection();
+          await loadFiles();
+        } else {
+          const detail = data.errors && data.errors[0] ? data.errors[0].message : (data.message || '未知错误');
+          showToast('批量操作失败: ' + detail, 'error');
+        }
+      } catch (error) {
+        showToast('批量操作失败: ' + error.message, 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
     function downloadFile(path) {
       window.open(apiFileUrl('/api/download', path), '_blank');
     }
@@ -4210,6 +5099,7 @@ const FIXED_INDEX_PAGE = `
       }, 3000);
     }
 
+    initializeBatchFolderSearch();
     checkAuth();
     loadFiles();
   </script>
@@ -4732,6 +5622,22 @@ export default {
 
         if (path === '/api/cache/refresh' && method === 'POST') {
           return await handleRefreshDirectoryCache(request, env);
+        }
+
+        if (path === '/api/reader/progress' && method === 'GET') {
+          return await handleGetReaderProgress(request, env);
+        }
+
+        if (path === '/api/reader/progress' && method === 'PUT') {
+          return await handlePutReaderProgress(request, env);
+        }
+
+        if (path === '/api/batch' && method === 'POST') {
+          return await handleBatchFileOperation(request, env);
+        }
+
+        if (path === '/api/folders/search' && method === 'GET') {
+          return await handleSearchFolders(request, env);
         }
         
         // File management routes
