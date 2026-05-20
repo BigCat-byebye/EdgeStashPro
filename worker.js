@@ -1684,6 +1684,17 @@ const CSS_STYLES = `
     height: 34px;
     padding: 0;
     flex: 0 0 34px;
+    border-radius: 50%;
+  }
+
+  .icon-btn.btn-secondary:hover {
+    background: var(--primary);
+    color: white;
+    transform: scale(1.1);
+  }
+
+  .icon-btn.btn-danger:hover {
+    transform: scale(1.1);
   }
 
   .action-icon {
@@ -1878,11 +1889,54 @@ const CSS_STYLES = `
   .preview-filename {
     font-weight: 600;
     color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1;
+    min-width: 0;
+    text-align: center;
   }
-  
+
   .preview-actions {
     display: flex;
     gap: 12px;
+    align-items: center;
+  }
+
+  .preview-icon-btn {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    border: none;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    flex-shrink: 0;
+    font-size: 16px;
+    line-height: 1;
+    padding: 0;
+  }
+
+  .preview-icon-btn.preview-close {
+    background: var(--surface-light);
+    color: var(--text);
+  }
+
+  .preview-icon-btn.preview-close:hover {
+    background: var(--surface);
+    transform: scale(1.05);
+  }
+
+  .preview-icon-btn.preview-download {
+    background: var(--gradient);
+    color: white;
+  }
+
+  .preview-icon-btn.preview-download:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 14px rgba(99, 102, 241, 0.3);
   }
   
   .preview-content {
@@ -2175,6 +2229,13 @@ const CSS_STYLES = `
     height: 18px;
     accent-color: var(--primary);
     cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+  }
+
+  .file-item:hover .file-select,
+  .file-select:checked {
+    opacity: 1;
   }
   
   .file-icon {
@@ -2198,11 +2259,22 @@ const CSS_STYLES = `
   
   .file-actions {
     display: flex;
-    gap: 8px;
+    gap: 6px;
     margin-top: 12px;
     justify-content: center;
     flex-wrap: wrap;
     max-width: 100%;
+    opacity: 0;
+    max-height: 0;
+    overflow: hidden;
+    margin-top: 0;
+    transition: opacity 0.2s ease, max-height 0.25s ease, margin-top 0.25s ease;
+  }
+
+  .file-item:hover .file-actions {
+    opacity: 1;
+    max-height: 80px;
+    margin-top: 12px;
   }
   
   /* Stats Cards */
@@ -2426,17 +2498,36 @@ const CSS_STYLES = `
   /* Responsive */
   @media (max-width: 768px) {
     .header {
-      flex-direction: column;
-      gap: 16px;
+      flex-direction: row;
+      gap: 8px;
+      padding: 12px 16px;
     }
     
     .header-actions {
-      width: 100%;
-      justify-content: center;
+      gap: 6px;
+    }
+
+    .header-actions .btn {
+      padding: 6px 10px;
+      font-size: 12px;
+    }
+
+    .logo {
+      font-size: 18px;
+    }
+
+    .container {
+      padding: 16px;
+    }
+
+    .toolbar .btn {
+      padding: 8px 12px;
+      font-size: 13px;
     }
     
     .file-grid {
-      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 12px;
     }
     
     .stats-grid {
@@ -2447,9 +2538,28 @@ const CSS_STYLES = `
       flex-direction: column;
     }
     
+    .file-actions {
+      opacity: 1;
+      max-height: none;
+      margin-top: 10px;
+    }
+
+    .file-select {
+      opacity: 1;
+    }
+
     .preview-header {
-      flex-direction: column;
+      flex-direction: row;
       gap: 12px;
+      padding: 12px 16px;
+    }
+
+    .preview-actions .btn {
+      display: none;
+    }
+
+    .preview-icon-btn {
+      display: inline-flex;
     }
   }
   
@@ -2831,6 +2941,8 @@ const INDEX_PAGE = `
       <div class="preview-actions">
         <button class="btn btn-primary" id="previewDownloadBtn">下载</button>
         <button class="btn btn-secondary" onclick="closePreview()">关闭</button>
+        <button type="button" class="preview-icon-btn preview-download" onclick="document.getElementById('previewDownloadBtn').click()">⬇</button>
+        <button type="button" class="preview-icon-btn preview-close" onclick="closePreview()">✕</button>
       </div>
     </div>
     <div class="preview-content" id="previewContent">
@@ -3965,7 +4077,6 @@ const FIXED_INDEX_PAGE = `
     <div class="toolbar">
       <button type="button" class="btn btn-primary" onclick="showNewFolderModal()">📁 新建文件夹</button>
       <button type="button" class="btn btn-primary" onclick="document.getElementById('fileInput').click()">📤 上传文件</button>
-      <button type="button" class="btn btn-secondary" onclick="toggleSelectAll(true)">全选</button>
       <input type="file" id="fileInput" multiple style="display: none;" onchange="handleFileUpload(event)">
     </div>
 
@@ -4090,6 +4201,8 @@ const FIXED_INDEX_PAGE = `
       <div class="preview-actions">
         <button type="button" class="btn btn-primary" id="previewDownloadBtn">下载</button>
         <button type="button" class="btn btn-secondary" onclick="closePreview()">关闭</button>
+        <button type="button" class="preview-icon-btn preview-download" onclick="document.getElementById('previewDownloadBtn').click()">⬇</button>
+        <button type="button" class="preview-icon-btn preview-close" onclick="closePreview()">✕</button>
       </div>
     </div>
     <div class="preview-content" id="previewContent"></div>
@@ -4311,7 +4424,7 @@ const FIXED_INDEX_PAGE = `
       const actions = document.createElement('div');
       actions.className = 'file-actions';
       if (item.isFolder) {
-        actions.appendChild(createActionButton('open', '打开', 'btn-primary', function () {
+        actions.appendChild(createActionButton('open', '打开', 'btn-secondary', function () {
           navigateTo(item.path);
         }));
         actions.appendChild(createActionButton('delete', '删除', 'btn-danger', function () {
@@ -4319,11 +4432,11 @@ const FIXED_INDEX_PAGE = `
         }));
       } else {
         if (item.previewType) {
-          actions.appendChild(createActionButton('preview', '预览', 'btn-primary', function () {
+          actions.appendChild(createActionButton('preview', '预览', 'btn-secondary', function () {
             previewFile(item.path, item.previewType, item.name);
           }));
         }
-        actions.appendChild(createActionButton('download', '下载', 'btn-primary', function () {
+        actions.appendChild(createActionButton('download', '下载', 'btn-secondary', function () {
           downloadFile(item.path);
         }));
         actions.appendChild(createActionButton('share', '分享', 'btn-secondary', function () {
