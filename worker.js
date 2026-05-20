@@ -1038,6 +1038,339 @@ async function handleBatchFileOperation(request, env) {
   }
 }
 
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < 256; index++) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit++) {
+      value = (value & 1) ? (0xedb88320 ^ (value >>> 1)) : (value >>> 1);
+    }
+    table[index] = value >>> 0;
+  }
+  return table;
+})();
+
+function updateCrc32(crc, chunk) {
+  let value = crc;
+  for (let index = 0; index < chunk.length; index++) {
+    value = CRC32_TABLE[(value ^ chunk[index]) & 0xff] ^ (value >>> 8);
+  }
+  return value >>> 0;
+}
+
+function finalizeCrc32(crc) {
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function createZipDateParts(value) {
+  const date = value ? new Date(value) : new Date();
+  const year = Math.max(1980, date.getFullYear());
+  return {
+    time: (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2),
+    date: ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate()
+  };
+}
+
+function writeUint16(buffer, offset, value) {
+  buffer[offset] = value & 0xff;
+  buffer[offset + 1] = (value >>> 8) & 0xff;
+}
+
+function writeUint32(buffer, offset, value) {
+  buffer[offset] = value & 0xff;
+  buffer[offset + 1] = (value >>> 8) & 0xff;
+  buffer[offset + 2] = (value >>> 16) & 0xff;
+  buffer[offset + 3] = (value >>> 24) & 0xff;
+}
+
+function createZipLocalHeader(entry) {
+  const header = new Uint8Array(30 + entry.nameBytes.length);
+  const dateParts = createZipDateParts(entry.lastModified);
+  const flags = 0x0800 | (entry.isDirectory ? 0 : 0x0008);
+
+  writeUint32(header, 0, 0x04034b50);
+  writeUint16(header, 4, 20);
+  writeUint16(header, 6, flags);
+  writeUint16(header, 8, 0);
+  writeUint16(header, 10, dateParts.time);
+  writeUint16(header, 12, dateParts.date);
+  writeUint32(header, 14, 0);
+  writeUint32(header, 18, 0);
+  writeUint32(header, 22, 0);
+  writeUint16(header, 26, entry.nameBytes.length);
+  writeUint16(header, 28, 0);
+  header.set(entry.nameBytes, 30);
+  return header;
+}
+
+function createZipDataDescriptor(crc, size) {
+  const descriptor = new Uint8Array(16);
+  writeUint32(descriptor, 0, 0x08074b50);
+  writeUint32(descriptor, 4, crc);
+  writeUint32(descriptor, 8, size);
+  writeUint32(descriptor, 12, size);
+  return descriptor;
+}
+
+function createZipCentralDirectoryHeader(entry) {
+  const header = new Uint8Array(46 + entry.nameBytes.length);
+  const dateParts = createZipDateParts(entry.lastModified);
+  const flags = 0x0800 | (entry.isDirectory ? 0 : 0x0008);
+
+  writeUint32(header, 0, 0x02014b50);
+  writeUint16(header, 4, 20);
+  writeUint16(header, 6, 20);
+  writeUint16(header, 8, flags);
+  writeUint16(header, 10, 0);
+  writeUint16(header, 12, dateParts.time);
+  writeUint16(header, 14, dateParts.date);
+  writeUint32(header, 16, entry.crc || 0);
+  writeUint32(header, 20, entry.size || 0);
+  writeUint32(header, 24, entry.size || 0);
+  writeUint16(header, 28, entry.nameBytes.length);
+  writeUint16(header, 30, 0);
+  writeUint16(header, 32, 0);
+  writeUint16(header, 34, 0);
+  writeUint16(header, 36, 0);
+  writeUint32(header, 38, entry.isDirectory ? 0x10 : 0);
+  writeUint32(header, 42, entry.offset);
+  header.set(entry.nameBytes, 46);
+  return header;
+}
+
+function createZipEndRecord(entryCount, centralDirectorySize, centralDirectoryOffset) {
+  const record = new Uint8Array(22);
+  writeUint32(record, 0, 0x06054b50);
+  writeUint16(record, 4, 0);
+  writeUint16(record, 6, 0);
+  writeUint16(record, 8, entryCount);
+  writeUint16(record, 10, entryCount);
+  writeUint32(record, 12, centralDirectorySize);
+  writeUint32(record, 16, centralDirectoryOffset);
+  writeUint16(record, 20, 0);
+  return record;
+}
+
+function sanitizeZipEntryName(name) {
+  const value = name || '未命名';
+  const isDirectory = value.endsWith('/');
+  const normalized = value
+    .replace(/^\/+/, '')
+    .replace(/\\/g, '/')
+    .split('/')
+    .filter(Boolean)
+    .join('/');
+  return isDirectory && normalized ? normalized + '/' : normalized;
+}
+
+function uniqueZipEntryName(name, usedNames) {
+  const sanitized = sanitizeZipEntryName(name);
+  const isDirectory = sanitized.endsWith('/');
+  const normalized = isDirectory ? sanitized : sanitized.replace(/\/+$/, '');
+  const baseName = isDirectory ? normalized.slice(0, -1) : normalized;
+  let candidate = isDirectory ? baseName + '/' : baseName;
+  let index = 2;
+
+  while (usedNames.has(candidate)) {
+    if (isDirectory) {
+      candidate = baseName + ' (' + index + ')/';
+    } else {
+      const slashIndex = baseName.lastIndexOf('/');
+      const parent = slashIndex >= 0 ? baseName.slice(0, slashIndex + 1) : '';
+      const filename = slashIndex >= 0 ? baseName.slice(slashIndex + 1) : baseName;
+      const dotIndex = filename.lastIndexOf('.');
+      candidate = dotIndex > 0
+        ? parent + filename.slice(0, dotIndex) + ' (' + index + ')' + filename.slice(dotIndex)
+        : parent + filename + ' (' + index + ')';
+    }
+    index++;
+  }
+
+  usedNames.add(candidate);
+  return candidate;
+}
+
+function addZipEntry(entries, usedNames, entry) {
+  const encoder = new TextEncoder();
+  const name = uniqueZipEntryName(entry.name, usedNames);
+  const nameBytes = encoder.encode(name);
+  if (nameBytes.length > 0xffff) {
+    throw new Error('文件名过长，无法打包: ' + name);
+  }
+  entries.push({ ...entry, name, nameBytes });
+}
+
+async function collectBatchDownloadEntries(env, items) {
+  const entries = [];
+  const usedNames = new Set();
+  const usedKeys = new Set();
+
+  for (const item of items) {
+    const itemPath = normalizeItemPath(typeof item === 'string' ? item : item.path);
+    const key = itemPathToR2Key(itemPath);
+    if (!key) throw new Error('不能打包根目录');
+
+    const fileObject = await env.R2_BUCKET.head(key);
+    if (fileObject) {
+      if (usedKeys.has(key)) continue;
+      usedKeys.add(key);
+      addZipEntry(entries, usedNames, {
+        name: nameFromItemPath(itemPath),
+        key,
+        isDirectory: false,
+        lastModified: fileObject.uploaded
+      });
+      continue;
+    }
+
+    const prefix = key + '/';
+    let cursor;
+    let foundFolderObject = false;
+    const directoryName = uniqueZipEntryName(nameFromItemPath(itemPath) + '/', usedNames);
+    const directoryNameBytes = new TextEncoder().encode(directoryName);
+    if (directoryNameBytes.length > 0xffff) {
+      throw new Error('文件名过长，无法打包: ' + directoryName);
+    }
+    entries.push({
+      name: directoryName,
+      nameBytes: directoryNameBytes,
+      isDirectory: true,
+      lastModified: new Date()
+    });
+
+    do {
+      const listed = await env.R2_BUCKET.list({ prefix, cursor });
+      for (const obj of listed.objects || []) {
+        foundFolderObject = true;
+        const relativeName = obj.key.slice(prefix.length);
+        if (!relativeName || relativeName === '.folder') continue;
+        if (relativeName.endsWith('/.folder')) {
+          addZipEntry(entries, usedNames, {
+            name: directoryName + relativeName.slice(0, -'.folder'.length),
+            isDirectory: true,
+            lastModified: obj.uploaded
+          });
+          continue;
+        }
+        if (usedKeys.has(obj.key)) continue;
+        usedKeys.add(obj.key);
+        addZipEntry(entries, usedNames, {
+          name: directoryName + relativeName,
+          key: obj.key,
+          isDirectory: false,
+          lastModified: obj.uploaded
+        });
+      }
+      cursor = listed.truncated ? listed.cursor : null;
+    } while (cursor);
+
+    if (!foundFolderObject) {
+      throw new Error('项目不存在: ' + itemPath);
+    }
+  }
+
+  if (entries.length === 0) {
+    throw new Error('没有可打包的文件');
+  }
+  return entries;
+}
+
+function createZipStream(env, entries) {
+  return new ReadableStream({
+    async start(controller) {
+      const centralDirectory = [];
+      let offset = 0;
+
+      function enqueue(chunk) {
+        controller.enqueue(chunk);
+        offset += chunk.length;
+        if (offset > 0xffffffff) {
+          throw new Error('打包文件过大，暂不支持超过 4GB 的 zip');
+        }
+      }
+
+      try {
+        for (const entry of entries) {
+          entry.offset = offset;
+          const localHeader = createZipLocalHeader(entry);
+          enqueue(localHeader);
+
+          let crc = 0xffffffff;
+          let size = 0;
+          if (!entry.isDirectory) {
+            const object = await env.R2_BUCKET.get(entry.key);
+            if (!object) throw new Error('文件不存在: ' + entry.name);
+
+            const reader = object.body.getReader();
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+              crc = updateCrc32(crc, chunk);
+              size += chunk.length;
+              if (size > 0xffffffff) {
+                throw new Error('单个文件过大，暂不支持超过 4GB 的文件: ' + entry.name);
+              }
+              enqueue(chunk);
+            }
+          }
+
+          entry.crc = entry.isDirectory ? 0 : finalizeCrc32(crc);
+          entry.size = size;
+          if (!entry.isDirectory) {
+            enqueue(createZipDataDescriptor(entry.crc, entry.size));
+          }
+          centralDirectory.push(createZipCentralDirectoryHeader(entry));
+        }
+
+        const centralDirectoryOffset = offset;
+        let centralDirectorySize = 0;
+        for (const header of centralDirectory) {
+          centralDirectorySize += header.length;
+          if (centralDirectorySize > 0xffffffff) {
+            throw new Error('打包文件过大，暂不支持超过 4GB 的 zip 目录');
+          }
+          enqueue(header);
+        }
+        if (entries.length > 0xffff) {
+          throw new Error('打包文件数量过多，暂不支持超过 65535 个条目');
+        }
+        enqueue(createZipEndRecord(entries.length, centralDirectorySize, centralDirectoryOffset));
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      }
+    }
+  });
+}
+
+async function handleBatchDownload(request, env) {
+  const auth = await verifyAuth(request, env);
+  if (!auth) {
+    return jsonResponse({ success: false, message: '未授权' }, 401);
+  }
+
+  try {
+    const body = await request.json();
+    const items = Array.isArray(body.items) ? body.items : [];
+    if (items.length === 0) {
+      return jsonResponse({ success: false, message: '请选择要下载的文件或文件夹' }, 400);
+    }
+
+    const entries = await collectBatchDownloadEntries(env, items);
+    const filename = 'edgestash-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.zip';
+
+    return new Response(createZipStream(env, entries), {
+      headers: {
+        'Content-Type': 'application/zip',
+        'Content-Disposition': createAttachmentDisposition(filename)
+      }
+    });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '批量下载失败: ' + e.message }, 500);
+  }
+}
+
 function addFolderPathsFromR2Key(folderPaths, key) {
   const parts = (key || '').split('/').filter(Boolean);
   const folderParts = parts.slice(0, -1);
@@ -2247,7 +2580,13 @@ const CSS_STYLES = `
   .file-name {
     font-weight: 500;
     text-align: center;
-    word-break: break-all;
+    line-height: 1.35;
+    min-height: 2.7em;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
     margin-bottom: 4px;
   }
   
@@ -4087,8 +4426,8 @@ const FIXED_INDEX_PAGE = `
       </label>
       <button type="button" class="btn btn-sm btn-secondary" onclick="showBatchTargetModal('copy')">复制</button>
       <button type="button" class="btn btn-sm btn-secondary" onclick="showBatchTargetModal('move')">移动</button>
+      <button type="button" class="btn btn-sm btn-secondary" onclick="batchDownload()">下载</button>
       <button type="button" class="btn btn-sm btn-danger" onclick="batchDelete()">删除</button>
-      <button type="button" class="btn btn-sm btn-secondary" onclick="clearSelection()">取消选择</button>
     </div>
 
     <div class="card">
@@ -4219,8 +4558,6 @@ const FIXED_INDEX_PAGE = `
     let folderSearchTimer = null;
     let folderSearchRequestId = 0;
     const ACTION_ICONS = {
-      open: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v1"/><path d="M3 7v10a2 2 0 0 0 2 2h13.4a2 2 0 0 0 1.9-1.4l1.5-5A2 2 0 0 0 19.9 10H7.4a2 2 0 0 0-1.9 1.4L3 18"/></svg>',
-      preview: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>',
       download: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>',
       share: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 10.6l6.8-4.2"/><path d="M8.6 13.4l6.8 4.2"/></svg>',
       rename: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
@@ -4386,6 +4723,11 @@ const FIXED_INDEX_PAGE = `
           handleFileClick(item.path, item.previewType, item.name);
         }
       });
+      card.addEventListener('click', function () {
+        if (item.isFolder && window.matchMedia('(max-width: 768px)').matches) {
+          navigateTo(item.path);
+        }
+      });
 
       const checkbox = document.createElement('input');
       checkbox.type = 'checkbox';
@@ -4408,6 +4750,7 @@ const FIXED_INDEX_PAGE = `
       const name = document.createElement('div');
       name.className = 'file-name';
       name.textContent = item.name;
+      name.title = item.name;
       card.appendChild(name);
 
       const meta = document.createElement('div');
@@ -4423,19 +4766,7 @@ const FIXED_INDEX_PAGE = `
 
       const actions = document.createElement('div');
       actions.className = 'file-actions';
-      if (item.isFolder) {
-        actions.appendChild(createActionButton('open', '打开', 'btn-secondary', function () {
-          navigateTo(item.path);
-        }));
-        actions.appendChild(createActionButton('delete', '删除', 'btn-danger', function () {
-          deleteFile(item.path);
-        }));
-      } else {
-        if (item.previewType) {
-          actions.appendChild(createActionButton('preview', '预览', 'btn-secondary', function () {
-            previewFile(item.path, item.previewType, item.name);
-          }));
-        }
+      if (!item.isFolder) {
         actions.appendChild(createActionButton('download', '下载', 'btn-secondary', function () {
           downloadFile(item.path);
         }));
@@ -4448,8 +4779,8 @@ const FIXED_INDEX_PAGE = `
         actions.appendChild(createActionButton('delete', '删除', 'btn-danger', function () {
           deleteFile(item.path);
         }));
+        card.appendChild(actions);
       }
-      card.appendChild(actions);
       return card;
     }
 
@@ -5092,6 +5423,64 @@ const FIXED_INDEX_PAGE = `
 
       if (!window.confirm('确定要删除选中的 ' + items.length + ' 项吗？此操作不可恢复。')) return;
       await runBatchOperation('delete', '/');
+    }
+
+    async function batchDownload() {
+      const items = getSelectedItems();
+      if (items.length === 0) {
+        showToast('请先选择文件或文件夹', 'error');
+        return;
+      }
+
+      showLoading(true);
+      try {
+        const response = await fetch('/api/batch/download', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: items })
+        });
+
+        if (!response.ok) {
+          let message = '下载失败';
+          try {
+            const data = await response.json();
+            message = data.message || message;
+          } catch (error) {
+            message = response.statusText || message;
+          }
+          throw new Error(message);
+        }
+
+        const blob = await response.blob();
+        const filename = getDownloadFilename(response.headers.get('Content-Disposition')) || 'edgestash.zip';
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+        showToast('批量下载已开始', 'success');
+      } catch (error) {
+        showToast('批量下载失败: ' + error.message, 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    function getDownloadFilename(header) {
+      if (!header) return '';
+      const utf8Match = header.match(/filename\\*=UTF-8''([^;\\n]+)/i);
+      if (utf8Match) {
+        try {
+          return decodeURIComponent(utf8Match[1]);
+        } catch (error) {
+          return utf8Match[1];
+        }
+      }
+      const fallbackMatch = header.match(/filename=["']?([^"';\\n]+)/i);
+      return fallbackMatch ? fallbackMatch[1] : '';
     }
 
     async function runBatchOperation(operation, destinationPath) {
@@ -5747,6 +6136,10 @@ export default {
 
         if (path === '/api/batch' && method === 'POST') {
           return await handleBatchFileOperation(request, env);
+        }
+
+        if (path === '/api/batch/download' && method === 'POST') {
+          return await handleBatchDownload(request, env);
         }
 
         if (path === '/api/folders/search' && method === 'GET') {
