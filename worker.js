@@ -9,7 +9,7 @@
  * Bindings (set in Cloudflare Dashboard):
  * - R2_BUCKET: R2 bucket binding for file storage
  * - KV_STORE: KV namespace binding for metadata storage
- * - D1_DB: D1 database binding for search, favorites, and recent visits
+ * - D1_DB: D1 database binding for search, favorites, recent visits, shares, permissions, and file tasks
  */
 
 // ============================================================================
@@ -1050,6 +1050,28 @@ async function findAvailableDestinationKey(env, desiredKey, isFolder) {
   throw new Error('目标目录中存在太多同名项目');
 }
 
+async function findAvailableDestinationKeyReserved(env, desiredKey, isFolder, reservedKeys) {
+  const reserved = reservedKeys || new Set();
+  if (!reserved.has(desiredKey) && !(await destinationExists(env, desiredKey, isFolder))) {
+    reserved.add(desiredKey);
+    return desiredKey;
+  }
+
+  const slashIndex = desiredKey.lastIndexOf('/');
+  const parent = slashIndex >= 0 ? desiredKey.slice(0, slashIndex + 1) : '';
+  const name = slashIndex >= 0 ? desiredKey.slice(slashIndex + 1) : desiredKey;
+
+  for (let index = 1; index <= 999; index++) {
+    const candidate = parent + copyNameCandidate(name, index);
+    if (!reserved.has(candidate) && !(await destinationExists(env, candidate, isFolder))) {
+      reserved.add(candidate);
+      return candidate;
+    }
+  }
+
+  throw new Error('目标目录中存在太多同名项目');
+}
+
 async function deleteItemAtPath(env, path) {
   const key = itemPathToR2Key(path);
   if (!key) throw new Error('不能操作根目录');
@@ -1230,6 +1252,596 @@ async function handleBatchFileOperation(request, env) {
   }
 }
 
+const TASK_ACTIVE_STATUSES = new Set(['queued', 'running']);
+const TASK_TYPES = new Set(['upload', 'download', 'batch_download', 'copy', 'move']);
+
+function taskRowToClient(row) {
+  let result = null;
+  if (row.result_json) {
+    try {
+      result = JSON.parse(row.result_json);
+    } catch (error) {
+      result = null;
+    }
+  }
+
+  return {
+    id: row.id,
+    type: row.task_type,
+    status: row.status,
+    title: row.title,
+    sourcePath: row.source_path || '',
+    destinationPath: row.destination_path || '',
+    totalBytes: Number(row.total_bytes || 0),
+    processedBytes: Number(row.processed_bytes || 0),
+    totalItems: Number(row.total_items || 0),
+    processedItems: Number(row.processed_items || 0),
+    errorMessage: row.error_message || '',
+    result,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    completedAt: row.completed_at || null
+  };
+}
+
+async function getTaskForAuth(env, auth, taskId) {
+  await ensureD1Schema(env);
+  const row = await env.D1_DB.prepare(`
+    SELECT * FROM file_tasks
+    WHERE id = ? AND owner_key = ?
+    LIMIT 1
+  `).bind(taskId, ownerKeyFromAuth(auth)).first();
+  return row || null;
+}
+
+async function updateTaskStatus(env, taskId, status, fields = {}) {
+  const now = Date.now();
+  const completedAt = ['succeeded', 'failed', 'canceled'].includes(status) ? now : null;
+  await env.D1_DB.prepare(`
+    UPDATE file_tasks
+    SET status = ?,
+        processed_bytes = COALESCE(?, processed_bytes),
+        total_bytes = COALESCE(?, total_bytes),
+        processed_items = COALESCE(?, processed_items),
+        total_items = COALESCE(?, total_items),
+        error_message = ?,
+        result_json = ?,
+        updated_at = ?,
+        completed_at = COALESCE(?, completed_at)
+    WHERE id = ?
+  `).bind(
+    status,
+    fields.processedBytes ?? null,
+    fields.totalBytes ?? null,
+    fields.processedItems ?? null,
+    fields.totalItems ?? null,
+    fields.errorMessage ?? null,
+    fields.result ? JSON.stringify(fields.result) : null,
+    now,
+    completedAt,
+    taskId
+  ).run();
+}
+
+async function insertFileTask(env, auth, input) {
+  await ensureD1Schema(env);
+  const now = Date.now();
+  const taskId = generateId(20);
+  await env.D1_DB.prepare(`
+    INSERT INTO file_tasks (
+      id, owner_key, task_type, status, title, source_path, destination_path,
+      total_bytes, processed_bytes, total_items, processed_items, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    taskId,
+    ownerKeyFromAuth(auth),
+    input.type,
+    input.status || 'queued',
+    input.title || TASK_TYPE_LABELS[input.type] || '任务',
+    input.sourcePath || '',
+    input.destinationPath || '',
+    input.totalBytes || 0,
+    input.processedBytes || 0,
+    input.totalItems || 0,
+    input.processedItems || 0,
+    now,
+    now
+  ).run();
+  return taskId;
+}
+
+const TASK_TYPE_LABELS = {
+  upload: '上传',
+  download: '下载',
+  batch_download: '批量下载',
+  copy: '复制',
+  move: '移动'
+};
+
+async function buildCopyMoveTaskItems(env, auth, operation, selectedItems, destinationPath) {
+  if (!(await folderExists(env, destinationPath))) {
+    throw new Error('目标文件夹不存在');
+  }
+
+  const destinationPermission = await requirePathPermission(env, auth, 'upload', destinationPath);
+  if (destinationPermission) {
+    const data = await destinationPermission.json();
+    throw new Error(data.message || '没有上传权限');
+  }
+
+  const reservedTargets = new Set();
+  const taskItems = [];
+  const errors = [];
+
+  for (const item of selectedItems) {
+    const itemPath = normalizeItemPath(typeof item === 'string' ? item : item.path);
+    try {
+      if (!itemPath || itemPath === '/') throw new Error('不能操作根目录');
+
+      const action = operation === 'move' ? 'modify' : 'download';
+      const permissionError = await requirePathPermission(env, auth, action, itemPath);
+      if (permissionError) {
+        const data = await permissionError.json();
+        throw new Error(data.message || '没有操作权限');
+      }
+
+      const sourceKey = itemPathToR2Key(itemPath);
+      const sourceObject = await env.R2_BUCKET.head(sourceKey);
+      const sourcePrefix = sourceKey + '/';
+      const folderCheck = sourceObject ? null : await env.R2_BUCKET.list({ prefix: sourcePrefix, limit: 1 });
+      const isFolder = !sourceObject && !!(folderCheck.objects && folderCheck.objects.length > 0);
+      if (!sourceObject && !isFolder) throw new Error('项目不存在: ' + itemPath);
+
+      const desiredPath = joinItemPath(destinationPath, nameFromItemPath(itemPath));
+      let targetKey = itemPathToR2Key(desiredPath);
+      if (operation === 'move' && targetKey === sourceKey) {
+        continue;
+      }
+      targetKey = await findAvailableDestinationKeyReserved(env, targetKey, isFolder, reservedTargets);
+      const targetPath = r2KeyToPath(targetKey);
+
+      if (isFolder) {
+        const targetPrefix = targetKey + '/';
+        if (targetPrefix.startsWith(sourcePrefix) || sourcePrefix.startsWith(targetPrefix)) {
+          throw new Error('不能把文件夹复制或移动到自身或其子目录中');
+        }
+
+        let cursor;
+        do {
+          const listed = await env.R2_BUCKET.list({ prefix: sourcePrefix, cursor });
+          for (const obj of listed.objects || []) {
+            const relativeKey = obj.key.slice(sourcePrefix.length);
+            taskItems.push({
+              sourcePath: r2KeyToPath(obj.key),
+              sourceKey: obj.key,
+              targetPath: r2KeyToPath(targetPrefix + relativeKey),
+              targetKey: targetPrefix + relativeKey,
+              size: obj.size || 0
+            });
+          }
+          cursor = listed.truncated ? listed.cursor : null;
+        } while (cursor);
+      } else {
+        taskItems.push({
+          sourcePath: itemPath,
+          sourceKey,
+          targetPath,
+          targetKey,
+          size: sourceObject.size || 0
+        });
+      }
+    } catch (error) {
+      errors.push({ path: itemPath, message: error.message });
+    }
+  }
+
+  if (taskItems.length === 0 && errors.length > 0) {
+    throw new Error(errors[0].message);
+  }
+
+  return { taskItems, errors };
+}
+
+async function insertTaskItems(env, taskId, taskItems) {
+  if (taskItems.length === 0) return;
+  const now = Date.now();
+  const insert = env.D1_DB.prepare(`
+    INSERT INTO file_task_items (
+      task_id, source_path, source_key, target_path, target_key, size, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+  `);
+
+  for (let index = 0; index < taskItems.length; index += 50) {
+    await env.D1_DB.batch(taskItems.slice(index, index + 50).map(item => insert.bind(
+      taskId,
+      item.sourcePath,
+      item.sourceKey,
+      item.targetPath,
+      item.targetKey,
+      item.size || 0,
+      now,
+      now
+    )));
+  }
+}
+
+async function handleCreateTask(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const body = await request.json();
+    const type = body.type;
+    if (!TASK_TYPES.has(type)) {
+      return jsonResponse({ success: false, message: '不支持的任务类型' }, 400);
+    }
+
+    let taskId;
+    if (type === 'upload') {
+      const destinationPath = normalizeDirectoryPath(body.destinationPath || body.path || '/');
+      const permissionError = await requirePathPermission(env, auth, 'upload', destinationPath);
+      if (permissionError) return permissionError;
+      taskId = await insertFileTask(env, auth, {
+        type,
+        status: 'running',
+        title: body.title || ('上传 ' + (body.name || '文件')),
+        destinationPath,
+        totalBytes: Number(body.totalBytes || 0)
+      });
+    } else if (type === 'download') {
+      const filePath = normalizeItemPath(body.path || body.sourcePath || '');
+      const permissionError = await requirePathPermission(env, auth, 'download', filePath);
+      if (permissionError) return permissionError;
+      const object = await env.R2_BUCKET.head(itemPathToR2Key(filePath));
+      if (!object) return jsonResponse({ success: false, message: '文件不存在' }, 404);
+      taskId = await insertFileTask(env, auth, {
+        type,
+        status: 'running',
+        title: body.title || ('下载 ' + nameFromItemPath(filePath)),
+        sourcePath: filePath,
+        totalBytes: object.size || 0
+      });
+    } else if (type === 'batch_download') {
+      const items = Array.isArray(body.items) ? body.items : [];
+      if (items.length === 0) return jsonResponse({ success: false, message: '请选择要下载的文件或文件夹' }, 400);
+      for (const item of items) {
+        const itemPath = normalizeItemPath(typeof item === 'string' ? item : item.path);
+        const permissionError = await requirePathPermission(env, auth, 'download', itemPath);
+        if (permissionError) return permissionError;
+      }
+      taskId = await insertFileTask(env, auth, {
+        type,
+        status: 'running',
+        title: body.title || ('批量下载 ' + items.length + ' 项'),
+        sourcePath: items.map(item => normalizeItemPath(typeof item === 'string' ? item : item.path)).join('\n'),
+        totalItems: items.length
+      });
+      await updateTaskStatus(env, taskId, 'running', {
+        result: {
+          items: items.map(item => ({
+            path: normalizeItemPath(typeof item === 'string' ? item : item.path),
+            name: item && typeof item === 'object' ? item.name : ''
+          }))
+        }
+      });
+    } else {
+      const items = Array.isArray(body.items) ? body.items : [];
+      if (items.length === 0) return jsonResponse({ success: false, message: '请选择要操作的文件或文件夹' }, 400);
+      const destinationPath = normalizeDirectoryPath(body.destinationPath || '/');
+      const built = await buildCopyMoveTaskItems(env, auth, type, items, destinationPath);
+      taskId = await insertFileTask(env, auth, {
+        type,
+        title: body.title || ((type === 'move' ? '移动 ' : '复制 ') + items.length + ' 项'),
+        sourcePath: items.map(item => normalizeItemPath(typeof item === 'string' ? item : item.path)).join('\n'),
+        destinationPath,
+        totalItems: built.taskItems.length
+      });
+      await insertTaskItems(env, taskId, built.taskItems);
+      if (built.errors.length > 0) {
+        await updateTaskStatus(env, taskId, 'queued', { result: { errors: built.errors } });
+      }
+    }
+
+    const task = await getTaskForAuth(env, auth, taskId);
+    return jsonResponse({ success: true, task: taskRowToClient(task) });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '创建任务失败: ' + e.message }, 500);
+  }
+}
+
+async function handleListTasks(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    await ensureD1Schema(env);
+    const url = new URL(request.url);
+    const activeOnly = ['1', 'true', 'yes'].includes((url.searchParams.get('active') || '').toLowerCase());
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit') || 50) || 50));
+    const ownerKey = ownerKeyFromAuth(auth);
+    await env.D1_DB.prepare(`
+      UPDATE file_tasks
+      SET status = 'failed',
+          error_message = '任务连接已中断或超时',
+          updated_at = ?,
+          completed_at = ?
+      WHERE owner_key = ?
+        AND task_type IN ('upload', 'download', 'batch_download')
+        AND status IN ('queued', 'running')
+        AND updated_at < ?
+    `).bind(Date.now(), Date.now(), ownerKey, Date.now() - 30 * 60 * 1000).run();
+    const rows = activeOnly
+      ? await env.D1_DB.prepare(`
+          SELECT * FROM file_tasks
+          WHERE owner_key = ? AND status IN ('queued', 'running')
+          ORDER BY created_at DESC
+          LIMIT ?
+        `).bind(ownerKey, limit).all()
+      : await env.D1_DB.prepare(`
+          SELECT * FROM file_tasks
+          WHERE owner_key = ?
+          ORDER BY created_at DESC
+          LIMIT ?
+        `).bind(ownerKey, limit).all();
+
+    return jsonResponse({ success: true, tasks: (rows.results || []).map(taskRowToClient) });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '获取任务失败: ' + e.message }, 500);
+  }
+}
+
+async function handleUpdateTaskProgress(request, env, taskId) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const task = await getTaskForAuth(env, auth, taskId);
+    if (!task) return jsonResponse({ success: false, message: '任务不存在' }, 404);
+
+    const body = await request.json();
+    const status = body.status && ['queued', 'running', 'succeeded', 'failed', 'canceled'].includes(body.status)
+      ? body.status
+      : task.status;
+    await updateTaskStatus(env, taskId, status, {
+      processedBytes: Number.isFinite(Number(body.processedBytes)) ? Math.max(0, Math.floor(Number(body.processedBytes))) : null,
+      totalBytes: Number.isFinite(Number(body.totalBytes)) ? Math.max(0, Math.floor(Number(body.totalBytes))) : null,
+      processedItems: Number.isFinite(Number(body.processedItems)) ? Math.max(0, Math.floor(Number(body.processedItems))) : null,
+      totalItems: Number.isFinite(Number(body.totalItems)) ? Math.max(0, Math.floor(Number(body.totalItems))) : null,
+      errorMessage: body.errorMessage || null,
+      result: body.result || null
+    });
+
+    const updated = await getTaskForAuth(env, auth, taskId);
+    return jsonResponse({ success: true, task: taskRowToClient(updated) });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '更新任务失败: ' + e.message }, 500);
+  }
+}
+
+async function handleCancelTask(request, env, taskId) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const task = await getTaskForAuth(env, auth, taskId);
+    if (!task) return jsonResponse({ success: false, message: '任务不存在' }, 404);
+    if (!['queued', 'running'].includes(task.status)) {
+      return jsonResponse({ success: true, task: taskRowToClient(task) });
+    }
+
+    await updateTaskStatus(env, taskId, 'canceled', { errorMessage: '任务已停止' });
+    const updated = await getTaskForAuth(env, auth, taskId);
+    return jsonResponse({ success: true, task: taskRowToClient(updated) });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '停止任务失败: ' + e.message }, 500);
+  }
+}
+
+async function handleDeleteTask(request, env, taskId) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const task = await getTaskForAuth(env, auth, taskId);
+    if (!task) return jsonResponse({ success: true });
+
+    await env.D1_DB.batch([
+      env.D1_DB.prepare('DELETE FROM file_task_items WHERE task_id = ?').bind(taskId),
+      env.D1_DB.prepare('DELETE FROM file_tasks WHERE id = ? AND owner_key = ?').bind(taskId, ownerKeyFromAuth(auth))
+    ]);
+    return jsonResponse({ success: true });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '删除任务失败: ' + e.message }, 500);
+  }
+}
+
+async function handleTaskDownload(request, env, taskId) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const task = await getTaskForAuth(env, auth, taskId);
+    if (!task) return jsonResponse({ success: false, message: '任务不存在' }, 404);
+
+    if (task.task_type === 'download') {
+      await updateTaskStatus(env, taskId, 'succeeded', {
+        processedBytes: task.total_bytes || 0,
+        totalBytes: task.total_bytes || 0,
+        result: { nativeDownload: true }
+      });
+      return await handleDownloadFile(request, env, task.source_path || '');
+    }
+
+    if (task.task_type !== 'batch_download') {
+      return jsonResponse({ success: false, message: '此任务不是下载任务' }, 400);
+    }
+
+    let result = {};
+    try {
+      result = task.result_json ? JSON.parse(task.result_json) : {};
+    } catch (error) {
+      result = {};
+    }
+    const items = Array.isArray(result.items) ? result.items : [];
+    const response = await createBatchDownloadResponse(env, auth, items);
+    if (response.ok) {
+      await updateTaskStatus(env, taskId, 'succeeded', {
+        processedItems: task.total_items || items.length,
+        totalItems: task.total_items || items.length,
+        result: { ...result, nativeDownload: true }
+      });
+    } else {
+      await updateTaskStatus(env, taskId, 'failed', { errorMessage: '批量下载启动失败' });
+    }
+    return response;
+  } catch (e) {
+    await updateTaskStatus(env, taskId, 'failed', { errorMessage: e.message }).catch(() => null);
+    return jsonResponse({ success: false, message: '下载任务失败: ' + e.message }, 500);
+  }
+}
+
+async function handleRunTask(request, env, taskId) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const task = await getTaskForAuth(env, auth, taskId);
+    if (!task) return jsonResponse({ success: false, message: '任务不存在' }, 404);
+    if (!['copy', 'move'].includes(task.task_type)) {
+      return jsonResponse({ success: false, message: '此任务不支持分片执行' }, 400);
+    }
+    if (!TASK_ACTIVE_STATUSES.has(task.status)) {
+      return jsonResponse({ success: true, task: taskRowToClient(task), done: true });
+    }
+
+    await updateTaskStatus(env, taskId, 'running');
+    const limit = Math.min(20, Math.max(1, Number(new URL(request.url).searchParams.get('limit') || 5) || 5));
+    const rows = await env.D1_DB.prepare(`
+      SELECT * FROM file_task_items
+      WHERE task_id = ? AND status = 'queued'
+      ORDER BY id ASC
+      LIMIT ?
+    `).bind(taskId, limit).all();
+
+    const errors = [];
+    for (const item of rows.results || []) {
+      try {
+        const copied = await copyR2Object(env, item.source_key, item.target_key);
+        if (!copied) throw new Error('源对象不存在');
+        if (task.task_type === 'move') {
+          await env.R2_BUCKET.delete(item.source_key);
+        }
+        await env.D1_DB.prepare(`
+          UPDATE file_task_items
+          SET status = 'succeeded', error_message = NULL, updated_at = ?
+          WHERE id = ?
+        `).bind(Date.now(), item.id).run();
+      } catch (error) {
+        await env.D1_DB.prepare(`
+          UPDATE file_task_items
+          SET status = 'failed', error_message = ?, updated_at = ?
+          WHERE id = ?
+        `).bind(error.message, Date.now(), item.id).run();
+        errors.push({ path: item.source_path, message: error.message });
+      }
+    }
+
+    const counts = await env.D1_DB.prepare(`
+      SELECT
+        SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded,
+        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+        COUNT(*) AS total
+      FROM file_task_items
+      WHERE task_id = ?
+    `).bind(taskId).first();
+
+    const succeeded = Number(counts?.succeeded || 0);
+    const failed = Number(counts?.failed || 0);
+    const total = Number(counts?.total || 0);
+    const done = succeeded + failed >= total;
+
+    if (done) {
+      const targetPath = task.destination_path || '/';
+      if (task.task_type === 'move') {
+        await cleanupMovedTaskSources(env, taskId);
+      }
+      await invalidateCachePath(env, targetPath);
+      if (task.task_type === 'move') {
+        await cleanupMovedTaskD1(env, taskId);
+      }
+      await updateTaskStatus(env, taskId, failed > 0 ? 'failed' : 'succeeded', {
+        processedItems: succeeded + failed,
+        totalItems: total,
+        errorMessage: failed > 0 ? '有 ' + failed + ' 个对象处理失败' : null,
+        result: { errors }
+      });
+    } else {
+      await updateTaskStatus(env, taskId, 'running', {
+        processedItems: succeeded + failed,
+        totalItems: total,
+        result: errors.length > 0 ? { errors } : null
+      });
+    }
+
+    const updated = await getTaskForAuth(env, auth, taskId);
+    return jsonResponse({ success: true, task: taskRowToClient(updated), done });
+  } catch (e) {
+    await updateTaskStatus(env, taskId, 'failed', { errorMessage: e.message }).catch(() => null);
+    return jsonResponse({ success: false, message: '执行任务失败: ' + e.message }, 500);
+  }
+}
+
+async function cleanupMovedTaskSources(env, taskId) {
+  const rows = await env.D1_DB.prepare(`
+    SELECT DISTINCT source_path FROM file_task_items
+    WHERE task_id = ? AND status = 'succeeded'
+  `).bind(taskId).all();
+
+  const folders = new Set();
+  for (const row of rows.results || []) {
+    let parent = parentPathFromItemPath(row.source_path);
+    while (parent && parent !== '/') {
+      folders.add(parent);
+      parent = parentPathFromItemPath(parent);
+    }
+  }
+
+  const folderList = Array.from(folders).sort((a, b) => b.length - a.length);
+  for (const folder of folderList) {
+    const key = itemPathToR2Key(folder);
+    const listed = await env.R2_BUCKET.list({ prefix: key + '/', limit: 1 });
+    if (!listed.objects || listed.objects.length === 0) {
+      await env.R2_BUCKET.delete(key + '/.folder').catch(() => null);
+    }
+    await invalidateCachePath(env, folder);
+  }
+}
+
+async function cleanupMovedTaskD1(env, taskId) {
+  const task = await env.D1_DB.prepare('SELECT source_path FROM file_tasks WHERE id = ?').bind(taskId).first();
+  const sourceRoots = String(task?.source_path || '')
+    .split('\n')
+    .map(path => normalizeItemPath(path))
+    .filter(path => path && path !== '/');
+
+  const roots = new Set();
+  if (sourceRoots.length > 0) {
+    sourceRoots.forEach(path => roots.add(path));
+  } else {
+    const rows = await env.D1_DB.prepare(`
+      SELECT DISTINCT source_path FROM file_task_items
+      WHERE task_id = ? AND status = 'succeeded'
+    `).bind(taskId).all();
+    for (const row of rows.results || []) {
+      roots.add(normalizeItemPath(row.source_path));
+    }
+  }
+
+  for (const path of roots) {
+    await cleanupD1ItemPath(env, path);
+  }
+}
+
 const CRC32_TABLE = (() => {
   const table = new Uint32Array(256);
   for (let index = 0; index < 256; index++) {
@@ -1392,6 +2004,20 @@ function addZipEntry(entries, usedNames, entry) {
   entries.push({ ...entry, name, nameBytes });
 }
 
+function calculateZipContentLength(entries) {
+  let total = 22;
+  for (const entry of entries) {
+    const nameLength = entry.nameBytes.length;
+    const dataLength = entry.isDirectory ? 0 : Number(entry.size || 0);
+    total += 30 + nameLength + dataLength + (entry.isDirectory ? 0 : 16);
+    total += 46 + nameLength;
+  }
+  if (total > 0xffffffff) {
+    throw new Error('打包文件过大，暂不支持超过 4GB 的 zip');
+  }
+  return total;
+}
+
 async function collectBatchDownloadEntries(env, items) {
   const entries = [];
   const usedNames = new Set();
@@ -1410,6 +2036,7 @@ async function collectBatchDownloadEntries(env, items) {
         name: nameFromItemPath(itemPath),
         key,
         isDirectory: false,
+        size: fileObject.size || 0,
         lastModified: fileObject.uploaded
       });
       continue;
@@ -1450,6 +2077,7 @@ async function collectBatchDownloadEntries(env, items) {
           name: directoryName + relativeName,
           key: obj.key,
           isDirectory: false,
+          size: obj.size || 0,
           lastModified: obj.uploaded
         });
       }
@@ -1545,28 +2173,33 @@ async function handleBatchDownload(request, env) {
   try {
     const body = await request.json();
     const items = Array.isArray(body.items) ? body.items : [];
-    if (items.length === 0) {
-      return jsonResponse({ success: false, message: '请选择要下载的文件或文件夹' }, 400);
-    }
-
-    for (const item of items) {
-      const itemPath = normalizeItemPath(typeof item === 'string' ? item : item.path);
-      const permissionError = await requirePathPermission(env, auth, 'download', itemPath);
-      if (permissionError) return permissionError;
-    }
-
-    const entries = await collectBatchDownloadEntries(env, items);
-    const filename = 'edgestash-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.zip';
-
-    return new Response(createZipStream(env, entries), {
-      headers: {
-        'Content-Type': 'application/zip',
-        'Content-Disposition': createAttachmentDisposition(filename)
-      }
-    });
+    return await createBatchDownloadResponse(env, auth, items);
   } catch (e) {
     return jsonResponse({ success: false, message: '批量下载失败: ' + e.message }, 500);
   }
+}
+
+async function createBatchDownloadResponse(env, auth, items) {
+  if (items.length === 0) {
+    return jsonResponse({ success: false, message: '请选择要下载的文件或文件夹' }, 400);
+  }
+
+  for (const item of items) {
+    const itemPath = normalizeItemPath(typeof item === 'string' ? item : item.path);
+    const permissionError = await requirePathPermission(env, auth, 'download', itemPath);
+    if (permissionError) return permissionError;
+  }
+
+  const entries = await collectBatchDownloadEntries(env, items);
+  const filename = 'edgestash-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.zip';
+
+  return new Response(createZipStream(env, entries), {
+    headers: {
+      'Content-Type': 'application/zip',
+      'Content-Disposition': createAttachmentDisposition(filename),
+      'Content-Length': String(calculateZipContentLength(entries))
+    }
+  });
 }
 
 function addFolderPathsFromR2Key(folderPaths, key) {
@@ -2432,18 +3065,6 @@ async function ensureD1Schema(env) {
   if (d1SchemaReady) return;
 
   const kvReady = env.KV_STORE ? await env.KV_STORE.get(D1_SCHEMA_KV_KEY) : null;
-  if (kvReady) {
-    await ensureUserPermissionsSchema(env);
-    d1SchemaReady = true;
-    return;
-  }
-
-  // KV 标记不存在，删除旧表重建
-  const tables = ['search_items', 'favorites', 'recent_items', 'share_links', 'app_stats', 'user_permissions'];
-  for (const t of tables) {
-    await env.D1_DB.prepare(`DROP TABLE IF EXISTS ${t}`).run();
-  }
-
   const ddlStatements = [
     `CREATE TABLE IF NOT EXISTS search_items (
       path TEXT PRIMARY KEY,
@@ -2500,14 +3121,15 @@ async function ensureD1Schema(env) {
       value INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL
     )`,
-    ...USER_PERMISSIONS_DDL
+    ...USER_PERMISSIONS_DDL,
+    ...FILE_TASKS_DDL
   ];
 
   for (const statement of ddlStatements) {
     await env.D1_DB.prepare(statement).run();
   }
 
-  if (env.KV_STORE) await env.KV_STORE.put(D1_SCHEMA_KV_KEY, '1');
+  if (!kvReady && env.KV_STORE) await env.KV_STORE.put(D1_SCHEMA_KV_KEY, '1');
   d1SchemaReady = true;
 }
 
@@ -2537,6 +3159,43 @@ async function ensureUserPermissionsSchema(env) {
     await env.D1_DB.prepare(statement).run();
   }
 }
+
+const FILE_TASKS_DDL = [
+  `CREATE TABLE IF NOT EXISTS file_tasks (
+    id TEXT PRIMARY KEY,
+    owner_key TEXT NOT NULL,
+    task_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    title TEXT NOT NULL,
+    source_path TEXT,
+    destination_path TEXT,
+    total_bytes INTEGER NOT NULL DEFAULT 0,
+    processed_bytes INTEGER NOT NULL DEFAULT 0,
+    total_items INTEGER NOT NULL DEFAULT 0,
+    processed_items INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    result_json TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    completed_at INTEGER
+  )`,
+  'CREATE INDEX IF NOT EXISTS idx_file_tasks_owner_status ON file_tasks(owner_key, status, updated_at DESC)',
+  'CREATE INDEX IF NOT EXISTS idx_file_tasks_owner_updated ON file_tasks(owner_key, updated_at DESC)',
+  `CREATE TABLE IF NOT EXISTS file_task_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    target_path TEXT NOT NULL,
+    target_key TEXT NOT NULL,
+    size INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'queued',
+    error_message TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  )`,
+  'CREATE INDEX IF NOT EXISTS idx_file_task_items_task_status ON file_task_items(task_id, status, id)'
+];
 
 function ownerKeyFromAuth(auth) {
   return auth && auth.role === 'admin' ? 'admin' : `user:${auth.email || ''}`;
@@ -3733,6 +4392,146 @@ const CSS_STYLES = `
   .header-actions {
     display: flex;
     gap: 12px;
+    align-items: center;
+  }
+
+  .task-chip {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    max-width: 260px;
+    padding: 8px 10px;
+    border: 1px solid var(--surface-light);
+    border-radius: 8px;
+    background: var(--background);
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.2;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .task-chip.active {
+    display: inline-flex;
+  }
+
+  .task-chip-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .task-panel-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .task-panel-empty {
+    color: var(--text-muted);
+    padding: 14px 0;
+    text-align: center;
+  }
+
+  .task-row {
+    border: 1px solid var(--surface-light);
+    border-radius: 8px;
+    padding: 12px;
+    background: var(--background);
+  }
+
+  .task-row-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 8px;
+    font-size: 14px;
+  }
+
+  .task-row-title {
+    font-weight: 600;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .task-row-status {
+    color: var(--text-muted);
+    flex: 0 0 auto;
+  }
+
+  .task-row-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+  }
+
+  .task-icon-btn {
+    width: 28px;
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--surface-light);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 0;
+  }
+
+  .task-icon-btn:hover {
+    color: var(--text);
+    border-color: var(--primary);
+  }
+
+  .task-icon-btn.danger:hover {
+    color: var(--error);
+    border-color: var(--error);
+  }
+
+  .task-icon-btn svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  .task-progress {
+    height: 6px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: var(--surface-light);
+  }
+
+  .task-progress-fill {
+    width: 0;
+    height: 100%;
+    background: var(--primary);
+    transition: width 0.2s ease;
+  }
+
+  .task-row-meta {
+    margin-top: 8px;
+    color: var(--text-muted);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+  }
+
+  .task-fly-icon {
+    position: fixed;
+    z-index: 4000;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    background: var(--primary);
+    color: white;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    box-shadow: 0 10px 24px rgba(99, 102, 241, 0.35);
+    font-size: 14px;
+    font-weight: 700;
   }
   
   /* Breadcrumb */
@@ -4083,6 +4882,12 @@ const CSS_STYLES = `
 
     .header-actions .btn {
       padding: 6px 10px;
+      font-size: 12px;
+    }
+
+    .task-chip {
+      max-width: 150px;
+      padding: 6px 8px;
       font-size: 12px;
     }
 
@@ -4826,6 +5631,9 @@ const FIXED_INDEX_PAGE = `
   <div class="header">
     <div class="logo">EdgeStash</div>
     <div class="header-actions">
+      <button type="button" class="task-chip" id="taskChip" onclick="openTaskPanel()">
+        <span class="task-chip-text" id="taskChipText"></span>
+      </button>
       <button type="button" class="btn btn-secondary" onclick="refreshCurrentDirectory()">刷新</button>
       <button type="button" class="btn btn-secondary" onclick="window.location.href='/admin.html'">管理后台</button>
       <button type="button" class="btn btn-secondary" onclick="logout()">退出登录</button>
@@ -4837,7 +5645,7 @@ const FIXED_INDEX_PAGE = `
 
     <div class="toolbar">
       <button type="button" class="btn btn-primary" onclick="showNewFolderModal()">📁 新建文件夹</button>
-      <button type="button" class="btn btn-primary" onclick="document.getElementById('fileInput').click()">📤 上传文件</button>
+      <button type="button" class="btn btn-primary" onclick="setTaskOrigin(this);document.getElementById('fileInput').click()">📤 上传文件</button>
       <input type="file" id="fileInput" multiple style="display: none;" onchange="handleFileUpload(event)">
     </div>
 
@@ -4864,9 +5672,9 @@ const FIXED_INDEX_PAGE = `
         <input type="checkbox" id="selectAllCheckbox" onchange="toggleSelectAll(this.checked)">
         已选择 <span id="selectedCount">0</span> 项
       </label>
-      <button type="button" class="btn btn-sm btn-secondary" onclick="showBatchTargetModal('copy')">复制</button>
-      <button type="button" class="btn btn-sm btn-secondary" onclick="showBatchTargetModal('move')">移动</button>
-      <button type="button" class="btn btn-sm btn-secondary" onclick="batchDownload()">下载</button>
+      <button type="button" class="btn btn-sm btn-secondary" onclick="setTaskOrigin(this);showBatchTargetModal('copy')">复制</button>
+      <button type="button" class="btn btn-sm btn-secondary" onclick="setTaskOrigin(this);showBatchTargetModal('move')">移动</button>
+      <button type="button" class="btn btn-sm btn-secondary" onclick="setTaskOrigin(this);batchDownload()">下载</button>
       <button type="button" class="btn btn-sm btn-danger" onclick="batchDelete()">删除</button>
     </div>
 
@@ -4977,6 +5785,16 @@ const FIXED_INDEX_PAGE = `
     </div>
   </div>
 
+  <div class="modal-overlay" id="taskPanelModal">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">任务状态</div>
+        <button type="button" class="modal-close" onclick="closeModal('taskPanelModal')">&times;</button>
+      </div>
+      <div class="task-panel-list" id="taskPanelList"></div>
+    </div>
+  </div>
+
   <div class="preview-overlay" id="previewOverlay">
     <div class="preview-header">
       <div class="preview-filename" id="previewFilename"></div>
@@ -5004,6 +5822,21 @@ const FIXED_INDEX_PAGE = `
     let folderSearchRequestId = 0;
     let globalSearchTimer = null;
     let globalSearchRequestId = 0;
+    const taskStore = new Map();
+    const runningTaskLoops = new Set();
+    const uploadQueue = [];
+    const activeUploadXhrs = new Map();
+    const canceledLocalTasks = new Set();
+    const deletedLocalTasks = new Set();
+    let activeUploadCount = 0;
+    let taskPollTimer = null;
+    let lastTaskOriginElement = null;
+    let batchTaskOriginElement = null;
+    const TASK_DONE_TOAST_KEY = 'edgestash:task-terminal-toasts:v1';
+    const TASK_ACTION_ICONS = {
+      stop: '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="1"/></svg>',
+      delete: '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5"/><path d="M14 11v5"/></svg>'
+    };
     const ACTION_ICONS = {
       download: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>',
       share: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 10.6l6.8-4.2"/><path d="M8.6 13.4l6.8 4.2"/></svg>',
@@ -5023,6 +5856,347 @@ const FIXED_INDEX_PAGE = `
 
     function apiFileUrl(prefix, path) {
       return prefix + encodePathForUrl(path);
+    }
+
+    function setTaskOrigin(element) {
+      if (element && element.getBoundingClientRect) {
+        lastTaskOriginElement = element;
+      }
+    }
+
+    function getDoneTaskToastSet() {
+      try {
+        return new Set(JSON.parse(localStorage.getItem(TASK_DONE_TOAST_KEY) || '[]'));
+      } catch (error) {
+        return new Set();
+      }
+    }
+
+    function saveDoneTaskToastSet(set) {
+      try {
+        localStorage.setItem(TASK_DONE_TOAST_KEY, JSON.stringify(Array.from(set).slice(-200)));
+      } catch (error) {
+        console.warn('Task toast state save failed:', error);
+      }
+    }
+
+    function mergeTask(task, options) {
+      if (!task || !task.id) return;
+      if (deletedLocalTasks.has(task.id)) return;
+      const previous = taskStore.get(task.id);
+      if (previous && (previous.updatedAt || 0) > (task.updatedAt || 0)) return;
+      taskStore.set(task.id, task);
+      maybeNotifyTaskTerminal(task, previous, options && options.forceToast);
+      updateTaskUi();
+      if ((task.type === 'copy' || task.type === 'move') && (task.status === 'queued' || task.status === 'running')) {
+        runCopyMoveTaskLoop(task.id);
+      }
+    }
+
+    function maybeNotifyTaskTerminal(task, previous, forceToast) {
+      if (!['succeeded', 'failed', 'canceled'].includes(task.status)) return;
+      const key = task.id + ':' + task.status;
+      const shown = getDoneTaskToastSet();
+      const becameTerminal = forceToast || (previous && previous.status !== task.status);
+      if (!becameTerminal || shown.has(key)) return;
+      shown.add(key);
+      saveDoneTaskToastSet(shown);
+      const verb = task.type === 'upload' ? '上传' : task.type === 'download' || task.type === 'batch_download' ? '下载' : task.type === 'move' ? '移动' : '复制';
+      if (task.status === 'succeeded') {
+        showToast(verb + (task.result && task.result.nativeDownload ? '已开始: ' : '完成: ') + task.title, 'success');
+      } else if (task.status === 'failed') {
+        showToast(verb + '失败: ' + (task.errorMessage || task.title), 'error');
+      }
+    }
+
+    async function createTask(payload, originElement) {
+      const response = await fetch('/api/tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await response.json();
+      if (!data.success) throw new Error(data.message || '创建任务失败');
+      mergeTask(data.task);
+      animateTaskCreated(originElement || lastTaskOriginElement || document.activeElement);
+      return data.task;
+    }
+
+    function animateTaskCreated(originElement) {
+      const chip = document.getElementById('taskChip');
+      if (!chip || !originElement || !originElement.getBoundingClientRect) return;
+      const from = originElement.getBoundingClientRect();
+      const to = chip.getBoundingClientRect();
+      if (!from.width || !from.height || !to.width || !to.height) return;
+
+      const fly = document.createElement('div');
+      fly.className = 'task-fly-icon';
+      fly.textContent = '+';
+      fly.style.left = (from.left + from.width / 2 - 15) + 'px';
+      fly.style.top = (from.top + from.height / 2 - 15) + 'px';
+      document.body.appendChild(fly);
+      if (!fly.animate) {
+        window.setTimeout(function () { fly.remove(); }, 300);
+        return;
+      }
+
+      const dx = to.left + to.width / 2 - (from.left + from.width / 2);
+      const dy = to.top + to.height / 2 - (from.top + from.height / 2);
+      fly.animate([
+        { transform: 'translate(0, 0) scale(1)', opacity: 1 },
+        { transform: 'translate(' + dx + 'px, ' + dy + 'px) scale(0.25)', opacity: 0 }
+      ], {
+        duration: 520,
+        easing: 'cubic-bezier(.2,.8,.2,1)'
+      }).addEventListener('finish', function () {
+        fly.remove();
+      });
+    }
+
+    async function patchTaskProgress(taskId, payload, forceToast) {
+      const response = await fetch('/api/tasks/' + encodeURIComponent(taskId) + '/progress', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await response.json();
+      if (!data.success) throw new Error(data.message || '更新任务失败');
+      mergeTask(data.task, { forceToast: forceToast });
+      return data.task;
+    }
+
+    async function loadTasks(activeOnly) {
+      try {
+        const response = await fetch('/api/tasks?limit=50' + (activeOnly ? '&active=1' : ''));
+        const data = await response.json();
+        if (!data.success) return;
+        (data.tasks || []).forEach(function (task) {
+          mergeTask(task);
+        });
+        updateTaskUi();
+      } catch (error) {
+        console.warn('Task load failed:', error);
+      }
+    }
+
+    async function cancelTask(taskId) {
+      abortLocalTask(taskId);
+      try {
+        const response = await fetch('/api/tasks/' + encodeURIComponent(taskId) + '/cancel', { method: 'POST' });
+        const data = await response.json();
+        if (!data.success) throw new Error(data.message || '停止失败');
+        mergeTask(data.task, { forceToast: true });
+        showToast('任务已停止', 'info');
+      } catch (error) {
+        showToast('停止任务失败: ' + error.message, 'error');
+      }
+    }
+
+    async function deleteTask(taskId) {
+      abortLocalTask(taskId);
+      try {
+        const response = await fetch('/api/tasks/' + encodeURIComponent(taskId), { method: 'DELETE' });
+        const data = await response.json();
+        if (!data.success) throw new Error(data.message || '删除失败');
+        deletedLocalTasks.add(taskId);
+        taskStore.delete(taskId);
+        updateTaskUi();
+        showToast('任务已删除', 'success');
+      } catch (error) {
+        showToast('删除任务失败: ' + error.message, 'error');
+      }
+    }
+
+    function abortLocalTask(taskId) {
+      canceledLocalTasks.add(taskId);
+      const xhr = activeUploadXhrs.get(taskId);
+      if (xhr) {
+        xhr.abort();
+        activeUploadXhrs.delete(taskId);
+      }
+    }
+
+    function startTaskMonitor() {
+      loadTasks(false);
+      if (taskPollTimer) clearInterval(taskPollTimer);
+      taskPollTimer = window.setInterval(function () {
+        loadTasks(false);
+      }, 5000);
+    }
+
+    function taskProgressPercent(task) {
+      if (task.totalBytes > 0) return Math.max(0, Math.min(100, Math.round((task.processedBytes / task.totalBytes) * 100)));
+      if (task.totalItems > 0) return Math.max(0, Math.min(100, Math.round((task.processedItems / task.totalItems) * 100)));
+      return task.status === 'succeeded' ? 100 : 0;
+    }
+
+    function estimateRemaining(task) {
+      if (!task.totalBytes || !task.processedBytes || !task.createdAt) return '';
+      const elapsed = Math.max(1, Date.now() - task.createdAt);
+      const speed = task.processedBytes / elapsed;
+      if (!speed) return '';
+      const remainingMs = (task.totalBytes - task.processedBytes) / speed;
+      if (!Number.isFinite(remainingMs) || remainingMs <= 0) return '';
+      return ' · 剩余 ' + formatDuration(remainingMs);
+    }
+
+    function formatDuration(ms) {
+      const seconds = Math.max(1, Math.round(ms / 1000));
+      if (seconds < 60) return seconds + '秒';
+      const minutes = Math.round(seconds / 60);
+      if (minutes < 60) return minutes + '分钟';
+      return Math.round(minutes / 60) + '小时';
+    }
+
+    function taskTypeLabel(type) {
+      return { upload: '上传', download: '下载', batch_download: '批量下载', copy: '复制', move: '移动' }[type] || '任务';
+    }
+
+    function taskStatusLabel(task) {
+      if ((task.type === 'download' || task.type === 'batch_download') && task.result && task.result.nativeDownload) return '已开始';
+      if (task.status === 'succeeded') return '已完成';
+      if (task.status === 'failed') return '失败';
+      if (task.status === 'canceled') return '已取消';
+      if (task.type === 'download' || task.type === 'batch_download') return task.status === 'running' ? '处理中' : '排队中';
+      if (task.totalBytes > 0) return taskProgressPercent(task) + '%' + estimateRemaining(task);
+      if (task.totalItems > 0) return '已处理 ' + task.processedItems + '/' + task.totalItems;
+      return task.status === 'running' ? '处理中' : '排队中';
+    }
+
+    function startNativeDownload(url) {
+      const frame = document.createElement('iframe');
+      frame.style.display = 'none';
+      frame.src = url;
+      document.body.appendChild(frame);
+      window.setTimeout(function () {
+        frame.remove();
+      }, 60000);
+    }
+
+    function updateTaskUi() {
+      const chip = document.getElementById('taskChip');
+      const text = document.getElementById('taskChipText');
+      if (!chip || !text) return;
+      const tasks = Array.from(taskStore.values()).sort(function (a, b) {
+        return (b.createdAt || 0) - (a.createdAt || 0);
+      });
+      const activeTasks = tasks.filter(function (task) {
+        return task.status === 'queued' || task.status === 'running';
+      });
+      if (activeTasks.length === 0) {
+        chip.classList.remove('active');
+      } else {
+        chip.classList.add('active');
+        if (activeTasks.length > 1) {
+          text.textContent = activeTasks.length + ' 个任务进行中';
+        } else {
+          const task = activeTasks[0];
+          text.textContent = taskTypeLabel(task.type) + ' ' + taskStatusLabel(task);
+        }
+      }
+      renderTaskPanel();
+    }
+
+    function openTaskPanel() {
+      renderTaskPanel();
+      document.getElementById('taskPanelModal').classList.add('active');
+      loadTasks(false);
+    }
+
+    function renderTaskPanel() {
+      const list = document.getElementById('taskPanelList');
+      if (!list) return;
+      const tasks = Array.from(taskStore.values()).sort(function (a, b) {
+        return (b.createdAt || 0) - (a.createdAt || 0);
+      }).slice(0, 50);
+      list.replaceChildren();
+      if (tasks.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'task-panel-empty';
+        empty.textContent = '暂无任务';
+        list.appendChild(empty);
+        return;
+      }
+      tasks.forEach(function (task) {
+        const row = document.createElement('div');
+        row.className = 'task-row';
+        const head = document.createElement('div');
+        head.className = 'task-row-head';
+        const title = document.createElement('div');
+        title.className = 'task-row-title';
+        title.textContent = task.title || taskTypeLabel(task.type);
+        const status = document.createElement('div');
+        status.className = 'task-row-status';
+        status.textContent = taskStatusLabel(task);
+        const actions = document.createElement('div');
+        actions.className = 'task-row-actions';
+        if (task.status === 'queued' || task.status === 'running') {
+          actions.appendChild(createTaskIconButton('stop', '停止任务', function () {
+            cancelTask(task.id);
+          }));
+        }
+        actions.appendChild(createTaskIconButton('delete', '删除任务', function () {
+          deleteTask(task.id);
+        }, 'danger'));
+        head.appendChild(title);
+        head.appendChild(status);
+        head.appendChild(actions);
+        row.appendChild(head);
+
+        const progress = document.createElement('div');
+        progress.className = 'task-progress';
+        const fill = document.createElement('div');
+        fill.className = 'task-progress-fill';
+        fill.style.width = taskProgressPercent(task) + '%';
+        progress.appendChild(fill);
+        row.appendChild(progress);
+
+        if (task.errorMessage || task.sourcePath || task.destinationPath) {
+          const meta = document.createElement('div');
+          meta.className = 'task-row-meta';
+          meta.textContent = task.errorMessage || [task.sourcePath, task.destinationPath].filter(Boolean).join(' -> ');
+          row.appendChild(meta);
+        }
+        list.appendChild(row);
+      });
+    }
+
+    function createTaskIconButton(iconKey, label, handler, extraClass) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'task-icon-btn' + (extraClass ? ' ' + extraClass : '');
+      button.title = label;
+      button.setAttribute('aria-label', label);
+      button.innerHTML = TASK_ACTION_ICONS[iconKey] || label;
+      button.addEventListener('click', function (event) {
+        event.stopPropagation();
+        handler();
+      });
+      return button;
+    }
+
+    async function runCopyMoveTaskLoop(taskId) {
+      if (runningTaskLoops.has(taskId)) return;
+      runningTaskLoops.add(taskId);
+      try {
+        while (true) {
+          const task = taskStore.get(taskId);
+          if (!task || !['queued', 'running'].includes(task.status)) break;
+          const response = await fetch('/api/tasks/' + encodeURIComponent(taskId) + '/run?limit=5', { method: 'POST' });
+          const data = await response.json();
+          if (!data.success) throw new Error(data.message || '任务执行失败');
+          mergeTask(data.task);
+          if (data.done || !['queued', 'running'].includes(data.task.status)) {
+            await loadFiles();
+            break;
+          }
+          await new Promise(function (resolve) { window.setTimeout(resolve, 300); });
+        }
+      } catch (error) {
+        showToast('任务执行失败: ' + error.message, 'error');
+      } finally {
+        runningTaskLoops.delete(taskId);
+      }
     }
 
     async function checkAuth() {
@@ -5440,7 +6614,8 @@ const FIXED_INDEX_PAGE = `
       button.innerHTML = ACTION_ICONS[actionKey] || label;
       button.addEventListener('click', function (event) {
         event.stopPropagation();
-        handler();
+        setTaskOrigin(button);
+        handler(button);
       });
       return button;
     }
@@ -5882,28 +7057,102 @@ const FIXED_INDEX_PAGE = `
       const files = Array.from(event.target.files || []);
       if (files.length === 0) return;
 
-      showLoading(true);
+      const origin = lastTaskOriginElement;
       for (const file of files) {
         try {
-          const formData = new FormData();
-          formData.append('file', file);
-          const response = await fetch(apiFileUrl('/api/files', currentPath), {
-            method: 'POST',
-            body: formData
-          });
-          const data = await response.json();
-          if (data.success) {
-            showToast('文件 ' + file.name + ' 上传成功', 'success');
-          } else {
-            showToast('文件 ' + file.name + ' 上传失败: ' + (data.message || '未知错误'), 'error');
-          }
+          const task = await createTask({
+            type: 'upload',
+            title: '上传 ' + file.name,
+            name: file.name,
+            destinationPath: currentPath,
+            totalBytes: file.size || 0
+          }, origin);
+          enqueueUpload(task, file, currentPath);
         } catch (error) {
-          showToast('文件 ' + file.name + ' 上传失败: ' + error.message, 'error');
+          showToast('创建上传任务失败: ' + error.message, 'error');
         }
       }
       event.target.value = '';
-      showLoading(false);
-      loadFiles();
+      processUploadQueue();
+    }
+
+    function enqueueUpload(task, file, path) {
+      uploadQueue.push({ task: task, file: file, path: path });
+    }
+
+    function processUploadQueue() {
+      while (activeUploadCount < 2 && uploadQueue.length > 0) {
+        const item = uploadQueue.shift();
+        const latest = taskStore.get(item.task.id);
+        if (latest && latest.status === 'canceled') continue;
+        activeUploadCount++;
+        uploadFileWithProgress(item.task, item.file, item.path).finally(function () {
+          activeUploadCount--;
+          processUploadQueue();
+        });
+      }
+    }
+
+    function uploadFileWithProgress(task, file, path) {
+      return new Promise(function (resolve) {
+        const xhr = new XMLHttpRequest();
+        const formData = new FormData();
+        let lastUpdate = 0;
+        formData.append('file', file);
+        xhr.open('POST', apiFileUrl('/api/files', path));
+        activeUploadXhrs.set(task.id, xhr);
+        xhr.upload.onprogress = function (event) {
+          if (!event.lengthComputable) return;
+          const now = Date.now();
+          if (now - lastUpdate < 800 && event.loaded < event.total) return;
+          lastUpdate = now;
+          patchTaskProgress(task.id, {
+            status: 'running',
+            processedBytes: event.loaded,
+            totalBytes: event.total
+          }).catch(function () {});
+        };
+        xhr.onload = async function () {
+          activeUploadXhrs.delete(task.id);
+          if (canceledLocalTasks.has(task.id) || !taskStore.has(task.id)) {
+            resolve();
+            return;
+          }
+          try {
+            const data = JSON.parse(xhr.responseText || '{}');
+            if (xhr.status >= 200 && xhr.status < 300 && data.success) {
+              await patchTaskProgress(task.id, {
+                status: 'succeeded',
+                processedBytes: file.size || task.totalBytes || 0,
+                totalBytes: file.size || task.totalBytes || 0,
+                result: { path: data.path }
+              }, true);
+              if (path === currentPath) await loadFiles();
+            } else {
+              throw new Error(data.message || xhr.statusText || '上传失败');
+            }
+          } catch (error) {
+            await patchTaskProgress(task.id, {
+              status: 'failed',
+              errorMessage: error.message
+            }, true).catch(function () {});
+          }
+          resolve();
+        };
+        xhr.onerror = async function () {
+          activeUploadXhrs.delete(task.id);
+          await patchTaskProgress(task.id, {
+            status: 'failed',
+            errorMessage: '网络连接失败'
+          }, true).catch(function () {});
+          resolve();
+        };
+        xhr.onabort = function () {
+          activeUploadXhrs.delete(task.id);
+          resolve();
+        };
+        xhr.send(formData);
+      });
     }
 
     function showNewFolderModal() {
@@ -6083,6 +7332,7 @@ const FIXED_INDEX_PAGE = `
         return;
       }
 
+      batchTaskOriginElement = lastTaskOriginElement;
       document.getElementById('batchOperation').value = operation;
       document.getElementById('batchDestinationPath').value = currentPath;
       document.getElementById('batchFolderSearch').value = '';
@@ -6118,60 +7368,57 @@ const FIXED_INDEX_PAGE = `
         return;
       }
 
-      showLoading(true);
+      let task = null;
       try {
-        const response = await fetch('/api/batch/download', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ items: items })
-        });
-
-        if (!response.ok) {
-          let message = '下载失败';
-          try {
-            const data = await response.json();
-            message = data.message || message;
-          } catch (error) {
-            message = response.statusText || message;
+        task = await createTask({
+          type: 'batch_download',
+          title: '批量下载 ' + items.length + ' 项',
+          items: items
+        }, lastTaskOriginElement);
+        startNativeDownload('/api/tasks/' + encodeURIComponent(task.id) + '/download');
+        await patchTaskProgress(task.id, {
+          status: 'succeeded',
+          processedItems: items.length,
+          totalItems: items.length,
+          result: {
+            nativeDownload: true,
+            items: items.map(function (item) {
+              return {
+                path: item.path,
+                name: item.name || ''
+              };
+            })
           }
-          throw new Error(message);
-        }
-
-        const blob = await response.blob();
-        const filename = getDownloadFilename(response.headers.get('Content-Disposition')) || 'edgestash.zip';
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = filename;
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        URL.revokeObjectURL(url);
-        showToast('批量下载已开始', 'success');
+        }, true);
       } catch (error) {
-        showToast('批量下载失败: ' + error.message, 'error');
-      } finally {
-        showLoading(false);
-      }
-    }
-
-    function getDownloadFilename(header) {
-      if (!header) return '';
-      const utf8Match = header.match(/filename\\*=UTF-8''([^;\\n]+)/i);
-      if (utf8Match) {
-        try {
-          return decodeURIComponent(utf8Match[1]);
-        } catch (error) {
-          return utf8Match[1];
+        if (task) {
+          await patchTaskProgress(task.id, { status: 'failed', errorMessage: error.message }, true).catch(function () {});
+        } else {
+          showToast('批量下载失败: ' + error.message, 'error');
         }
       }
-      const fallbackMatch = header.match(/filename=["']?([^"';\\n]+)/i);
-      return fallbackMatch ? fallbackMatch[1] : '';
     }
 
     async function runBatchOperation(operation, destinationPath) {
       const items = getSelectedItems();
       if (items.length === 0) return;
+
+      if (operation === 'copy' || operation === 'move') {
+        try {
+          const task = await createTask({
+            type: operation,
+            title: (operation === 'move' ? '移动 ' : '复制 ') + items.length + ' 项',
+            destinationPath: destinationPath,
+            items: items
+          }, batchTaskOriginElement || lastTaskOriginElement);
+          clearSelection();
+          showToast((operation === 'move' ? '移动' : '复制') + '任务已开始', 'info');
+          runCopyMoveTaskLoop(task.id);
+        } catch (error) {
+          showToast('创建批量任务失败: ' + error.message, 'error');
+        }
+        return;
+      }
 
       showLoading(true);
       try {
@@ -6204,8 +7451,29 @@ const FIXED_INDEX_PAGE = `
       }
     }
 
-    function downloadFile(path) {
-      window.open(apiFileUrl('/api/download', path), '_blank');
+    async function downloadFile(path, originElement) {
+      let task = null;
+      try {
+        task = await createTask({
+          type: 'download',
+          title: '下载 ' + (path.split('/').pop() || '文件'),
+          path: path
+        }, originElement || lastTaskOriginElement);
+        startNativeDownload('/api/tasks/' + encodeURIComponent(task.id) + '/download');
+        await patchTaskProgress(task.id, {
+          status: 'succeeded',
+          processedBytes: task.totalBytes || 0,
+          totalBytes: task.totalBytes || 0,
+          result: { nativeDownload: true }
+        }, true);
+      } catch (error) {
+        if (task && (canceledLocalTasks.has(task.id) || !taskStore.has(task.id))) return;
+        if (task) {
+          await patchTaskProgress(task.id, { status: 'failed', errorMessage: error.message }, true).catch(function () {});
+        } else {
+          showToast('下载失败: ' + error.message, 'error');
+        }
+      }
     }
 
     function showShareModal(path) {
@@ -6492,6 +7760,7 @@ const FIXED_INDEX_PAGE = `
 
     initializeBatchFolderSearch();
     checkAuth();
+    startTaskMonitor();
     loadFiles();
   </script>
 </body>
@@ -7319,7 +8588,7 @@ export default {
     // CORS headers for API requests
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type'
     };
     
@@ -7375,6 +8644,39 @@ export default {
 
         if (path === '/api/recent' && ['GET', 'POST'].includes(method)) {
           return await handleRecent(request, env);
+        }
+
+        if (path === '/api/tasks' && method === 'GET') {
+          return await handleListTasks(request, env);
+        }
+
+        if (path === '/api/tasks' && method === 'POST') {
+          return await handleCreateTask(request, env);
+        }
+
+        if (path.match(/^\/api\/tasks\/[^/]+\/progress$/) && method === 'PATCH') {
+          const taskId = path.split('/')[3];
+          return await handleUpdateTaskProgress(request, env, taskId);
+        }
+
+        if (path.match(/^\/api\/tasks\/[^/]+\/cancel$/) && method === 'POST') {
+          const taskId = path.split('/')[3];
+          return await handleCancelTask(request, env, taskId);
+        }
+
+        if (path.match(/^\/api\/tasks\/[^/]+\/download$/) && method === 'GET') {
+          const taskId = path.split('/')[3];
+          return await handleTaskDownload(request, env, taskId);
+        }
+
+        if (path.match(/^\/api\/tasks\/[^/]+$/) && method === 'DELETE') {
+          const taskId = path.split('/')[3];
+          return await handleDeleteTask(request, env, taskId);
+        }
+
+        if (path.match(/^\/api\/tasks\/[^/]+\/run$/) && method === 'POST') {
+          const taskId = path.split('/')[3];
+          return await handleRunTask(request, env, taskId);
         }
 
         if (path === '/api/reader/progress' && method === 'GET') {
