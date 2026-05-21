@@ -1253,7 +1253,7 @@ async function handleBatchFileOperation(request, env) {
 }
 
 const TASK_ACTIVE_STATUSES = new Set(['queued', 'running']);
-const TASK_TYPES = new Set(['upload', 'download', 'batch_download', 'copy', 'move']);
+const TASK_TYPES = new Set(['upload', 'download', 'batch_download', 'copy', 'move', 'delete']);
 
 function taskRowToClient(row) {
   let result = null;
@@ -1355,7 +1355,8 @@ const TASK_TYPE_LABELS = {
   download: '下载',
   batch_download: '批量下载',
   copy: '复制',
-  move: '移动'
+  move: '移动',
+  delete: '删除'
 };
 
 async function buildCopyMoveTaskItems(env, auth, operation, selectedItems, destinationPath) {
@@ -1429,6 +1430,71 @@ async function buildCopyMoveTaskItems(env, auth, operation, selectedItems, desti
           targetKey,
           size: sourceObject.size || 0
         });
+      }
+    } catch (error) {
+      errors.push({ path: itemPath, message: error.message });
+    }
+  }
+
+  if (taskItems.length === 0 && errors.length > 0) {
+    throw new Error(errors[0].message);
+  }
+
+  return { taskItems, errors };
+}
+
+async function buildDeleteTaskItems(env, auth, selectedItems) {
+  const taskItems = [];
+  const errors = [];
+  const reservedKeys = new Set();
+
+  for (const item of selectedItems) {
+    const itemPath = normalizeItemPath(typeof item === 'string' ? item : item.path);
+    try {
+      if (!itemPath || itemPath === '/') throw new Error('不能操作根目录');
+
+      const permissionError = await requirePathPermission(env, auth, 'delete', itemPath);
+      if (permissionError) {
+        const data = await permissionError.json();
+        throw new Error(data.message || '没有删除权限');
+      }
+
+      const sourceKey = itemPathToR2Key(itemPath);
+      const sourceObject = await env.R2_BUCKET.head(sourceKey);
+      const sourcePrefix = sourceKey + '/';
+      const folderCheck = await env.R2_BUCKET.list({ prefix: sourcePrefix, limit: 1 });
+      const isFolder = !!(folderCheck.objects && folderCheck.objects.length > 0);
+      if (!sourceObject && !isFolder) throw new Error('项目不存在: ' + itemPath);
+
+      if (sourceObject && !reservedKeys.has(sourceKey)) {
+        reservedKeys.add(sourceKey);
+        taskItems.push({
+          sourcePath: itemPath,
+          sourceKey,
+          targetPath: itemPath,
+          targetKey: sourceKey,
+          size: sourceObject.size || 0
+        });
+      }
+
+      if (isFolder) {
+        let cursor;
+        do {
+          const listed = await env.R2_BUCKET.list({ prefix: sourcePrefix, cursor });
+          for (const obj of listed.objects || []) {
+            if (reservedKeys.has(obj.key)) continue;
+            reservedKeys.add(obj.key);
+            const objectPath = r2KeyToPath(obj.key);
+            taskItems.push({
+              sourcePath: objectPath,
+              sourceKey: obj.key,
+              targetPath: objectPath,
+              targetKey: obj.key,
+              size: obj.size || 0
+            });
+          }
+          cursor = listed.truncated ? listed.cursor : null;
+        } while (cursor);
       }
     } catch (error) {
       errors.push({ path: itemPath, message: error.message });
@@ -1524,7 +1590,7 @@ async function handleCreateTask(request, env) {
           }))
         }
       });
-    } else {
+    } else if (type === 'copy' || type === 'move') {
       const items = Array.isArray(body.items) ? body.items : [];
       if (items.length === 0) return jsonResponse({ success: false, message: '请选择要操作的文件或文件夹' }, 400);
       const destinationPath = normalizeDirectoryPath(body.destinationPath || '/');
@@ -1534,6 +1600,20 @@ async function handleCreateTask(request, env) {
         title: body.title || ((type === 'move' ? '移动 ' : '复制 ') + items.length + ' 项'),
         sourcePath: items.map(item => normalizeItemPath(typeof item === 'string' ? item : item.path)).join('\n'),
         destinationPath,
+        totalItems: built.taskItems.length
+      });
+      await insertTaskItems(env, taskId, built.taskItems);
+      if (built.errors.length > 0) {
+        await updateTaskStatus(env, taskId, 'queued', { result: { errors: built.errors } });
+      }
+    } else if (type === 'delete') {
+      const items = Array.isArray(body.items) ? body.items : [];
+      if (items.length === 0) return jsonResponse({ success: false, message: '请选择要删除的文件或文件夹' }, 400);
+      const built = await buildDeleteTaskItems(env, auth, items);
+      taskId = await insertFileTask(env, auth, {
+        type,
+        title: body.title || ('删除 ' + items.length + ' 项'),
+        sourcePath: items.map(item => normalizeItemPath(typeof item === 'string' ? item : item.path)).join('\n'),
         totalItems: built.taskItems.length
       });
       await insertTaskItems(env, taskId, built.taskItems);
@@ -1707,7 +1787,7 @@ async function handleRunTask(request, env, taskId) {
   try {
     const task = await getTaskForAuth(env, auth, taskId);
     if (!task) return jsonResponse({ success: false, message: '任务不存在' }, 404);
-    if (!['copy', 'move'].includes(task.task_type)) {
+    if (!['copy', 'move', 'delete'].includes(task.task_type)) {
       return jsonResponse({ success: false, message: '此任务不支持分片执行' }, 400);
     }
     if (!TASK_ACTIVE_STATUSES.has(task.status)) {
@@ -1726,10 +1806,14 @@ async function handleRunTask(request, env, taskId) {
     const errors = [];
     for (const item of rows.results || []) {
       try {
-        const copied = await copyR2Object(env, item.source_key, item.target_key);
-        if (!copied) throw new Error('源对象不存在');
-        if (task.task_type === 'move') {
+        if (task.task_type === 'delete') {
           await env.R2_BUCKET.delete(item.source_key);
+        } else {
+          const copied = await copyR2Object(env, item.source_key, item.target_key);
+          if (!copied) throw new Error('源对象不存在');
+          if (task.task_type === 'move') {
+            await env.R2_BUCKET.delete(item.source_key);
+          }
         }
         await env.D1_DB.prepare(`
           UPDATE file_task_items
@@ -1765,7 +1849,11 @@ async function handleRunTask(request, env, taskId) {
       if (task.task_type === 'move') {
         await cleanupMovedTaskSources(env, taskId);
       }
-      await invalidateCachePath(env, targetPath);
+      if (task.task_type === 'delete') {
+        await cleanupDeletedTaskSources(env, task);
+      } else {
+        await invalidateCachePath(env, targetPath);
+      }
       if (task.task_type === 'move') {
         await cleanupMovedTaskD1(env, taskId);
       }
@@ -1788,6 +1876,18 @@ async function handleRunTask(request, env, taskId) {
   } catch (e) {
     await updateTaskStatus(env, taskId, 'failed', { errorMessage: e.message }).catch(() => null);
     return jsonResponse({ success: false, message: '执行任务失败: ' + e.message }, 500);
+  }
+}
+
+async function cleanupDeletedTaskSources(env, task) {
+  const sourceRoots = String(task?.source_path || '')
+    .split('\n')
+    .map(path => normalizeItemPath(path))
+    .filter(path => path && path !== '/');
+
+  for (const path of sourceRoots) {
+    await invalidateCachePath(env, path);
+    await cleanupD1ItemPath(env, path);
   }
 }
 
@@ -5888,7 +5988,7 @@ const FIXED_INDEX_PAGE = `
       taskStore.set(task.id, task);
       maybeNotifyTaskTerminal(task, previous, options && options.forceToast);
       updateTaskUi();
-      if ((task.type === 'copy' || task.type === 'move') && (task.status === 'queued' || task.status === 'running')) {
+      if ((task.type === 'copy' || task.type === 'move' || task.type === 'delete') && (task.status === 'queued' || task.status === 'running')) {
         runCopyMoveTaskLoop(task.id);
       }
     }
@@ -5901,7 +6001,7 @@ const FIXED_INDEX_PAGE = `
       if (!becameTerminal || shown.has(key)) return;
       shown.add(key);
       saveDoneTaskToastSet(shown);
-      const verb = task.type === 'upload' ? '上传' : task.type === 'download' || task.type === 'batch_download' ? '下载' : task.type === 'move' ? '移动' : '复制';
+      const verb = task.type === 'upload' ? '上传' : task.type === 'download' || task.type === 'batch_download' ? '下载' : task.type === 'move' ? '移动' : task.type === 'delete' ? '删除' : '复制';
       if (task.status === 'succeeded') {
         showToast(verb + (task.result && task.result.nativeDownload ? '已开始: ' : '完成: ') + task.title, 'success');
       } else if (task.status === 'failed') {
@@ -6049,7 +6149,7 @@ const FIXED_INDEX_PAGE = `
     }
 
     function taskTypeLabel(type) {
-      return { upload: '上传', download: '下载', batch_download: '批量下载', copy: '复制', move: '移动' }[type] || '任务';
+      return { upload: '上传', download: '下载', batch_download: '批量下载', copy: '复制', move: '移动', delete: '删除' }[type] || '任务';
     }
 
     function taskStatusLabel(task) {
@@ -6588,9 +6688,6 @@ const FIXED_INDEX_PAGE = `
         toggleFavorite(item);
       }));
       if (!item.isFolder) {
-        actions.appendChild(createActionButton('download', '下载', 'btn-secondary', function () {
-          downloadFile(item.path);
-        }));
         actions.appendChild(createActionButton('share', '分享', 'btn-secondary', function () {
           showShareModal(item.path);
         }));
@@ -7358,6 +7455,7 @@ const FIXED_INDEX_PAGE = `
       }
 
       if (!window.confirm('确定要删除选中的 ' + items.length + ' 项吗？此操作不可恢复。')) return;
+      batchTaskOriginElement = lastTaskOriginElement;
       await runBatchOperation('delete', '/');
     }
 
@@ -7403,19 +7501,22 @@ const FIXED_INDEX_PAGE = `
       const items = getSelectedItems();
       if (items.length === 0) return;
 
-      if (operation === 'copy' || operation === 'move') {
+      if (operation === 'copy' || operation === 'move' || operation === 'delete') {
         try {
+          const verb = operation === 'move' ? '移动' : operation === 'delete' ? '删除' : '复制';
           const task = await createTask({
             type: operation,
-            title: (operation === 'move' ? '移动 ' : '复制 ') + items.length + ' 项',
+            title: verb + ' ' + items.length + ' 项',
             destinationPath: destinationPath,
             items: items
           }, batchTaskOriginElement || lastTaskOriginElement);
           clearSelection();
-          showToast((operation === 'move' ? '移动' : '复制') + '任务已开始', 'info');
+          showToast(verb + '任务已开始', 'info');
           runCopyMoveTaskLoop(task.id);
         } catch (error) {
           showToast('创建批量任务失败: ' + error.message, 'error');
+        } finally {
+          batchTaskOriginElement = null;
         }
         return;
       }
