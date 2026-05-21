@@ -75,55 +75,6 @@ Binding 名必须和代码一致。如果你改了 binding 名，需要同步改
 https://your-worker.your-subdomain.workers.dev/
 ```
 
-## Wrangler 部署流程
-
-安装并登录 Wrangler：
-
-```bash
-npm install -g wrangler
-wrangler login
-```
-
-在项目根目录创建 `wrangler.toml`：
-
-```toml
-name = "edge-stash"
-main = "worker.js"
-compatibility_date = "2026-05-21"
-workers_dev = true
-
-[[r2_buckets]]
-binding = "R2_BUCKET"
-bucket_name = "your-r2-bucket-name"
-
-[[kv_namespaces]]
-binding = "KV_STORE"
-id = "your-kv-namespace-id"
-
-[[d1_databases]]
-binding = "D1_DB"
-database_name = "your-d1-database-name"
-database_id = "your-d1-database-id"
-```
-
-设置管理员密码：
-
-```bash
-wrangler secret put ADMIN_PASSWORD
-```
-
-部署：
-
-```bash
-wrangler deploy
-```
-
-如果不使用 `wrangler.toml`，也可以指定入口文件：
-
-```bash
-wrangler deploy worker.js --name edge-stash
-```
-
 ## 首次初始化
 
 部署完成后：
@@ -140,15 +91,23 @@ wrangler deploy worker.js --name edge-stash
 
 普通用户登录不需要 OTP，只使用管理员创建的邮箱和密码。
 
-## 重置管理员 OTP
+## 重置 OTP 和 D1 初始化状态
 
 如果管理员手机丢失、Authenticator 数据丢失，或需要重新绑定 OTP，需要删除 KV 中的管理员 OTP key。
 
-建议同时删除这两个 key：
+如果 D1 表结构曾经初始化失败、手动删改过 D1 表，或更换过 D1 数据库，也可以同时删除 D1 初始化标记，让 Worker 下次访问时重新检查并创建表结构。
+
+管理员 OTP 相关 key：
 
 ```txt
 admin:otp:secret
 admin:otp:pending
+```
+
+D1 初始化标记 key：
+
+```txt
+d1:schema:v1
 ```
 
 说明：
@@ -156,25 +115,28 @@ admin:otp:pending
 - `admin:otp:secret` 是已启用的管理员 OTP Secret。
 - `admin:otp:pending` 是首次初始化时的临时 Secret，有效期约 10 分钟。
 - 如果只删除 `admin:otp:secret`，但 `admin:otp:pending` 还存在，页面可能继续复用旧的临时初始化 Secret。
-- 删除后，旧 Authenticator 中的验证码会失效，下一次管理员密码登录会重新显示初始化二维码。
+- 删除 OTP key 后，旧 Authenticator 中的验证码会失效，下一次管理员密码登录会重新显示初始化二维码。
+- 删除 `d1:schema:v1` 不会删除 D1 数据，只会让 Worker 下次访问相关 API 时重新执行建表检查。
 
-### 在 Dashboard 重置
+### 在 Dashboard 里重置
 
 1. 打开 Cloudflare Dashboard。
 2. 进入 Workers KV。
 3. 选择绑定到 EdgeStash 的 KV Namespace。
-4. 搜索并删除：
+4. 按需要搜索并删除：
    - `admin:otp:secret`
    - `admin:otp:pending`
-5. 回到 `/login.html`，输入管理员密码，重新扫码绑定。
+   - `d1:schema:v1`
+5. 如果重置了 OTP，回到 `/login.html`，输入管理员密码，重新扫码绑定。
 
-### 用 Wrangler 重置
+### 用 Wrangler 删除 KV key
 
 在有 `wrangler.toml` 且绑定名为 `KV_STORE` 的项目目录中执行：
 
 ```bash
 wrangler kv key delete "admin:otp:secret" --binding KV_STORE
 wrangler kv key delete "admin:otp:pending" --binding KV_STORE
+wrangler kv key delete "d1:schema:v1" --binding KV_STORE
 ```
 
 如果你更习惯使用 KV namespace ID：
@@ -182,6 +144,7 @@ wrangler kv key delete "admin:otp:pending" --binding KV_STORE
 ```bash
 wrangler kv key delete "admin:otp:secret" --namespace-id YOUR_KV_NAMESPACE_ID
 wrangler kv key delete "admin:otp:pending" --namespace-id YOUR_KV_NAMESPACE_ID
+wrangler kv key delete "d1:schema:v1" --namespace-id YOUR_KV_NAMESPACE_ID
 ```
 
 ## 日常使用
