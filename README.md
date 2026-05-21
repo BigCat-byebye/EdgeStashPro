@@ -291,6 +291,24 @@ user_permissions
 
 请同时删除 `admin:otp:pending`。临时初始化 Secret 可能仍在 10 分钟有效期内。
 
+### 当前目录不显示文件，控制台报 `Unexpected token 'if'` 怎么办？
+
+这通常是线上 Worker 仍在运行旧版页面模板，或手动粘贴部署时改坏了内嵌脚本中的正则转义。先确认 Cloudflare Worker 中部署的是当前仓库的完整 `worker.js`，保存后强制刷新浏览器缓存。
+
+如果你在旧代码里看到类似这一行：
+
+```js
+normalized = normalized.replace(//+/g, '/');
+```
+
+需要改成：
+
+```js
+normalized = normalized.replace(/[/]+/g, '/');
+```
+
+当前仓库版本已不包含这段旧逻辑；如果重新部署当前 `worker.js` 后仍然目录为空，再检查 `R2_BUCKET`、`KV_STORE`、`D1_DB` binding 是否配置正确，以及普通用户是否已经授权了可访问目录。
+
 ### 需要 D1 吗？
 
 需要。当前版本使用 D1 保存搜索索引、收藏、最近访问、分享链接、统计和用户路径权限，binding 名固定为 `D1_DB`。相关表由 `worker.js` 首次访问相关 API 时自动创建。
