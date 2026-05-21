@@ -2595,6 +2595,53 @@ function shareRowToClient(row) {
   };
 }
 
+function shareItemRowToClient(row) {
+  return {
+    path: normalizeItemPath(row.item_path),
+    name: row.item_name || nameFromItemPath(row.item_path),
+    itemType: row.item_type === 'folder' ? 'folder' : 'file',
+    sortOrder: row.sort_order || 0
+  };
+}
+
+function isPathWithinFolder(folderPath, targetPath) {
+  const folder = normalizeDirectoryPath(folderPath);
+  const target = normalizeItemPath(targetPath);
+  return target === folder || target.startsWith(folder + '/');
+}
+
+async function describeShareItem(env, rawPath) {
+  const path = normalizeItemPath(rawPath);
+  if (!path || path === '/') throw new Error('不能分享根目录');
+
+  const key = itemPathToR2Key(path);
+  const object = await env.R2_BUCKET.head(key);
+  if (object) {
+    return {
+      path,
+      name: nameFromItemPath(path),
+      itemType: 'file',
+      size: object.size || 0,
+      lastModified: isoDateString(object.uploaded),
+      previewType: getPreviewType(nameFromItemPath(path))
+    };
+  }
+
+  const folderCheck = await env.R2_BUCKET.list({ prefix: key + '/', limit: 1 });
+  if (folderCheck.objects && folderCheck.objects.length > 0) {
+    return {
+      path,
+      name: nameFromItemPath(path),
+      itemType: 'folder',
+      size: 0,
+      lastModified: null,
+      previewType: null
+    };
+  }
+
+  throw new Error('项目不存在: ' + path);
+}
+
 async function upsertD1Share(env, share) {
   await ensureD1Schema(env);
   await env.D1_DB.prepare(`
@@ -2613,18 +2660,79 @@ async function upsertD1Share(env, share) {
     share.downloadCount || 0,
     share.createdAt || Date.now()
   ).run();
+
+  if (Array.isArray(share.items) && share.items.length > 0) {
+    const insertItem = env.D1_DB.prepare(`
+      INSERT OR IGNORE INTO share_items (
+        share_id, item_path, item_name, item_type, sort_order, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    await env.D1_DB.batch(share.items.map((item, index) => insertItem.bind(
+      share.shareId,
+      normalizeItemPath(item.path),
+      item.name || nameFromItemPath(item.path),
+      item.itemType === 'folder' ? 'folder' : 'file',
+      Number.isFinite(item.sortOrder) ? item.sortOrder : index,
+      share.createdAt || Date.now()
+    )));
+  }
+}
+
+async function getD1ShareItems(env, share) {
+  const rows = await env.D1_DB.prepare(`
+    SELECT * FROM share_items
+    WHERE share_id = ?
+    ORDER BY sort_order ASC, item_name ASC
+  `).bind(share.shareId).all();
+
+  const items = (rows.results || []).map(shareItemRowToClient);
+  if (items.length > 0) return items;
+
+  const fallbackPath = r2KeyToPath(share.filePath || '');
+  if (!fallbackPath || fallbackPath === '/') return [];
+  const fallbackItem = {
+    path: fallbackPath,
+    name: share.fileName || nameFromItemPath(fallbackPath),
+    itemType: 'file',
+    sortOrder: 0
+  };
+
+  await env.D1_DB.prepare(`
+    INSERT OR IGNORE INTO share_items (
+      share_id, item_path, item_name, item_type, sort_order, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+  `).bind(
+    share.shareId,
+    fallbackItem.path,
+    fallbackItem.name,
+    fallbackItem.itemType,
+    0,
+    share.createdAt || Date.now()
+  ).run();
+
+  return [fallbackItem];
 }
 
 async function getD1Share(env, shareId) {
   await ensureD1Schema(env);
   const row = await env.D1_DB.prepare('SELECT * FROM share_links WHERE share_id = ?').bind(shareId).first();
-  if (row) return shareRowToClient(row);
+  if (row) {
+    const share = shareRowToClient(row);
+    share.items = await getD1ShareItems(env, share);
+    return share;
+  }
 
   const legacyData = await env.KV_STORE.get(`share:${shareId}`);
   if (!legacyData) return null;
 
   const legacyShare = JSON.parse(legacyData);
+  legacyShare.items = [{
+    path: r2KeyToPath(legacyShare.filePath || ''),
+    name: legacyShare.fileName || nameFromItemPath(legacyShare.filePath || ''),
+    itemType: 'file'
+  }];
   await upsertD1Share(env, legacyShare);
+  legacyShare.items = await getD1ShareItems(env, legacyShare);
   return legacyShare;
 }
 
@@ -2644,7 +2752,15 @@ async function migrateLegacySharesToD1(env) {
       const data = await env.KV_STORE.get(key.name);
       if (!data) continue;
       try {
-        await upsertD1Share(env, JSON.parse(data));
+        const legacyShare = JSON.parse(data);
+        if (!Array.isArray(legacyShare.items) || legacyShare.items.length === 0) {
+          legacyShare.items = [{
+            path: r2KeyToPath(legacyShare.filePath || ''),
+            name: legacyShare.fileName || nameFromItemPath(legacyShare.filePath || ''),
+            itemType: 'file'
+          }];
+        }
+        await upsertD1Share(env, legacyShare);
         migrated++;
       } catch (error) {
         console.warn('Legacy share migration failed:', key.name, error.message);
@@ -2748,22 +2864,35 @@ async function handleCreateShare(request, env) {
   try {
     const body = await request.json();
     const { filePath, password, expiresIn } = body;
-    
-    if (!filePath) {
-      return jsonResponse({ success: false, message: '请提供文件路径' }, 400);
+    const requestedItems = Array.isArray(body.items) && body.items.length > 0
+      ? body.items
+      : (filePath ? [{ path: filePath }] : []);
+
+    if (requestedItems.length === 0) {
+      return jsonResponse({ success: false, message: '请选择要分享的文件或文件夹' }, 400);
     }
 
-    const normalizedFilePath = normalizeItemPath(filePath);
-    const permissionError = await requirePathPermission(env, auth, 'share', normalizedFilePath);
-    if (permissionError) return permissionError;
-    
-    // Verify file exists
-    let key = normalizedFilePath;
-    if (key.startsWith('/')) key = key.slice(1);
-    
-    const object = await env.R2_BUCKET.head(key);
-    if (!object) {
-      return jsonResponse({ success: false, message: '文件不存在' }, 404);
+    const seenPaths = new Set();
+    const shareItems = [];
+
+    for (const rawItem of requestedItems) {
+      const rawPath = typeof rawItem === 'string' ? rawItem : rawItem?.path;
+      const itemPath = normalizeItemPath(rawPath);
+      if (!itemPath || itemPath === '/') {
+        return jsonResponse({ success: false, message: '不能分享根目录' }, 400);
+      }
+      if (seenPaths.has(itemPath)) continue;
+
+      const permissionError = await requirePathPermission(env, auth, 'share', itemPath);
+      if (permissionError) return permissionError;
+
+      const item = await describeShareItem(env, itemPath);
+      seenPaths.add(item.path);
+      shareItems.push(item);
+    }
+
+    if (shareItems.length === 0) {
+      return jsonResponse({ success: false, message: '请选择要分享的文件或文件夹' }, 400);
     }
     
     let shareId = '';
@@ -2778,16 +2907,18 @@ async function handleCreateShare(request, env) {
       throw new Error('分享 ID 生成失败，请重试');
     }
 
+    const firstItem = shareItems[0];
     const shareData = {
       shareId,
-      filePath: key,
-      fileName: key.split('/').pop(),
-      fileSize: object.size,
+      filePath: itemPathToR2Key(firstItem.path),
+      fileName: shareItems.length === 1 ? firstItem.name : shareItems.length + ' 个项目',
+      fileSize: shareItems.length === 1 && firstItem.itemType === 'file' ? firstItem.size : 0,
       passwordHash: password ? await hashPassword(password) : null,
       expiresAt: getExpirationTime(expiresIn || '1d'),
       viewCount: 0,
       downloadCount: 0,
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      items: shareItems
     };
     
     await upsertD1Share(env, shareData);
@@ -2801,6 +2932,87 @@ async function handleCreateShare(request, env) {
   } catch (e) {
     return jsonResponse({ success: false, message: '创建分享链接失败: ' + e.message }, 500);
   }
+}
+
+async function readShareRequestBody(request) {
+  return await request.json().catch(() => ({}));
+}
+
+async function validateSharePassword(share, body) {
+  if (!share.passwordHash) return null;
+
+  const password = body?.password || '';
+  if (!password) {
+    return jsonResponse({ success: false, message: '请输入密码' }, 401);
+  }
+
+  const passwordHash = await hashPassword(password);
+  if (passwordHash !== share.passwordHash) {
+    return jsonResponse({ success: false, message: '密码错误' }, 401);
+  }
+  return null;
+}
+
+function findSharedFolderForPath(share, path) {
+  const targetPath = normalizeItemPath(path);
+  return (share.items || []).find(item => (
+    item.itemType === 'folder' && isPathWithinFolder(item.path, targetPath)
+  ));
+}
+
+function isSharedFilePath(share, path) {
+  const targetPath = normalizeItemPath(path);
+  return (share.items || []).some(item => (
+    item.itemType === 'file' && normalizeItemPath(item.path) === targetPath
+  ));
+}
+
+function isDownloadPathAllowedByShare(share, path) {
+  const targetPath = normalizeItemPath(path);
+  if (isSharedFilePath(share, targetPath)) return true;
+  return (share.items || []).some(item => {
+    if (item.itemType !== 'folder') return false;
+    const folderPath = normalizeDirectoryPath(item.path);
+    return targetPath.startsWith(folderPath + '/');
+  });
+}
+
+async function buildShareRootListing(env, share) {
+  const files = [];
+  const folders = [];
+
+  for (const item of share.items || []) {
+    if (item.itemType === 'folder') {
+      if (await folderExists(env, item.path)) {
+        folders.push({
+          name: item.name,
+          path: normalizeItemPath(item.path)
+        });
+      }
+      continue;
+    }
+
+    const object = await env.R2_BUCKET.head(itemPathToR2Key(item.path));
+    if (!object) continue;
+    files.push({
+      name: item.name,
+      path: normalizeItemPath(item.path),
+      size: object.size || 0,
+      sizeFormatted: formatFileSize(object.size || 0),
+      lastModified: isoDateString(object.uploaded),
+      previewType: getPreviewType(item.name)
+    });
+  }
+
+  folders.sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
+  files.sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
+
+  return {
+    success: true,
+    currentPath: '/',
+    files,
+    folders
+  };
 }
 
 async function handleGetShareInfo(request, env, shareId) {
@@ -2821,17 +3033,62 @@ async function handleGetShareInfo(request, env, shareId) {
       WHERE share_id = ?
     `).bind(shareId).run();
     await changeD1Stat(env, 'totalViews', 1);
+
+    const itemCount = (share.items || []).length || 1;
+    const firstItem = (share.items || [])[0] || null;
     
     return jsonResponse({
       success: true,
       fileName: share.fileName,
       fileSize: share.fileSize,
-      fileSizeFormatted: formatFileSize(share.fileSize),
+      fileSizeFormatted: itemCount === 1 && firstItem?.itemType === 'folder' ? '文件夹' : formatFileSize(share.fileSize),
+      itemCount,
       requiresPassword: !!share.passwordHash,
       expiresAt: share.expiresAt
     });
   } catch (e) {
     return jsonResponse({ success: false, message: '获取分享信息失败: ' + e.message }, 500);
+  }
+}
+
+async function handleShareList(request, env, shareId) {
+  try {
+    const share = await getD1Share(env, shareId);
+    if (!share) {
+      return jsonResponse({ success: false, message: '分享链接不存在' }, 404);
+    }
+
+    if (share.expiresAt && Date.now() > share.expiresAt) {
+      return jsonResponse({ success: false, message: '分享链接已过期' }, 410);
+    }
+
+    const body = await readShareRequestBody(request);
+    const passwordError = await validateSharePassword(share, body);
+    if (passwordError) return passwordError;
+
+    const currentPath = normalizeDirectoryPath(body.path || '/');
+    if (currentPath === '/') {
+      return jsonResponse(await buildShareRootListing(env, share));
+    }
+
+    const sharedFolder = findSharedFolderForPath(share, currentPath);
+    if (!sharedFolder) {
+      return jsonResponse({ success: false, message: '无权访问该路径' }, 403);
+    }
+
+    if (!(await folderExists(env, currentPath))) {
+      return jsonResponse({ success: false, message: '文件夹不存在' }, 404);
+    }
+
+    const listing = await listDirectoryFromR2(env, currentPath);
+    return jsonResponse({
+      success: true,
+      currentPath,
+      files: listing.files,
+      folders: listing.folders
+    });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '获取分享目录失败: ' + e.message }, 500);
   }
 }
 
@@ -2847,23 +3104,27 @@ async function handleShareDownload(request, env, shareId) {
       return jsonResponse({ success: false, message: '分享链接已过期' }, 410);
     }
     
-    // Check password
-    if (share.passwordHash) {
-      const body = await request.json();
-      const { password } = body;
-      
-      if (!password) {
-        return jsonResponse({ success: false, message: '请输入密码' }, 401);
-      }
-      
-      const passwordHash = await hashPassword(password);
-      if (passwordHash !== share.passwordHash) {
-        return jsonResponse({ success: false, message: '密码错误' }, 401);
-      }
+    const body = await readShareRequestBody(request);
+    const passwordError = await validateSharePassword(share, body);
+    if (passwordError) return passwordError;
+
+    let targetPath = body.path || body.filePath || body.targetPath || '';
+    if (!targetPath && (share.items || []).length === 1 && share.items[0].itemType === 'file') {
+      targetPath = share.items[0].path;
+    }
+    targetPath = normalizeItemPath(targetPath);
+
+    if (!targetPath || targetPath === '/') {
+      return jsonResponse({ success: false, message: '请选择要下载的文件' }, 400);
+    }
+
+    if (!isDownloadPathAllowedByShare(share, targetPath)) {
+      return jsonResponse({ success: false, message: '无权下载该文件' }, 403);
     }
     
     // Get file from R2
-    const object = await env.R2_BUCKET.get(share.filePath);
+    const filename = nameFromItemPath(targetPath);
+    const object = await env.R2_BUCKET.get(itemPathToR2Key(targetPath));
     if (!object) {
       return jsonResponse({ success: false, message: '文件不存在' }, 404);
     }
@@ -2877,8 +3138,8 @@ async function handleShareDownload(request, env, shareId) {
     
     return new Response(object.body, {
       headers: {
-        'Content-Type': object.httpMetadata?.contentType || getMimeType(share.fileName),
-        'Content-Disposition': createAttachmentDisposition(share.fileName),
+        'Content-Type': object.httpMetadata?.contentType || getMimeType(filename),
+        'Content-Disposition': createAttachmentDisposition(filename),
         'Content-Length': object.size
       }
     });
@@ -2942,7 +3203,10 @@ async function handleDeleteShare(request, env, shareId) {
   
   try {
     const existing = await getD1Share(env, shareId);
-    await env.D1_DB.prepare('DELETE FROM share_links WHERE share_id = ?').bind(shareId).run();
+    await env.D1_DB.batch([
+      env.D1_DB.prepare('DELETE FROM share_items WHERE share_id = ?').bind(shareId),
+      env.D1_DB.prepare('DELETE FROM share_links WHERE share_id = ?').bind(shareId)
+    ]);
     await env.KV_STORE.delete(`share:${shareId}`);
     if (existing) await changeD1Stat(env, 'totalShares', -1);
     
@@ -3216,6 +3480,16 @@ async function ensureD1Schema(env) {
     )`,
     'CREATE INDEX IF NOT EXISTS idx_share_links_created ON share_links(created_at DESC)',
     'CREATE INDEX IF NOT EXISTS idx_share_links_expires ON share_links(expires_at)',
+    `CREATE TABLE IF NOT EXISTS share_items (
+      share_id TEXT NOT NULL,
+      item_path TEXT NOT NULL,
+      item_name TEXT NOT NULL,
+      item_type TEXT NOT NULL,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (share_id, item_path)
+    )`,
+    'CREATE INDEX IF NOT EXISTS idx_share_items_share_order ON share_items(share_id, sort_order)',
     `CREATE TABLE IF NOT EXISTS app_stats (
       key TEXT PRIMARY KEY,
       value INTEGER NOT NULL DEFAULT 0,
@@ -4918,7 +5192,7 @@ const CSS_STYLES = `
   .share-container {
     min-height: 100vh;
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: center;
     background: var(--background);
     padding: 20px;
@@ -4926,16 +5200,27 @@ const CSS_STYLES = `
   
   .share-card {
     background: var(--surface);
-    border-radius: 24px;
-    padding: 40px;
+    border-radius: 12px;
+    padding: 28px;
     width: 100%;
-    max-width: 480px;
-    text-align: center;
+    max-width: 960px;
+  }
+
+  .share-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 18px;
+  }
+
+  .share-title {
+    min-width: 0;
   }
   
   .share-icon {
-    font-size: 64px;
-    margin-bottom: 20px;
+    font-size: 36px;
+    margin-bottom: 8px;
   }
   
   .share-filename {
@@ -4947,12 +5232,30 @@ const CSS_STYLES = `
   
   .share-filesize {
     color: var(--text-muted);
-    margin-bottom: 24px;
+    font-size: 14px;
+  }
+
+  .share-browser {
+    display: none;
+  }
+
+  .share-browser.active {
+    display: block;
+  }
+
+  .share-browser .file-item {
+    cursor: pointer;
+  }
+
+  .share-browser .file-actions,
+  .share-browser .file-select {
+    display: none;
   }
   
   .share-expired {
     color: var(--error);
     font-size: 18px;
+    text-align: center;
   }
   
   /* Empty State */
@@ -5775,6 +6078,7 @@ const FIXED_INDEX_PAGE = `
       <button type="button" class="btn btn-sm btn-secondary" onclick="setTaskOrigin(this);showBatchTargetModal('copy')">复制</button>
       <button type="button" class="btn btn-sm btn-secondary" onclick="setTaskOrigin(this);showBatchTargetModal('move')">移动</button>
       <button type="button" class="btn btn-sm btn-secondary" onclick="setTaskOrigin(this);batchDownload()">下载</button>
+      <button type="button" class="btn btn-sm btn-secondary" onclick="batchShare()">分享</button>
       <button type="button" class="btn btn-sm btn-danger" onclick="batchDelete()">删除</button>
     </div>
 
@@ -5841,6 +6145,7 @@ const FIXED_INDEX_PAGE = `
           </select>
         </div>
         <input type="hidden" id="shareFilePath">
+        <input type="hidden" id="shareItems">
         <button type="submit" class="btn btn-primary" style="width: 100%;">创建分享链接</button>
       </form>
     </div>
@@ -6688,14 +6993,8 @@ const FIXED_INDEX_PAGE = `
         toggleFavorite(item);
       }));
       if (!item.isFolder) {
-        actions.appendChild(createActionButton('share', '分享', 'btn-secondary', function () {
-          showShareModal(item.path);
-        }));
         actions.appendChild(createActionButton('rename', '重命名', 'btn-secondary', function () {
           showRenameModal(item.path, item.name);
-        }));
-        actions.appendChild(createActionButton('delete', '删除', 'btn-danger', function () {
-          deleteFile(item.path);
         }));
       }
       card.appendChild(actions);
@@ -7577,26 +7876,61 @@ const FIXED_INDEX_PAGE = `
       }
     }
 
-    function showShareModal(path) {
-      document.getElementById('shareFilePath').value = path;
+    function showShareModal(items) {
+      const shareItems = Array.isArray(items) ? items : [{ path: items }];
+      document.getElementById('shareFilePath').value = shareItems[0]?.path || '';
+      document.getElementById('shareItems').value = JSON.stringify(shareItems.map(function (item) {
+        return {
+          path: item.path,
+          name: item.name || '',
+          itemType: item.isFolder ? 'folder' : 'file'
+        };
+      }));
       document.getElementById('sharePassword').value = '';
       document.getElementById('shareExpiry').value = '1d';
       document.getElementById('shareModal').classList.add('active');
     }
 
+    function batchShare() {
+      const items = getSelectedItems();
+      if (items.length === 0) {
+        showToast('请选择要分享的文件或文件夹', 'error');
+        return;
+      }
+      showShareModal(items);
+    }
+
     async function createShare(event) {
       event.preventDefault();
       const filePath = document.getElementById('shareFilePath').value;
+      const shareItemsValue = document.getElementById('shareItems').value;
       const password = document.getElementById('sharePassword').value;
       const expiresIn = document.getElementById('shareExpiry').value;
+      let items = [];
+
+      try {
+        items = shareItemsValue ? JSON.parse(shareItemsValue) : [];
+      } catch (error) {
+        items = [];
+      }
 
       showLoading(true);
       closeModal('shareModal');
       try {
+        const payload = {
+          password: password,
+          expiresIn: expiresIn
+        };
+        if (items.length > 0) {
+          payload.items = items;
+        } else {
+          payload.filePath = filePath;
+        }
+
         const response = await fetch('/api/share', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ filePath: filePath, password: password, expiresIn: expiresIn })
+          body: JSON.stringify(payload)
         });
         const data = await response.json();
         if (data.success) {
@@ -8560,16 +8894,28 @@ const FIXED_SHARE_PAGE = `
       </div>
 
       <div id="shareContent" style="display: none;">
-        <div class="share-icon">📄</div>
-        <div class="share-filename" id="fileName"></div>
-        <div class="share-filesize" id="fileSize"></div>
+        <div class="share-header">
+          <div class="share-title">
+            <div class="share-icon">📁</div>
+            <div class="share-filename" id="fileName"></div>
+            <div class="share-filesize" id="fileSize"></div>
+          </div>
+        </div>
         <div id="passwordForm" style="display: none;">
           <div class="form-group">
             <label class="form-label" for="sharePassword">请输入分享密码</label>
-            <input type="password" id="sharePassword" class="form-input" placeholder="输入密码">
+            <input type="password" id="sharePassword" class="form-input" placeholder="输入密码" onkeydown="handlePasswordKey(event)">
+          </div>
+          <button type="button" class="btn btn-primary" style="width: 100%;" onclick="unlockShare()">进入分享</button>
+        </div>
+        <div class="share-browser" id="shareBrowser">
+          <div class="breadcrumb" id="shareBreadcrumb"></div>
+          <div id="shareFileList" class="file-grid"></div>
+          <div id="shareEmptyState" class="empty-state" style="display: none;">
+            <div class="empty-icon">📂</div>
+            <div>此文件夹为空</div>
           </div>
         </div>
-        <button type="button" class="btn btn-primary" style="width: 100%; margin-top: 20px;" onclick="downloadFile()">下载文件</button>
       </div>
     </div>
   </div>
@@ -8579,6 +8925,8 @@ const FIXED_SHARE_PAGE = `
   <script>
     let shareId = '';
     let requiresPassword = false;
+    let sharePassword = '';
+    let currentPath = '/';
 
     async function loadShareInfo() {
       const parts = window.location.pathname.split('/').filter(Boolean);
@@ -8598,9 +8946,12 @@ const FIXED_SHARE_PAGE = `
         document.getElementById('loadingState').style.display = 'none';
         document.getElementById('shareContent').style.display = 'block';
         document.getElementById('fileName').textContent = data.fileName;
-        document.getElementById('fileSize').textContent = data.fileSizeFormatted;
+        document.getElementById('fileSize').textContent = data.itemCount > 1 ? data.itemCount + ' 个项目' : data.fileSizeFormatted;
         requiresPassword = !!data.requiresPassword;
         document.getElementById('passwordForm').style.display = requiresPassword ? 'block' : 'none';
+        if (!requiresPassword) {
+          await loadShareDirectory('/');
+        }
       } catch (error) {
         showExpired();
       }
@@ -8611,9 +8962,163 @@ const FIXED_SHARE_PAGE = `
       document.getElementById('expiredState').style.display = 'block';
     }
 
-    async function downloadFile() {
-      const password = document.getElementById('sharePassword') ? document.getElementById('sharePassword').value : '';
-      if (requiresPassword && !password) {
+    function handlePasswordKey(event) {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        unlockShare();
+      }
+    }
+
+    async function unlockShare() {
+      sharePassword = document.getElementById('sharePassword') ? document.getElementById('sharePassword').value : '';
+      if (requiresPassword && !sharePassword) {
+        showToast('请输入分享密码', 'error');
+        return;
+      }
+
+      await loadShareDirectory('/');
+    }
+
+    async function loadShareDirectory(path) {
+      try {
+        const response = await fetch('/api/share/' + encodeURIComponent(shareId) + '/list', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: path || '/', password: sharePassword })
+        });
+        const data = await response.json();
+        if (!data.success) {
+          showToast(data.message || '加载失败', 'error');
+          return;
+        }
+
+        currentPath = data.currentPath || path || '/';
+        document.getElementById('passwordForm').style.display = 'none';
+        document.getElementById('shareBrowser').classList.add('active');
+        renderBreadcrumb();
+        renderFiles(data.folders || [], data.files || []);
+      } catch (error) {
+        showToast('加载失败: ' + error.message, 'error');
+      }
+    }
+
+    function renderBreadcrumb() {
+      const breadcrumb = document.getElementById('shareBreadcrumb');
+      breadcrumb.replaceChildren();
+
+      const root = document.createElement('a');
+      root.href = '#';
+      root.className = 'breadcrumb-item';
+      root.textContent = '分享根目录';
+      root.addEventListener('click', function (event) {
+        event.preventDefault();
+        loadShareDirectory('/');
+      });
+      breadcrumb.appendChild(root);
+
+      let path = '';
+      currentPath.split('/').filter(Boolean).forEach(function (part, index, parts) {
+        const separator = document.createElement('span');
+        separator.className = 'breadcrumb-separator';
+        separator.textContent = '/';
+        breadcrumb.appendChild(separator);
+
+        path += '/' + part;
+        if (index === parts.length - 1) {
+          const active = document.createElement('span');
+          active.className = 'breadcrumb-item active';
+          active.textContent = part;
+          breadcrumb.appendChild(active);
+        } else {
+          const link = document.createElement('a');
+          link.href = '#';
+          link.className = 'breadcrumb-item';
+          link.textContent = part;
+          const targetPath = path;
+          link.addEventListener('click', function (event) {
+            event.preventDefault();
+            loadShareDirectory(targetPath);
+          });
+          breadcrumb.appendChild(link);
+        }
+      });
+    }
+
+    function renderFiles(folders, files) {
+      const fileList = document.getElementById('shareFileList');
+      const emptyState = document.getElementById('shareEmptyState');
+      fileList.replaceChildren();
+
+      if (folders.length === 0 && files.length === 0) {
+        emptyState.style.display = 'block';
+        return;
+      }
+
+      emptyState.style.display = 'none';
+      folders.forEach(function (folder) {
+        fileList.appendChild(createShareFileCard({
+          name: folder.name,
+          path: folder.path,
+          isFolder: true,
+          typeLabel: '📁',
+          meta: '文件夹'
+        }));
+      });
+
+      files.forEach(function (file) {
+        fileList.appendChild(createShareFileCard({
+          name: file.name,
+          path: file.path,
+          isFolder: false,
+          typeLabel: getFileIcon(file.name),
+          meta: file.sizeFormatted || ''
+        }));
+      });
+    }
+
+    function createShareFileCard(item) {
+      const card = document.createElement('div');
+      card.className = 'file-item';
+      card.addEventListener('click', function () {
+        if (item.isFolder) {
+          loadShareDirectory(item.path);
+        } else {
+          downloadFile(item.path);
+        }
+      });
+
+      const icon = document.createElement('div');
+      icon.className = 'file-icon';
+      icon.textContent = item.typeLabel;
+      card.appendChild(icon);
+
+      const name = document.createElement('div');
+      name.className = 'file-name';
+      name.textContent = item.name;
+      name.title = item.name;
+      card.appendChild(name);
+
+      const meta = document.createElement('div');
+      meta.className = 'file-meta';
+      meta.textContent = item.meta;
+      card.appendChild(meta);
+      return card;
+    }
+
+    function getFileIcon(filename) {
+      const ext = filename.split('.').pop().toLowerCase();
+      if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'].includes(ext)) return '🖼️';
+      if (ext === 'pdf') return '📕';
+      if (['mp4', 'webm', 'ogg'].includes(ext)) return '🎬';
+      if (['mp3', 'wav', 'flac', 'm4a'].includes(ext)) return '🎵';
+      if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) return '📦';
+      if (['doc', 'docx'].includes(ext)) return '📝';
+      if (['xls', 'xlsx'].includes(ext)) return '📊';
+      return '📄';
+    }
+
+    async function downloadFile(path) {
+      if (requiresPassword && !sharePassword) {
         showToast('请输入分享密码', 'error');
         return;
       }
@@ -8622,7 +9127,7 @@ const FIXED_SHARE_PAGE = `
         const response = await fetch('/api/share/' + encodeURIComponent(shareId) + '/download', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ password: password })
+          body: JSON.stringify({ path: path, password: sharePassword })
         });
         if (!response.ok) {
           const data = await response.json();
@@ -8843,6 +9348,11 @@ export default {
         if (path.match(/^\/api\/share\/[^/]+$/) && method === 'GET') {
           const shareId = path.split('/').pop();
           return await handleGetShareInfo(request, env, shareId);
+        }
+
+        if (path.match(/^\/api\/share\/[^/]+\/list$/) && method === 'POST') {
+          const shareId = path.split('/')[3];
+          return await handleShareList(request, env, shareId);
         }
         
         if (path.match(/^\/api\/share\/[^/]+\/download$/) && method === 'POST') {
