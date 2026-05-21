@@ -788,6 +788,13 @@ async function handleListFiles(request, env, path) {
   
   try {
     const currentPath = normalizeDirectoryPath(path);
+    const permissionError = await requirePathPermission(env, auth, 'view', currentPath);
+    if (permissionError) {
+      const virtualListing = await listVirtualPermissionDirectory(env, auth, currentPath);
+      if (virtualListing) return jsonResponse(virtualListing);
+      return permissionError;
+    }
+
     if (currentPath !== '/') {
       await recordRecentVisit(env, auth, {
         path: currentPath,
@@ -805,11 +812,19 @@ async function handleListFiles(request, env, path) {
     }
 
     if (cached) {
-      return jsonResponse(cached);
+      return jsonResponse({
+        ...cached,
+        folders: await filterItemsByPermission(env, auth, cached.folders || [], 'view'),
+        files: await filterItemsByPermission(env, auth, cached.files || [], 'view')
+      });
     }
 
     const fresh = await refreshDirectoryCache(env, currentPath);
-    return jsonResponse(fresh);
+    return jsonResponse({
+      ...fresh,
+      folders: await filterItemsByPermission(env, auth, fresh.folders || [], 'view'),
+      files: await filterItemsByPermission(env, auth, fresh.files || [], 'view')
+    });
   } catch (e) {
     return jsonResponse({ success: false, message: '获取文件列表失败: ' + e.message }, 500);
   }
@@ -822,8 +837,19 @@ async function handleRefreshDirectoryCache(request, env) {
   try {
     const body = await request.json().catch(() => ({}));
     const currentPath = normalizeDirectoryPath(body.path || '/');
+    const permissionError = await requirePathPermission(env, auth, 'view', currentPath);
+    if (permissionError) {
+      const virtualListing = await listVirtualPermissionDirectory(env, auth, currentPath);
+      if (virtualListing) return jsonResponse(virtualListing);
+      return permissionError;
+    }
+
     const refreshed = await refreshDirectoryCache(env, currentPath);
-    return jsonResponse(refreshed);
+    return jsonResponse({
+      ...refreshed,
+      folders: await filterItemsByPermission(env, auth, refreshed.folders || [], 'view'),
+      files: await filterItemsByPermission(env, auth, refreshed.files || [], 'view')
+    });
   } catch (e) {
     return jsonResponse({ success: false, message: '刷新缓存失败: ' + e.message }, 500);
   }
@@ -834,6 +860,10 @@ async function handleUploadFile(request, env, path) {
   if (auth instanceof Response) return auth;
   
   try {
+    const destinationPath = normalizeDirectoryPath(path || '/');
+    const permissionError = await requirePathPermission(env, auth, 'upload', destinationPath);
+    if (permissionError) return permissionError;
+
     const formData = await request.formData();
     const file = formData.get('file');
     
@@ -869,6 +899,9 @@ async function handleDeleteFile(request, env, path) {
   if (auth instanceof Response) return auth;
   
   try {
+    const permissionError = await requirePathPermission(env, auth, 'delete', path);
+    if (permissionError) return permissionError;
+
     await deleteItemAtPath(env, path);
     return jsonResponse({ success: true, message: '删除成功' });
   } catch (e) {
@@ -881,6 +914,9 @@ async function handleRenameFile(request, env, path) {
   if (auth instanceof Response) return auth;
   
   try {
+    const permissionError = await requirePathPermission(env, auth, 'modify', path);
+    if (permissionError) return permissionError;
+
     const body = await request.json();
     const { newName } = body;
     
@@ -1141,6 +1177,11 @@ async function handleBatchFileOperation(request, env) {
       return jsonResponse({ success: false, message: '目标文件夹不存在' }, 400);
     }
 
+    if (operation !== 'delete') {
+      const destinationPermission = await requirePathPermission(env, auth, 'upload', destinationPath);
+      if (destinationPermission) return destinationPermission;
+    }
+
     const results = [];
     const errors = [];
 
@@ -1152,9 +1193,20 @@ async function handleBatchFileOperation(request, env) {
         }
 
         if (operation === 'delete') {
+          const permissionError = await requirePathPermission(env, auth, 'delete', itemPath);
+          if (permissionError) {
+            const data = await permissionError.json();
+            throw new Error(data.message || '没有删除权限');
+          }
           await deleteItemAtPath(env, itemPath);
           results.push({ path: itemPath });
         } else {
+          const action = operation === 'move' ? 'modify' : 'download';
+          const permissionError = await requirePathPermission(env, auth, action, itemPath);
+          if (permissionError) {
+            const data = await permissionError.json();
+            throw new Error(data.message || '没有操作权限');
+          }
           const result = await copyOrMoveItem(env, itemPath, destinationPath, operation === 'move');
           results.push(result);
         }
@@ -1497,6 +1549,12 @@ async function handleBatchDownload(request, env) {
       return jsonResponse({ success: false, message: '请选择要下载的文件或文件夹' }, 400);
     }
 
+    for (const item of items) {
+      const itemPath = normalizeItemPath(typeof item === 'string' ? item : item.path);
+      const permissionError = await requirePathPermission(env, auth, 'download', itemPath);
+      if (permissionError) return permissionError;
+    }
+
     const entries = await collectBatchDownloadEntries(env, items);
     const filename = 'edgestash-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.zip';
 
@@ -1527,6 +1585,9 @@ async function handleSearchFolders(request, env) {
   try {
     const url = new URL(request.url);
     const query = (url.searchParams.get('q') || '').trim().toLowerCase();
+    const permissionAction = PERMISSION_COLUMNS[url.searchParams.get('permission') || 'view']
+      ? (url.searchParams.get('permission') || 'view')
+      : 'view';
     const requestedLimit = Number(url.searchParams.get('limit') || 50);
     const limit = Number.isFinite(requestedLimit)
       ? Math.min(100, Math.max(1, requestedLimit))
@@ -1546,17 +1607,18 @@ async function handleSearchFolders(request, env) {
       cursor = listed.truncated ? listed.cursor : null;
     } while (cursor && scanned < maxScannedObjects);
 
-    const folders = Array.from(folderPaths)
+    let folders = Array.from(folderPaths)
       .filter(path => {
         if (!query) return true;
         return path.toLowerCase().includes(query) || nameFromItemPath(path).toLowerCase().includes(query);
       })
       .sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
-      .slice(0, limit)
       .map(path => ({
         path,
         name: path === '/' ? '根目录' : nameFromItemPath(path)
       }));
+
+    folders = (await filterItemsByPermission(env, auth, folders, permissionAction)).slice(0, limit);
 
     return jsonResponse({
       success: true,
@@ -1581,6 +1643,12 @@ async function handleCreateFolder(request, env) {
       return jsonResponse({ success: false, message: '请提供文件夹路径' }, 400);
     }
     
+    const normalizedFolderPath = normalizeDirectoryPath(folderPath);
+    const parentPath = parentPathFromItemPath(normalizedFolderPath);
+    const permissionError = await requirePathPermission(env, auth, 'upload', parentPath);
+    if (permissionError) return permissionError;
+
+    folderPath = normalizedFolderPath;
     if (folderPath.startsWith('/')) folderPath = folderPath.slice(1);
     if (!folderPath.endsWith('/')) folderPath += '/';
     
@@ -1603,6 +1671,9 @@ async function handleDownloadFile(request, env, path) {
   try {
     let key = path || '';
     if (key.startsWith('/')) key = key.slice(1);
+    const itemPath = r2KeyToPath(key);
+    const permissionError = await requirePathPermission(env, auth, 'download', itemPath);
+    if (permissionError) return permissionError;
     
     const object = await env.R2_BUCKET.get(key);
     if (!object) {
@@ -1611,7 +1682,7 @@ async function handleDownloadFile(request, env, path) {
     
     const filename = key.split('/').pop();
     await recordRecentVisit(env, auth, {
-      path: r2KeyToPath(key),
+      path: itemPath,
       name: filename,
       itemType: 'file',
       sizeFormatted: formatFileSize(object.size || 0),
@@ -1640,6 +1711,9 @@ async function handlePreviewFile(request, env, path) {
   try {
     let key = path || '';
     if (key.startsWith('/')) key = key.slice(1);
+    const itemPath = r2KeyToPath(key);
+    const permissionError = await requirePathPermission(env, auth, 'preview', itemPath);
+    if (permissionError) return permissionError;
     
     const object = await env.R2_BUCKET.get(key, {
       range: request.headers
@@ -1651,7 +1725,7 @@ async function handlePreviewFile(request, env, path) {
     const filename = key.split('/').pop();
     const contentType = object.httpMetadata?.contentType || getMimeType(filename);
     await recordRecentVisit(env, auth, {
-      path: r2KeyToPath(key),
+      path: itemPath,
       name: filename,
       itemType: 'file',
       sizeFormatted: formatFileSize(object.size || 0),
@@ -1719,6 +1793,9 @@ async function handleGetReaderProgress(request, env) {
       return jsonResponse({ success: false, message: '只支持保存 txt 文件阅读进度' }, 400);
     }
 
+    const permissionError = await requirePathPermission(env, auth, 'preview', filePath);
+    if (permissionError) return permissionError;
+
     const key = await readerProgressKey(auth, filePath);
     const progress = await env.KV_STORE.get(key, 'json');
     return jsonResponse({ success: true, progress: progress || null });
@@ -1738,6 +1815,9 @@ async function handlePutReaderProgress(request, env) {
     if (!filePath || filePath === '/' || !isTxtReaderPath(filePath)) {
       return jsonResponse({ success: false, message: '只支持保存 txt 文件阅读进度' }, 400);
     }
+
+    const permissionError = await requirePathPermission(env, auth, 'preview', filePath);
+    if (permissionError) return permissionError;
 
     const value = {
       path: filePath,
@@ -1939,9 +2019,13 @@ async function handleCreateShare(request, env) {
     if (!filePath) {
       return jsonResponse({ success: false, message: '请提供文件路径' }, 400);
     }
+
+    const normalizedFilePath = normalizeItemPath(filePath);
+    const permissionError = await requirePathPermission(env, auth, 'share', normalizedFilePath);
+    if (permissionError) return permissionError;
     
     // Verify file exists
-    let key = filePath;
+    let key = normalizedFilePath;
     if (key.startsWith('/')) key = key.slice(1);
     
     const object = await env.R2_BUCKET.head(key);
@@ -2149,10 +2233,17 @@ async function handleListUsers(request, env) {
         const data = await env.KV_STORE.get(key.name);
         if (data) {
           const user = JSON.parse(data);
+          const permissionRows = await getUserPermissionRows(env, user.email);
           users.push({
             email: user.email,
             role: user.role,
-            createdAt: user.createdAt
+            createdAt: user.createdAt,
+            permissionCount: permissionRows.length,
+            permissions: permissionRows.slice(0, 3).map(row => ({
+              path: row.path,
+              itemType: row.item_type,
+              summary: summarizePermissionFlags(row)
+            }))
           });
         }
       }
@@ -2172,6 +2263,7 @@ async function handleCreateUser(request, env) {
   try {
     const body = await request.json();
     const { email, password } = body;
+    const permissions = Array.isArray(body.permissions) ? body.permissions : [];
     
     if (!email || !password) {
       return jsonResponse({ success: false, message: '请提供邮箱和密码' }, 400);
@@ -2191,6 +2283,7 @@ async function handleCreateUser(request, env) {
     };
     
     await env.KV_STORE.put(`user:${email}`, JSON.stringify(userData));
+    await replaceUserPermissions(env, email, permissions);
     
     return jsonResponse({ success: true, message: '用户创建成功', email });
   } catch (e) {
@@ -2203,13 +2296,46 @@ async function handleDeleteUser(request, env, email) {
   if (auth instanceof Response) return auth;
   
   try {
+    await ensureD1Schema(env);
     const decodedEmail = decodeURIComponent(email);
     await env.KV_STORE.delete(`user:${decodedEmail}`);
     await deleteReaderProgressForUser(env, decodedEmail);
+    await env.D1_DB.prepare('DELETE FROM user_permissions WHERE email = ?').bind(decodedEmail).run();
     
     return jsonResponse({ success: true, message: '用户已删除' });
   } catch (e) {
     return jsonResponse({ success: false, message: '删除用户失败: ' + e.message }, 500);
+  }
+}
+
+async function handleGetUserPermissions(request, env, email) {
+  const auth = await requireAdmin(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const decodedEmail = decodeURIComponent(email);
+    const rows = await getUserPermissionRows(env, decodedEmail);
+    return jsonResponse({ success: true, permissions: rows.map(permissionRowToClient) });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '获取用户授权失败: ' + e.message }, 500);
+  }
+}
+
+async function handleUpdateUserPermissions(request, env, email) {
+  const auth = await requireAdmin(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const decodedEmail = decodeURIComponent(email);
+    const existing = await env.KV_STORE.get(`user:${decodedEmail}`);
+    if (!existing) {
+      return jsonResponse({ success: false, message: '用户不存在' }, 404);
+    }
+    const body = await request.json();
+    await replaceUserPermissions(env, decodedEmail, Array.isArray(body.permissions) ? body.permissions : []);
+    return jsonResponse({ success: true, message: '用户授权已更新' });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '更新用户授权失败: ' + e.message }, 500);
   }
 }
 
@@ -2219,6 +2345,79 @@ async function handleCheckAuth(request, env) {
     return jsonResponse({ authenticated: false });
   }
   return jsonResponse({ authenticated: true, role: auth.role, email: auth.email });
+}
+
+async function handleAdminSearchResources(request, env) {
+  const auth = await requireAdmin(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    await ensureD1Schema(env);
+    const url = new URL(request.url);
+    const query = (url.searchParams.get('q') || '').trim().toLowerCase();
+    const type = url.searchParams.get('type') || 'all';
+    const requestedLimit = Number(url.searchParams.get('limit') || 50);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(100, Math.max(1, requestedLimit)) : 50;
+
+    const clauses = [];
+    const params = [];
+    if (query) {
+      clauses.push('(lower(name) LIKE ? OR lower(path) LIKE ?)');
+      params.push('%' + query + '%', '%' + query + '%');
+    }
+    if (type === 'file') {
+      clauses.push("item_type = 'file'");
+    } else if (type === 'folder') {
+      clauses.push("item_type = 'folder'");
+    }
+
+    const where = clauses.length ? 'WHERE ' + clauses.join(' AND ') : '';
+    const rows = await env.D1_DB.prepare(`
+      SELECT * FROM search_items
+      ${where}
+      ORDER BY item_type DESC, name COLLATE NOCASE ASC, path COLLATE NOCASE ASC
+      LIMIT ?
+    `).bind(...params, limit).all();
+
+    const items = (rows.results || []).map(d1RowToClientItem);
+    if ((!query || '/'.includes(query)) && type !== 'file' && !items.some(item => item.path === '/')) {
+      items.unshift({
+        path: '/',
+        name: '根目录',
+        itemType: 'folder',
+        isFolder: true,
+        sizeFormatted: '',
+        previewType: '',
+        parentPath: '/'
+      });
+    }
+
+    return jsonResponse({ success: true, items: items.slice(0, limit) });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '搜索资源失败: ' + e.message }, 500);
+  }
+}
+
+async function handleAdminListResources(request, env) {
+  const auth = await requireAdmin(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const url = new URL(request.url);
+    const currentPath = normalizeDirectoryPath(url.searchParams.get('path') || '/');
+    let listing = await readDirectoryCache(env, currentPath).catch(() => null);
+    if (!listing) listing = await refreshDirectoryCache(env, currentPath);
+    return jsonResponse({
+      success: true,
+      currentPath,
+      items: [
+        ...(listing.folders || []).map(folder => ({ ...folder, itemType: 'folder', isFolder: true })),
+        ...(listing.files || []).map(file => ({ ...file, itemType: 'file', isFolder: false }))
+      ]
+    });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '读取资源列表失败: ' + e.message }, 500);
+  }
 }
 
 // ============================================================================
@@ -2234,12 +2433,13 @@ async function ensureD1Schema(env) {
 
   const kvReady = env.KV_STORE ? await env.KV_STORE.get(D1_SCHEMA_KV_KEY) : null;
   if (kvReady) {
+    await ensureUserPermissionsSchema(env);
     d1SchemaReady = true;
     return;
   }
 
   // KV 标记不存在，删除旧表重建
-  const tables = ['search_items', 'favorites', 'recent_items', 'share_links', 'app_stats'];
+  const tables = ['search_items', 'favorites', 'recent_items', 'share_links', 'app_stats', 'user_permissions'];
   for (const t of tables) {
     await env.D1_DB.prepare(`DROP TABLE IF EXISTS ${t}`).run();
   }
@@ -2299,7 +2499,8 @@ async function ensureD1Schema(env) {
       key TEXT PRIMARY KEY,
       value INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL
-    )`
+    )`,
+    ...USER_PERMISSIONS_DDL
   ];
 
   for (const statement of ddlStatements) {
@@ -2310,8 +2511,302 @@ async function ensureD1Schema(env) {
   d1SchemaReady = true;
 }
 
+const USER_PERMISSIONS_DDL = [
+  `CREATE TABLE IF NOT EXISTS user_permissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL,
+    path TEXT NOT NULL,
+    item_type TEXT NOT NULL,
+    can_view INTEGER NOT NULL DEFAULT 0,
+    can_preview INTEGER NOT NULL DEFAULT 0,
+    can_download INTEGER NOT NULL DEFAULT 0,
+    can_upload INTEGER NOT NULL DEFAULT 0,
+    can_modify INTEGER NOT NULL DEFAULT 0,
+    can_delete INTEGER NOT NULL DEFAULT 0,
+    can_share INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(email, path, item_type)
+  )`,
+  'CREATE INDEX IF NOT EXISTS idx_user_permissions_email_path ON user_permissions(email, path)',
+  'CREATE INDEX IF NOT EXISTS idx_user_permissions_email_updated ON user_permissions(email, updated_at DESC)'
+];
+
+async function ensureUserPermissionsSchema(env) {
+  for (const statement of USER_PERMISSIONS_DDL) {
+    await env.D1_DB.prepare(statement).run();
+  }
+}
+
 function ownerKeyFromAuth(auth) {
   return auth && auth.role === 'admin' ? 'admin' : `user:${auth.email || ''}`;
+}
+
+const PERMISSION_COLUMNS = {
+  view: 'can_view',
+  preview: 'can_preview',
+  download: 'can_download',
+  upload: 'can_upload',
+  modify: 'can_modify',
+  delete: 'can_delete',
+  share: 'can_share'
+};
+
+const PERMISSION_PRESETS = {
+  readonly: {
+    view: true,
+    preview: true,
+    download: true,
+    upload: false,
+    modify: false,
+    delete: false,
+    share: false
+  },
+  uploader: {
+    view: true,
+    preview: true,
+    download: true,
+    upload: true,
+    modify: false,
+    delete: false,
+    share: false
+  },
+  editor: {
+    view: true,
+    preview: true,
+    download: true,
+    upload: true,
+    modify: true,
+    delete: false,
+    share: false
+  },
+  manager: {
+    view: true,
+    preview: true,
+    download: true,
+    upload: true,
+    modify: true,
+    delete: true,
+    share: true
+  }
+};
+
+const PERMISSION_LABELS = {
+  view: '查看',
+  preview: '预览',
+  download: '下载',
+  upload: '上传',
+  modify: '修改',
+  delete: '删除',
+  share: '分享'
+};
+
+function normalizePermissionFlags(input) {
+  const preset = typeof input?.preset === 'string' ? input.preset : '';
+  const source = input?.permissions || input || {};
+  const base = PERMISSION_PRESETS[preset] || {};
+  const flags = {};
+  for (const key of Object.keys(PERMISSION_COLUMNS)) {
+    flags[key] = !!(key in source ? source[key] : base[key]);
+  }
+
+  if (flags.preview || flags.download || flags.upload || flags.modify || flags.delete || flags.share) {
+    flags.view = true;
+  }
+  if (flags.modify || flags.delete || flags.share) {
+    flags.preview = true;
+    flags.download = true;
+  }
+  if (flags.modify) {
+    flags.upload = true;
+  }
+  return flags;
+}
+
+function normalizeUserPermissionEntry(entry) {
+  const path = normalizeItemPath(entry?.path || '');
+  if (!path) throw new Error('授权路径无效');
+
+  const itemType = entry?.itemType || entry?.item_type || (entry?.isFolder ? 'folder' : 'file');
+  if (!['file', 'folder'].includes(itemType)) {
+    throw new Error('授权资源类型无效: ' + path);
+  }
+  if (path === '/' && itemType !== 'folder') {
+    throw new Error('根目录只能按文件夹授权');
+  }
+
+  return {
+    path,
+    itemType,
+    permissions: normalizePermissionFlags(entry)
+  };
+}
+
+function permissionRowToClient(row) {
+  const permissions = {};
+  for (const [key, column] of Object.entries(PERMISSION_COLUMNS)) {
+    permissions[key] = !!row[column];
+  }
+  return {
+    id: row.id,
+    email: row.email,
+    path: row.path,
+    itemType: row.item_type,
+    name: row.path === '/' ? '根目录' : nameFromItemPath(row.path),
+    permissions,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function summarizePermissionFlags(row) {
+  const names = [];
+  for (const [key, label] of Object.entries(PERMISSION_LABELS)) {
+    if (row[PERMISSION_COLUMNS[key]]) names.push(label);
+  }
+  return names.join('、') || '无权限';
+}
+
+async function replaceUserPermissions(env, email, permissions) {
+  await ensureD1Schema(env);
+  const normalized = Array.isArray(permissions) ? permissions.map(normalizeUserPermissionEntry) : [];
+  await env.D1_DB.prepare('DELETE FROM user_permissions WHERE email = ?').bind(email).run();
+  if (normalized.length === 0) return;
+
+  const now = Date.now();
+  const insert = env.D1_DB.prepare(`
+    INSERT INTO user_permissions (
+      email, path, item_type, can_view, can_preview, can_download, can_upload, can_modify, can_delete, can_share, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(email, path, item_type) DO UPDATE SET
+      can_view = excluded.can_view,
+      can_preview = excluded.can_preview,
+      can_download = excluded.can_download,
+      can_upload = excluded.can_upload,
+      can_modify = excluded.can_modify,
+      can_delete = excluded.can_delete,
+      can_share = excluded.can_share,
+      updated_at = excluded.updated_at
+  `);
+
+  for (let index = 0; index < normalized.length; index += 50) {
+    const batch = normalized.slice(index, index + 50).map(item => insert.bind(
+      email,
+      item.path,
+      item.itemType,
+      item.permissions.view ? 1 : 0,
+      item.permissions.preview ? 1 : 0,
+      item.permissions.download ? 1 : 0,
+      item.permissions.upload ? 1 : 0,
+      item.permissions.modify ? 1 : 0,
+      item.permissions.delete ? 1 : 0,
+      item.permissions.share ? 1 : 0,
+      now,
+      now
+    ));
+    await env.D1_DB.batch(batch);
+  }
+}
+
+async function getUserPermissionRows(env, email) {
+  await ensureD1Schema(env);
+  const rows = await env.D1_DB.prepare(`
+    SELECT * FROM user_permissions
+    WHERE email = ?
+    ORDER BY path = '/' DESC, length(path) ASC, path COLLATE NOCASE ASC
+  `).bind(email).all();
+  return rows.results || [];
+}
+
+async function findUserPermissionForPath(env, email, path) {
+  await ensureD1Schema(env);
+  const normalized = normalizeItemPath(path);
+  return await env.D1_DB.prepare(`
+    SELECT * FROM user_permissions
+    WHERE email = ?
+      AND (
+        path = ?
+        OR (item_type = 'folder' AND path = '/')
+        OR (item_type = 'folder' AND ? LIKE path || '/%')
+      )
+    ORDER BY length(path) DESC
+    LIMIT 1
+  `).bind(email, normalized, normalized).first();
+}
+
+async function hasPathPermission(env, auth, action, path) {
+  if (auth && auth.role === 'admin') return true;
+  if (!auth || !auth.email) return false;
+  const column = PERMISSION_COLUMNS[action];
+  if (!column) throw new Error('未知权限类型: ' + action);
+  const row = await findUserPermissionForPath(env, auth.email, path);
+  return !!(row && row[column]);
+}
+
+async function requirePathPermission(env, auth, action, path) {
+  if (await hasPathPermission(env, auth, action, path)) return null;
+  return jsonResponse({
+    success: false,
+    message: '没有' + (PERMISSION_LABELS[action] || action) + '权限: ' + normalizeItemPath(path)
+  }, 403);
+}
+
+async function filterItemsByPermission(env, auth, items, action = 'view') {
+  if (!Array.isArray(items) || auth?.role === 'admin') return items || [];
+  const allowed = [];
+  for (const item of items) {
+    if (await hasPathPermission(env, auth, action, item.path)) allowed.push(item);
+  }
+  return allowed;
+}
+
+async function listVirtualPermissionDirectory(env, auth, dirPath) {
+  if (!auth || auth.role === 'admin' || !auth.email) return null;
+  const currentPath = normalizeDirectoryPath(dirPath);
+  const rows = await getUserPermissionRows(env, auth.email);
+  const itemMap = new Map();
+
+  for (const row of rows) {
+    const permissionPath = normalizeItemPath(row.path);
+    if (permissionPath === '/') continue;
+
+    const currentPrefix = currentPath === '/' ? '/' : currentPath + '/';
+    if (permissionPath !== currentPath && !permissionPath.startsWith(currentPrefix)) continue;
+
+    const relative = currentPath === '/'
+      ? permissionPath.slice(1)
+      : permissionPath.slice(currentPrefix.length);
+    const parts = relative.split('/').filter(Boolean);
+    if (parts.length === 0) continue;
+
+    const childPath = currentPath === '/' ? '/' + parts[0] : currentPath + '/' + parts[0];
+    const isExactPermission = parts.length === 1;
+    const itemType = isExactPermission ? row.item_type : 'folder';
+    const existing = itemMap.get(childPath);
+    if (existing && existing.itemType === 'folder') continue;
+
+    itemMap.set(childPath, {
+      path: childPath,
+      name: nameFromItemPath(childPath),
+      itemType,
+      isFolder: itemType === 'folder',
+      sizeFormatted: '',
+      previewType: ''
+    });
+  }
+
+  const items = Array.from(itemMap.values()).sort((a, b) => {
+    if (a.itemType !== b.itemType) return a.itemType === 'folder' ? -1 : 1;
+    return a.name.localeCompare(b.name, 'zh-Hans-CN');
+  });
+
+  if (items.length === 0) return null;
+  return {
+    success: true,
+    files: items.filter(item => item.itemType === 'file'),
+    folders: items.filter(item => item.itemType === 'folder'),
+    currentPath
+  };
 }
 
 function d1RowToClientItem(row) {
@@ -2511,7 +3006,7 @@ async function handleSearch(request, env) {
 
     return jsonResponse({
       success: true,
-      items: (results.results || []).map(d1RowToClientItem),
+      items: await filterItemsByPermission(env, auth, (results.results || []).map(d1RowToClientItem), 'view'),
       refresh: refreshResult
     });
   } catch (e) {
@@ -2536,11 +3031,16 @@ async function handleFavorites(request, env) {
         ORDER BY updated_at DESC
         LIMIT ?
       `).bind(ownerKey, limit).all();
-      return jsonResponse({ success: true, favorites: (results.results || []).map(d1RowToClientItem) });
+      return jsonResponse({
+        success: true,
+        favorites: await filterItemsByPermission(env, auth, (results.results || []).map(d1RowToClientItem), 'view')
+      });
     }
 
     if (request.method === 'POST') {
       const item = normalizeD1ItemFromBody(await request.json());
+      const permissionError = await requirePathPermission(env, auth, 'view', item.path);
+      if (permissionError) return permissionError;
       const now = Date.now();
       await env.D1_DB.prepare(`
         INSERT INTO favorites (owner_key, path, name, item_type, size_formatted, preview_type, created_at, updated_at)
@@ -2631,11 +3131,16 @@ async function handleRecent(request, env) {
         ORDER BY visited_at DESC
         LIMIT ?
       `).bind(ownerKey, limit).all();
-      return jsonResponse({ success: true, recent: (results.results || []).map(d1RowToClientItem) });
+      return jsonResponse({
+        success: true,
+        recent: await filterItemsByPermission(env, auth, (results.results || []).map(d1RowToClientItem), 'view')
+      });
     }
 
     if (request.method === 'POST') {
       const item = normalizeD1ItemFromBody(await request.json());
+      const permissionError = await requirePathPermission(env, auth, 'view', item.path);
+      if (permissionError) return permissionError;
       const visitedAt = await saveRecentItem(env, auth, item);
       return jsonResponse({ success: true, recent: { ...item, visitedAt } });
     }
@@ -2883,6 +3388,10 @@ const CSS_STYLES = `
     transition: all 0.3s ease;
     max-height: 90vh;
     overflow-y: auto;
+  }
+
+  .modal-wide {
+    max-width: 820px;
   }
   
   .modal-overlay.active .modal {
@@ -3856,6 +4365,91 @@ const CSS_STYLES = `
     padding: 10px 12px;
     color: var(--text-muted);
     font-size: 14px;
+  }
+
+  .resource-picker-toolbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 130px;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+
+  .resource-list,
+  .permission-list {
+    border: 1px solid var(--surface-light);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--background);
+  }
+
+  .resource-list {
+    max-height: 280px;
+    overflow-y: auto;
+  }
+
+  .resource-row,
+  .permission-row {
+    display: grid;
+    grid-template-columns: 24px minmax(0, 1fr) auto;
+    gap: 10px;
+    align-items: center;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--surface-light);
+  }
+
+  .permission-row {
+    grid-template-columns: minmax(0, 1fr) 150px 34px;
+  }
+
+  .resource-row:last-child,
+  .permission-row:last-child {
+    border-bottom: none;
+  }
+
+  .resource-main,
+  .permission-main {
+    min-width: 0;
+  }
+
+  .resource-name,
+  .permission-path {
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .resource-path,
+  .permission-summary {
+    color: var(--text-muted);
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .permission-empty {
+    padding: 14px 12px;
+    color: var(--text-muted);
+    font-size: 14px;
+  }
+
+  .permission-checks {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px 12px;
+    margin-top: 10px;
+  }
+
+  .permission-checks label {
+    color: var(--text-muted);
+    font-size: 13px;
+    white-space: nowrap;
+  }
+
+  .permission-checks input {
+    margin-right: 6px;
   }
   
   /* Upload Area */
@@ -5957,7 +6551,7 @@ const FIXED_ADMIN_PAGE = `
         </div>
         <div class="table-container">
           <table>
-            <thead><tr><th>邮箱</th><th>角色</th><th>创建时间</th><th>操作</th></tr></thead>
+            <thead><tr><th>邮箱</th><th>角色</th><th>授权资源</th><th>创建时间</th><th>操作</th></tr></thead>
             <tbody id="usersTable"></tbody>
           </table>
         </div>
@@ -5966,9 +6560,9 @@ const FIXED_ADMIN_PAGE = `
   </div>
 
   <div class="modal-overlay" id="addUserModal">
-    <div class="modal">
+    <div class="modal modal-wide">
       <div class="modal-header">
-        <div class="modal-title">添加授权用户</div>
+        <div class="modal-title" id="userModalTitle">添加授权用户</div>
         <button type="button" class="modal-close" onclick="closeModal('addUserModal')">&times;</button>
       </div>
       <form onsubmit="addUser(event)">
@@ -5976,11 +6570,27 @@ const FIXED_ADMIN_PAGE = `
           <label class="form-label" for="newUserEmail">邮箱</label>
           <input type="email" id="newUserEmail" class="form-input" placeholder="请输入邮箱" required>
         </div>
-        <div class="form-group">
+        <div class="form-group" id="newUserPasswordGroup">
           <label class="form-label" for="newUserPassword">密码</label>
           <input type="text" id="newUserPassword" class="form-input" placeholder="请输入密码" required>
         </div>
-        <button type="submit" class="btn btn-primary" style="width: 100%;">添加用户</button>
+        <div class="form-group">
+          <label class="form-label" for="resourceSearchInput">授权文件或目录</label>
+          <div class="resource-picker-toolbar">
+            <input type="search" id="resourceSearchInput" class="form-input" placeholder="搜索文件或目录">
+            <select id="resourceTypeFilter" class="form-select">
+              <option value="all">全部</option>
+              <option value="folder">文件夹</option>
+              <option value="file">文件</option>
+            </select>
+          </div>
+          <div class="resource-list" id="resourceSearchResults"></div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">已选资源权限</label>
+          <div class="permission-list" id="selectedPermissionList"></div>
+        </div>
+        <button type="submit" class="btn btn-primary" id="userModalSubmit" style="width: 100%;">添加用户</button>
       </form>
     </div>
   </div>
@@ -5989,6 +6599,27 @@ const FIXED_ADMIN_PAGE = `
   <div class="loading-overlay" id="loadingOverlay" style="display: none;"><div class="spinner"></div></div>
 
   <script>
+    const selectedPermissions = new Map();
+    let resourceSearchTimer = null;
+    let resourceSearchRequestId = 0;
+    let editingUserEmail = '';
+    const permissionPresetFlags = {
+      readonly: { view: true, preview: true, download: true, upload: false, modify: false, delete: false, share: false },
+      uploader: { view: true, preview: true, download: true, upload: true, modify: false, delete: false, share: false },
+      editor: { view: true, preview: true, download: true, upload: true, modify: true, delete: false, share: false },
+      manager: { view: true, preview: true, download: true, upload: true, modify: true, delete: true, share: true },
+      custom: { view: true, preview: true, download: true, upload: false, modify: false, delete: false, share: false }
+    };
+    const permissionLabels = {
+      view: '查看',
+      preview: '预览',
+      download: '下载',
+      upload: '上传',
+      modify: '修改',
+      delete: '删除',
+      share: '分享'
+    };
+
     async function checkAdminAuth() {
       try {
         const response = await fetch('/api/auth/check');
@@ -6075,15 +6706,24 @@ const FIXED_ADMIN_PAGE = `
         tbody.replaceChildren();
         if (!data.success) throw new Error(data.message || '加载失败');
         if (data.users.length === 0) {
-          appendEmptyRow(tbody, 4, '暂无授权用户');
+          appendEmptyRow(tbody, 5, '暂无授权用户');
           return;
         }
         data.users.forEach(function (user) {
           const tr = document.createElement('tr');
           appendCell(tr, user.email);
           appendCell(tr, user.role === 'admin' ? '管理员' : '普通用户');
+          const permissionText = user.permissionCount
+            ? user.permissionCount + ' 个资源' + ((user.permissions || []).length ? '：' + user.permissions.map(function (item) {
+              return item.path + '（' + item.summary + '）';
+            }).join('；') : '')
+            : '未授权';
+          appendCell(tr, permissionText);
           appendCell(tr, user.createdAt ? new Date(user.createdAt).toLocaleString() : '-');
           const actions = document.createElement('td');
+          actions.appendChild(createSmallButton('编辑授权', 'btn-secondary', function () {
+            showEditUserModal(user.email);
+          }));
           actions.appendChild(createSmallButton('撤销授权', 'btn-danger', function () {
             deleteUser(user.email);
           }));
@@ -6124,35 +6764,321 @@ const FIXED_ADMIN_PAGE = `
     }
 
     function showAddUserModal() {
+      editingUserEmail = '';
+      document.getElementById('userModalTitle').textContent = '添加授权用户';
+      document.getElementById('userModalSubmit').textContent = '添加用户';
       document.getElementById('newUserEmail').value = '';
+      document.getElementById('newUserEmail').disabled = false;
       document.getElementById('newUserPassword').value = '';
+      document.getElementById('newUserPassword').required = true;
+      document.getElementById('newUserPasswordGroup').style.display = 'block';
+      document.getElementById('resourceSearchInput').value = '';
+      document.getElementById('resourceTypeFilter').value = 'all';
+      selectedPermissions.clear();
+      renderSelectedPermissions();
       document.getElementById('addUserModal').classList.add('active');
+      searchResources('');
+    }
+
+    async function showEditUserModal(email) {
+      editingUserEmail = email;
+      document.getElementById('userModalTitle').textContent = '编辑用户授权';
+      document.getElementById('userModalSubmit').textContent = '保存授权';
+      document.getElementById('newUserEmail').value = email;
+      document.getElementById('newUserEmail').disabled = true;
+      document.getElementById('newUserPassword').value = '';
+      document.getElementById('newUserPassword').required = false;
+      document.getElementById('newUserPasswordGroup').style.display = 'none';
+      document.getElementById('resourceSearchInput').value = '';
+      document.getElementById('resourceTypeFilter').value = 'all';
+      selectedPermissions.clear();
+      renderSelectedPermissions();
+      document.getElementById('addUserModal').classList.add('active');
+      searchResources('');
+
+      showLoading(true);
+      try {
+        const response = await fetch('/api/admin/users/' + encodeURIComponent(email) + '/permissions');
+        const data = await response.json();
+        if (!data.success) throw new Error(data.message || '加载失败');
+        (data.permissions || []).forEach(function (permission) {
+          selectedPermissions.set(permission.path, {
+            path: permission.path,
+            name: permission.name || permission.path,
+            itemType: permission.itemType,
+            preset: 'custom',
+            permissions: permission.permissions || { ...permissionPresetFlags.readonly }
+          });
+        });
+        renderSelectedPermissions();
+        searchResources('');
+      } catch (error) {
+        closeModal('addUserModal');
+        showToast('加载用户授权失败: ' + error.message, 'error');
+      } finally {
+        showLoading(false);
+      }
     }
 
     async function addUser(event) {
       event.preventDefault();
       const email = document.getElementById('newUserEmail').value.trim();
       const password = document.getElementById('newUserPassword').value;
+      const permissions = Array.from(selectedPermissions.values()).map(function (item) {
+        return {
+          path: item.path,
+          itemType: item.itemType,
+          preset: item.preset,
+          permissions: item.permissions
+        };
+      });
+      if (permissions.length === 0) {
+        showToast('请至少选择一个授权文件或目录', 'error');
+        return;
+      }
       showLoading(true);
       closeModal('addUserModal');
       try {
-        const response = await fetch('/api/admin/users', {
-          method: 'POST',
+        const url = editingUserEmail
+          ? '/api/admin/users/' + encodeURIComponent(editingUserEmail) + '/permissions'
+          : '/api/admin/users';
+        const response = await fetch(url, {
+          method: editingUserEmail ? 'PUT' : 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email: email, password: password })
+          body: JSON.stringify(editingUserEmail
+            ? { permissions: permissions }
+            : { email: email, password: password, permissions: permissions })
         });
         const data = await response.json();
         if (data.success) {
-          showToast('用户添加成功', 'success');
+          showToast(editingUserEmail ? '用户授权已更新' : '用户添加成功', 'success');
+          editingUserEmail = '';
           loadUsers();
         } else {
-          showToast('添加失败: ' + (data.message || '未知错误'), 'error');
+          showToast((editingUserEmail ? '保存失败: ' : '添加失败: ') + (data.message || '未知错误'), 'error');
         }
       } catch (error) {
-        showToast('添加失败: ' + error.message, 'error');
+        showToast((editingUserEmail ? '保存失败: ' : '添加失败: ') + error.message, 'error');
       } finally {
         showLoading(false);
       }
+    }
+
+    function initializeResourcePicker() {
+      const input = document.getElementById('resourceSearchInput');
+      const type = document.getElementById('resourceTypeFilter');
+      if (!input || !type) return;
+
+      input.addEventListener('input', function () {
+        if (resourceSearchTimer) clearTimeout(resourceSearchTimer);
+        resourceSearchTimer = window.setTimeout(function () {
+          searchResources(input.value);
+        }, 250);
+      });
+
+      type.addEventListener('change', function () {
+        searchResources(input.value);
+      });
+    }
+
+    async function searchResources(query) {
+      const results = document.getElementById('resourceSearchResults');
+      if (!results) return;
+      const requestId = ++resourceSearchRequestId;
+      const type = document.getElementById('resourceTypeFilter').value;
+      results.replaceChildren(createResourceMessage('搜索中...'));
+
+      try {
+        const response = await fetch('/api/admin/resources/search?q=' + encodeURIComponent(query || '') + '&type=' + encodeURIComponent(type) + '&limit=80');
+        const data = await response.json();
+        if (requestId !== resourceSearchRequestId) return;
+        results.replaceChildren();
+        if (!data.success) {
+          results.appendChild(createResourceMessage(data.message || '搜索失败'));
+          return;
+        }
+        if (!data.items || data.items.length === 0) {
+          results.appendChild(createResourceMessage('没有匹配的资源'));
+          return;
+        }
+        data.items.forEach(function (item) {
+          results.appendChild(createResourceRow(item));
+        });
+      } catch (error) {
+        if (requestId !== resourceSearchRequestId) return;
+        results.replaceChildren(createResourceMessage('搜索失败: ' + error.message));
+      }
+    }
+
+    function createResourceMessage(message) {
+      const div = document.createElement('div');
+      div.className = 'permission-empty';
+      div.textContent = message;
+      return div;
+    }
+
+    function createResourceRow(item) {
+      const normalized = normalizeClientItem(item);
+      const row = document.createElement('label');
+      row.className = 'resource-row';
+
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = selectedPermissions.has(normalized.path);
+      checkbox.addEventListener('change', function () {
+        if (checkbox.checked) {
+          addSelectedPermission(normalized);
+        } else {
+          selectedPermissions.delete(normalized.path);
+          renderSelectedPermissions();
+        }
+      });
+
+      const main = document.createElement('div');
+      main.className = 'resource-main';
+      const name = document.createElement('div');
+      name.className = 'resource-name';
+      name.textContent = (normalized.itemType === 'folder' ? '文件夹 ' : '文件 ') + normalized.name;
+      const path = document.createElement('div');
+      path.className = 'resource-path';
+      path.textContent = normalized.path;
+      main.appendChild(name);
+      main.appendChild(path);
+
+      const badge = document.createElement('span');
+      badge.className = 'badge badge-info';
+      badge.textContent = normalized.itemType === 'folder' ? '目录' : '文件';
+
+      row.appendChild(checkbox);
+      row.appendChild(main);
+      row.appendChild(badge);
+      return row;
+    }
+
+    function normalizeClientItem(item) {
+      const isFolder = item.itemType === 'folder' || item.item_type === 'folder' || item.isFolder;
+      return {
+        path: item.path || '/',
+        name: item.name || (item.path === '/' ? '根目录' : item.path),
+        itemType: isFolder ? 'folder' : 'file'
+      };
+    }
+
+    function addSelectedPermission(item) {
+      if (!selectedPermissions.has(item.path)) {
+        selectedPermissions.set(item.path, {
+          path: item.path,
+          name: item.name,
+          itemType: item.itemType,
+          preset: 'readonly',
+          permissions: { ...permissionPresetFlags.readonly }
+        });
+      }
+      renderSelectedPermissions();
+    }
+
+    function renderSelectedPermissions() {
+      const list = document.getElementById('selectedPermissionList');
+      if (!list) return;
+      list.replaceChildren();
+      if (selectedPermissions.size === 0) {
+        list.appendChild(createResourceMessage('尚未选择授权资源'));
+        return;
+      }
+
+      selectedPermissions.forEach(function (item) {
+        const row = document.createElement('div');
+        row.className = 'permission-row';
+
+        const main = document.createElement('div');
+        main.className = 'permission-main';
+        const path = document.createElement('div');
+        path.className = 'permission-path';
+        path.textContent = item.path;
+        const summary = document.createElement('div');
+        summary.className = 'permission-summary';
+        summary.textContent = (item.itemType === 'folder' ? '目录' : '文件') + ' · ' + summarizeClientPermissions(item.permissions);
+        main.appendChild(path);
+        main.appendChild(summary);
+
+        const select = document.createElement('select');
+        select.className = 'form-select';
+        [
+          ['readonly', '只读'],
+          ['uploader', '可上传'],
+          ['editor', '可编辑'],
+          ['manager', '完全管理'],
+          ['custom', '自定义']
+        ].forEach(function (option) {
+          const el = document.createElement('option');
+          el.value = option[0];
+          el.textContent = option[1];
+          select.appendChild(el);
+        });
+        select.value = item.preset;
+        select.addEventListener('change', function () {
+          item.preset = select.value;
+          if (select.value !== 'custom') {
+            item.permissions = { ...permissionPresetFlags[select.value] };
+          }
+          renderSelectedPermissions();
+        });
+
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'btn btn-sm btn-danger icon-btn';
+        remove.textContent = '×';
+        remove.addEventListener('click', function () {
+          selectedPermissions.delete(item.path);
+          renderSelectedPermissions();
+          searchResources(document.getElementById('resourceSearchInput').value);
+        });
+
+        row.appendChild(main);
+        row.appendChild(select);
+        row.appendChild(remove);
+
+        if (item.preset === 'custom') {
+          row.appendChild(createPermissionChecks(item));
+        }
+
+        list.appendChild(row);
+      });
+    }
+
+    function createPermissionChecks(item) {
+      const checks = document.createElement('div');
+      checks.className = 'permission-checks';
+      Object.keys(permissionLabels).forEach(function (key) {
+        const label = document.createElement('label');
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.checked = !!item.permissions[key];
+        input.addEventListener('change', function () {
+          item.permissions[key] = input.checked;
+          if (['preview', 'download', 'upload', 'modify', 'delete', 'share'].includes(key) && input.checked) {
+            item.permissions.view = true;
+          }
+          if (key === 'view' && !input.checked && ['preview', 'download', 'upload', 'modify', 'delete', 'share'].some(function (name) {
+            return item.permissions[name];
+          })) {
+            item.permissions.view = true;
+          }
+          renderSelectedPermissions();
+        });
+        label.appendChild(input);
+        label.appendChild(document.createTextNode(permissionLabels[key]));
+        checks.appendChild(label);
+      });
+      return checks;
+    }
+
+    function summarizeClientPermissions(permissions) {
+      return Object.keys(permissionLabels).filter(function (key) {
+        return !!permissions[key];
+      }).map(function (key) {
+        return permissionLabels[key];
+      }).join('、') || '无权限';
     }
 
     async function deleteUser(email) {
@@ -6234,6 +7160,7 @@ const FIXED_ADMIN_PAGE = `
     }
 
     checkAdminAuth();
+    initializeResourcePicker();
     loadStats();
   </script>
 </body>
@@ -6540,6 +7467,24 @@ export default {
         
         if (path === '/api/admin/users' && method === 'POST') {
           return await handleCreateUser(request, env);
+        }
+
+        if (path === '/api/admin/resources/search' && method === 'GET') {
+          return await handleAdminSearchResources(request, env);
+        }
+
+        if (path === '/api/admin/resources/list' && method === 'GET') {
+          return await handleAdminListResources(request, env);
+        }
+
+        if (path.match(/^\/api\/admin\/users\/[^/]+\/permissions$/) && method === 'GET') {
+          const email = path.split('/')[4];
+          return await handleGetUserPermissions(request, env, email);
+        }
+
+        if (path.match(/^\/api\/admin\/users\/[^/]+\/permissions$/) && method === 'PUT') {
+          const email = path.split('/')[4];
+          return await handleUpdateUserPermissions(request, env, email);
         }
         
         if (path.match(/^\/api\/admin\/users\/[^/]+$/) && method === 'DELETE') {
