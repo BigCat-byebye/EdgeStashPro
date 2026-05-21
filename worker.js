@@ -9,6 +9,7 @@
  * Bindings (set in Cloudflare Dashboard):
  * - R2_BUCKET: R2 bucket binding for file storage
  * - KV_STORE: KV namespace binding for metadata storage
+ * - D1_DB: D1 database binding for search, favorites, and recent visits
  */
 
 // ============================================================================
@@ -38,6 +39,102 @@ async function hashPassword(password) {
   const hashBuffer = await crypto.subtle.digest('SHA-256', data);
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function base32Encode(bytes) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits = 0;
+  let value = 0;
+  let output = '';
+
+  for (const byte of bytes) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      output += alphabet[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+
+  if (bits > 0) {
+    output += alphabet[(value << (5 - bits)) & 31];
+  }
+  return output;
+}
+
+function base32Decode(value) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const clean = String(value || '').toUpperCase().replace(/=+$/g, '').replace(/\s+/g, '');
+  const bytes = [];
+  let bits = 0;
+  let buffer = 0;
+
+  for (const char of clean) {
+    const index = alphabet.indexOf(char);
+    if (index < 0) continue;
+    buffer = (buffer << 5) | index;
+    bits += 5;
+    if (bits >= 8) {
+      bytes.push((buffer >>> (bits - 8)) & 255);
+      bits -= 8;
+    }
+  }
+
+  return new Uint8Array(bytes);
+}
+
+function generateOtpSecret() {
+  const bytes = new Uint8Array(20);
+  crypto.getRandomValues(bytes);
+  return base32Encode(bytes);
+}
+
+async function generateTotp(secret, timeStep) {
+  const keyBytes = base32Decode(secret);
+  const counter = Math.floor((timeStep || Date.now()) / 30000);
+  const counterBytes = new Uint8Array(8);
+  let value = counter;
+  for (let index = 7; index >= 0; index--) {
+    counterBytes[index] = value & 255;
+    value = Math.floor(value / 256);
+  }
+
+  const key = await crypto.subtle.importKey(
+    'raw',
+    keyBytes,
+    { name: 'HMAC', hash: 'SHA-1' },
+    false,
+    ['sign']
+  );
+  const signature = new Uint8Array(await crypto.subtle.sign('HMAC', key, counterBytes));
+  const offset = signature[signature.length - 1] & 15;
+  const code = (
+    ((signature[offset] & 127) << 24) |
+    ((signature[offset + 1] & 255) << 16) |
+    ((signature[offset + 2] & 255) << 8) |
+    (signature[offset + 3] & 255)
+  ) % 1000000;
+
+  return String(code).padStart(6, '0');
+}
+
+async function verifyTotp(secret, token) {
+  const normalized = String(token || '').replace(/\s+/g, '');
+  if (!/^\d{6}$/.test(normalized)) return false;
+
+  const now = Date.now();
+  for (const offset of [-30000, 0, 30000]) {
+    if (await generateTotp(secret, now + offset) === normalized) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function createOtpUri(secret) {
+  const issuer = 'EdgeStash';
+  const label = `${issuer}:admin`;
+  return `otpauth://totp/${encodeURIComponent(label)}?secret=${encodeURIComponent(secret)}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`;
 }
 
 async function sha256Hex(value) {
@@ -568,11 +665,41 @@ function htmlResponse(html, status = 200, headers = {}) {
 async function handleLogin(request, env) {
   try {
     const body = await request.json();
-    const { email, password, isAdmin } = body;
+    const { email, password, isAdmin, otp } = body;
     
     if (isAdmin) {
       // Admin login
       if (password === env.ADMIN_PASSWORD) {
+        const otpSecret = await env.KV_STORE.get('admin:otp:secret');
+        if (otpSecret) {
+          if (!(await verifyTotp(otpSecret, otp))) {
+            return jsonResponse({
+              success: false,
+              requiresOtp: true,
+              message: otp ? 'OTP 验证码错误' : '请输入 OTP 验证码'
+            }, 401);
+          }
+        } else {
+          let pendingSecret = await env.KV_STORE.get('admin:otp:pending');
+          if (!pendingSecret) {
+            pendingSecret = generateOtpSecret();
+            await env.KV_STORE.put('admin:otp:pending', pendingSecret, { expirationTtl: 600 });
+          }
+
+          if (!(await verifyTotp(pendingSecret, otp))) {
+            return jsonResponse({
+              success: false,
+              requiresOtpSetup: true,
+              otpSecret: pendingSecret,
+              otpUri: createOtpUri(pendingSecret),
+              message: otp ? 'OTP 验证码错误，请确认扫码后输入 6 位验证码' : '请先绑定管理员 OTP'
+            }, 401);
+          }
+
+          await env.KV_STORE.put('admin:otp:secret', pendingSecret);
+          await env.KV_STORE.delete('admin:otp:pending');
+        }
+
         const token = await createJWT(
           { role: 'admin', exp: Date.now() + 24 * 60 * 60 * 1000 },
           env.ADMIN_PASSWORD
@@ -661,6 +788,15 @@ async function handleListFiles(request, env, path) {
   
   try {
     const currentPath = normalizeDirectoryPath(path);
+    if (currentPath !== '/') {
+      await recordRecentVisit(env, auth, {
+        path: currentPath,
+        name: nameFromItemPath(currentPath),
+        itemType: 'folder',
+        sizeFormatted: '',
+        previewType: ''
+      });
+    }
     let cached = null;
     try {
       cached = await readDirectoryCache(env, currentPath);
@@ -769,6 +905,7 @@ async function handleRenameFile(request, env, path) {
       // Delete old file
       await env.R2_BUCKET.delete(oldKey);
       await invalidateCachePath(env, r2KeyToPath(oldKey));
+      await cleanupD1ItemPath(env, r2KeyToPath(oldKey));
 
       const newObject = await env.R2_BUCKET.head(newKey);
       await syncFileCacheIfParentCached(env, newKey, {
@@ -813,6 +950,7 @@ async function handleRenameFile(request, env, path) {
     } while (cursor);
 
     await invalidateCachePath(env, r2KeyToPath(oldKey));
+    await cleanupD1ItemPath(env, r2KeyToPath(oldKey));
     await syncFolderCacheIfParentCached(env, newKey);
 
     return jsonResponse({ success: true, message: '重命名成功', newPath: '/' + newKey });
@@ -894,6 +1032,7 @@ async function deleteItemAtPath(env, path) {
 
   await env.R2_BUCKET.delete(key);
   await invalidateCachePath(env, r2KeyToPath(key));
+  await cleanupD1ItemPath(env, r2KeyToPath(key));
 }
 
 async function deleteR2Keys(env, keys) {
@@ -973,6 +1112,7 @@ async function copyOrMoveItem(env, sourcePath, destinationPath, shouldMove) {
 
   if (shouldMove) {
     await invalidateCachePath(env, normalizedSourcePath);
+    await cleanupD1ItemPath(env, normalizedSourcePath);
   }
   await invalidateCachePath(env, targetPath);
 
@@ -1470,6 +1610,13 @@ async function handleDownloadFile(request, env, path) {
     }
     
     const filename = key.split('/').pop();
+    await recordRecentVisit(env, auth, {
+      path: r2KeyToPath(key),
+      name: filename,
+      itemType: 'file',
+      sizeFormatted: formatFileSize(object.size || 0),
+      previewType: getPreviewType(filename) || ''
+    });
     
     return new Response(object.body, {
       headers: {
@@ -1503,6 +1650,13 @@ async function handlePreviewFile(request, env, path) {
     
     const filename = key.split('/').pop();
     const contentType = object.httpMetadata?.contentType || getMimeType(filename);
+    await recordRecentVisit(env, auth, {
+      path: r2KeyToPath(key),
+      name: filename,
+      itemType: 'file',
+      sizeFormatted: formatFileSize(object.size || 0),
+      previewType: getPreviewType(filename) || ''
+    });
     const headers = new Headers({
       'Content-Type': contentType,
       'Content-Disposition': createInlineDisposition(filename),
@@ -1614,6 +1768,162 @@ async function deleteReaderProgressForUser(env, email) {
   } while (cursor);
 }
 
+function shareRowToClient(row) {
+  return {
+    shareId: row.share_id,
+    filePath: row.file_path,
+    fileName: row.file_name,
+    fileSize: row.file_size || 0,
+    passwordHash: row.password_hash || null,
+    expiresAt: row.expires_at ?? null,
+    viewCount: row.view_count || 0,
+    downloadCount: row.download_count || 0,
+    createdAt: row.created_at || 0
+  };
+}
+
+async function upsertD1Share(env, share) {
+  await ensureD1Schema(env);
+  await env.D1_DB.prepare(`
+    INSERT INTO share_links (
+      share_id, file_path, file_name, file_size, password_hash, expires_at, view_count, download_count, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(share_id) DO NOTHING
+  `).bind(
+    share.shareId,
+    share.filePath,
+    share.fileName,
+    share.fileSize || 0,
+    share.passwordHash || null,
+    share.expiresAt ?? null,
+    share.viewCount || 0,
+    share.downloadCount || 0,
+    share.createdAt || Date.now()
+  ).run();
+}
+
+async function getD1Share(env, shareId) {
+  await ensureD1Schema(env);
+  const row = await env.D1_DB.prepare('SELECT * FROM share_links WHERE share_id = ?').bind(shareId).first();
+  if (row) return shareRowToClient(row);
+
+  const legacyData = await env.KV_STORE.get(`share:${shareId}`);
+  if (!legacyData) return null;
+
+  const legacyShare = JSON.parse(legacyData);
+  await upsertD1Share(env, legacyShare);
+  return legacyShare;
+}
+
+async function migrateLegacySharesToD1(env) {
+  await ensureD1Schema(env);
+  const marker = await env.D1_DB.prepare('SELECT value FROM app_stats WHERE key = ?')
+    .bind('legacySharesMigrated')
+    .first();
+  if (marker) return 0;
+
+  let cursor;
+  let migrated = 0;
+
+  do {
+    const listed = await env.KV_STORE.list({ prefix: 'share:', cursor });
+    for (const key of listed.keys) {
+      const data = await env.KV_STORE.get(key.name);
+      if (!data) continue;
+      try {
+        await upsertD1Share(env, JSON.parse(data));
+        migrated++;
+      } catch (error) {
+        console.warn('Legacy share migration failed:', key.name, error.message);
+      }
+    }
+    cursor = listed.list_complete ? null : listed.cursor;
+  } while (cursor);
+
+  await reconcileD1StatsMinimums(env);
+  await env.D1_DB.prepare(`
+    INSERT INTO app_stats (key, value, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `).bind('legacySharesMigrated', 1, Date.now()).run();
+  return migrated;
+}
+
+async function getLegacyStat(env, key) {
+  const value = await env.KV_STORE.get(`stats:${key}`);
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+async function calculateD1StatFallback(env, key) {
+  const legacy = await getLegacyStat(env, key);
+  let aggregate = 0;
+
+  if (key === 'totalShares') {
+    const row = await env.D1_DB.prepare('SELECT COUNT(*) AS value FROM share_links').first();
+    aggregate = Number(row?.value || 0);
+  } else if (key === 'totalViews') {
+    const row = await env.D1_DB.prepare('SELECT COALESCE(SUM(view_count), 0) AS value FROM share_links').first();
+    aggregate = Number(row?.value || 0);
+  } else if (key === 'totalDownloads') {
+    const row = await env.D1_DB.prepare('SELECT COALESCE(SUM(download_count), 0) AS value FROM share_links').first();
+    aggregate = Number(row?.value || 0);
+  }
+
+  return Math.max(legacy ?? 0, aggregate);
+}
+
+async function ensureD1Stat(env, key) {
+  await ensureD1Schema(env);
+  const existing = await env.D1_DB.prepare('SELECT value FROM app_stats WHERE key = ?').bind(key).first();
+  if (existing) return Number(existing.value || 0);
+
+  const value = await calculateD1StatFallback(env, key);
+  await env.D1_DB.prepare(`
+    INSERT OR IGNORE INTO app_stats (key, value, updated_at)
+    VALUES (?, ?, ?)
+  `).bind(key, value, Date.now()).run();
+
+  const row = await env.D1_DB.prepare('SELECT value FROM app_stats WHERE key = ?').bind(key).first();
+  return Number(row?.value || value);
+}
+
+async function changeD1Stat(env, key, delta) {
+  await ensureD1Stat(env, key);
+  await env.D1_DB.prepare(`
+    UPDATE app_stats
+    SET value = MAX(0, value + ?), updated_at = ?
+    WHERE key = ?
+  `).bind(delta, Date.now(), key).run();
+}
+
+async function reconcileD1StatsMinimums(env) {
+  await ensureD1Schema(env);
+  const totals = {
+    totalShares: Number((await env.D1_DB.prepare('SELECT COUNT(*) AS value FROM share_links').first())?.value || 0),
+    totalViews: Number((await env.D1_DB.prepare('SELECT COALESCE(SUM(view_count), 0) AS value FROM share_links').first())?.value || 0),
+    totalDownloads: Number((await env.D1_DB.prepare('SELECT COALESCE(SUM(download_count), 0) AS value FROM share_links').first())?.value || 0)
+  };
+
+  for (const [key, value] of Object.entries(totals)) {
+    const existing = await env.D1_DB.prepare('SELECT value FROM app_stats WHERE key = ?').bind(key).first();
+    if (!existing) continue;
+    await env.D1_DB.prepare(`
+      UPDATE app_stats
+      SET value = MAX(value, ?), updated_at = ?
+      WHERE key = ?
+    `).bind(value, Date.now(), key).run();
+  }
+}
+
+async function getD1Stats(env) {
+  return {
+    totalShares: await ensureD1Stat(env, 'totalShares'),
+    totalViews: await ensureD1Stat(env, 'totalViews'),
+    totalDownloads: await ensureD1Stat(env, 'totalDownloads')
+  };
+}
+
 // ============================================================================
 // SHARE HANDLERS
 // ============================================================================
@@ -1639,7 +1949,18 @@ async function handleCreateShare(request, env) {
       return jsonResponse({ success: false, message: '文件不存在' }, 404);
     }
     
-    const shareId = generateId(12);
+    let shareId = '';
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const candidate = generateId(12);
+      if (!(await getD1Share(env, candidate))) {
+        shareId = candidate;
+        break;
+      }
+    }
+    if (!shareId) {
+      throw new Error('分享 ID 生成失败，请重试');
+    }
+
     const shareData = {
       shareId,
       filePath: key,
@@ -1652,11 +1973,8 @@ async function handleCreateShare(request, env) {
       createdAt: Date.now()
     };
     
-    await env.KV_STORE.put(`share:${shareId}`, JSON.stringify(shareData));
-    
-    // Update stats
-    const totalShares = parseInt(await env.KV_STORE.get('stats:totalShares') || '0');
-    await env.KV_STORE.put('stats:totalShares', String(totalShares + 1));
+    await upsertD1Share(env, shareData);
+    await changeD1Stat(env, 'totalShares', 1);
     
     return jsonResponse({
       success: true,
@@ -1670,25 +1988,22 @@ async function handleCreateShare(request, env) {
 
 async function handleGetShareInfo(request, env, shareId) {
   try {
-    const shareData = await env.KV_STORE.get(`share:${shareId}`);
-    if (!shareData) {
+    const share = await getD1Share(env, shareId);
+    if (!share) {
       return jsonResponse({ success: false, message: '分享链接不存在' }, 404);
     }
-    
-    const share = JSON.parse(shareData);
     
     // Check expiration
     if (share.expiresAt && Date.now() > share.expiresAt) {
       return jsonResponse({ success: false, message: '分享链接已过期' }, 410);
     }
     
-    // Update view count
-    share.viewCount++;
-    await env.KV_STORE.put(`share:${shareId}`, JSON.stringify(share));
-    
-    // Update global stats
-    const totalViews = parseInt(await env.KV_STORE.get('stats:totalViews') || '0');
-    await env.KV_STORE.put('stats:totalViews', String(totalViews + 1));
+    await env.D1_DB.prepare(`
+      UPDATE share_links
+      SET view_count = view_count + 1
+      WHERE share_id = ?
+    `).bind(shareId).run();
+    await changeD1Stat(env, 'totalViews', 1);
     
     return jsonResponse({
       success: true,
@@ -1705,12 +2020,10 @@ async function handleGetShareInfo(request, env, shareId) {
 
 async function handleShareDownload(request, env, shareId) {
   try {
-    const shareData = await env.KV_STORE.get(`share:${shareId}`);
-    if (!shareData) {
+    const share = await getD1Share(env, shareId);
+    if (!share) {
       return jsonResponse({ success: false, message: '分享链接不存在' }, 404);
     }
-    
-    const share = JSON.parse(shareData);
     
     // Check expiration
     if (share.expiresAt && Date.now() > share.expiresAt) {
@@ -1738,13 +2051,12 @@ async function handleShareDownload(request, env, shareId) {
       return jsonResponse({ success: false, message: '文件不存在' }, 404);
     }
     
-    // Update download count
-    share.downloadCount++;
-    await env.KV_STORE.put(`share:${shareId}`, JSON.stringify(share));
-    
-    // Update global stats
-    const totalDownloads = parseInt(await env.KV_STORE.get('stats:totalDownloads') || '0');
-    await env.KV_STORE.put('stats:totalDownloads', String(totalDownloads + 1));
+    await env.D1_DB.prepare(`
+      UPDATE share_links
+      SET download_count = download_count + 1
+      WHERE share_id = ?
+    `).bind(shareId).run();
+    await changeD1Stat(env, 'totalDownloads', 1);
     
     return new Response(object.body, {
       headers: {
@@ -1767,9 +2079,8 @@ async function handleGetStats(request, env) {
   if (auth instanceof Response) return auth;
   
   try {
-    const totalShares = parseInt(await env.KV_STORE.get('stats:totalShares') || '0');
-    const totalViews = parseInt(await env.KV_STORE.get('stats:totalViews') || '0');
-    const totalDownloads = parseInt(await env.KV_STORE.get('stats:totalDownloads') || '0');
+    await migrateLegacySharesToD1(env);
+    const { totalShares, totalViews, totalDownloads } = await getD1Stats(env);
     
     return jsonResponse({
       success: true,
@@ -1787,27 +2098,20 @@ async function handleListShares(request, env) {
   if (auth instanceof Response) return auth;
   
   try {
-    const shares = [];
-    let cursor;
-    
-    do {
-      const listed = await env.KV_STORE.list({ prefix: 'share:', cursor });
-      for (const key of listed.keys) {
-        const data = await env.KV_STORE.get(key.name);
-        if (data) {
-          const share = JSON.parse(data);
-          shares.push({
-            ...share,
-            fileSizeFormatted: formatFileSize(share.fileSize),
-            isExpired: share.expiresAt && Date.now() > share.expiresAt
-          });
-        }
-      }
-      cursor = listed.list_complete ? null : listed.cursor;
-    } while (cursor);
-    
-    // Sort by creation date, newest first
-    shares.sort((a, b) => b.createdAt - a.createdAt);
+    await migrateLegacySharesToD1(env);
+    const rows = await env.D1_DB.prepare(`
+      SELECT * FROM share_links
+      ORDER BY created_at DESC
+      LIMIT 1000
+    `).all();
+    const shares = (rows.results || []).map(row => {
+      const share = shareRowToClient(row);
+      return {
+        ...share,
+        fileSizeFormatted: formatFileSize(share.fileSize),
+        isExpired: share.expiresAt && Date.now() > share.expiresAt
+      };
+    });
     
     return jsonResponse({ success: true, shares });
   } catch (e) {
@@ -1820,13 +2124,10 @@ async function handleDeleteShare(request, env, shareId) {
   if (auth instanceof Response) return auth;
   
   try {
+    const existing = await getD1Share(env, shareId);
+    await env.D1_DB.prepare('DELETE FROM share_links WHERE share_id = ?').bind(shareId).run();
     await env.KV_STORE.delete(`share:${shareId}`);
-    
-    // Update stats
-    const totalShares = parseInt(await env.KV_STORE.get('stats:totalShares') || '0');
-    if (totalShares > 0) {
-      await env.KV_STORE.put('stats:totalShares', String(totalShares - 1));
-    }
+    if (existing) await changeD1Stat(env, 'totalShares', -1);
     
     return jsonResponse({ success: true, message: '分享链接已删除' });
   } catch (e) {
@@ -1918,6 +2219,431 @@ async function handleCheckAuth(request, env) {
     return jsonResponse({ authenticated: false });
   }
   return jsonResponse({ authenticated: true, role: auth.role, email: auth.email });
+}
+
+// ============================================================================
+// D1 SEARCH, FAVORITES, AND RECENT VISITS
+// ============================================================================
+
+let d1SchemaReady = false;
+const D1_SCHEMA_KV_KEY = 'd1:schema:v1';
+
+async function ensureD1Schema(env) {
+  if (!env.D1_DB) throw new Error('D1_DB binding 未配置');
+  if (d1SchemaReady) return;
+
+  const kvReady = env.KV_STORE ? await env.KV_STORE.get(D1_SCHEMA_KV_KEY) : null;
+  if (kvReady) {
+    d1SchemaReady = true;
+    return;
+  }
+
+  // KV 标记不存在，删除旧表重建
+  const tables = ['search_items', 'favorites', 'recent_items', 'share_links', 'app_stats'];
+  for (const t of tables) {
+    await env.D1_DB.prepare(`DROP TABLE IF EXISTS ${t}`).run();
+  }
+
+  const ddlStatements = [
+    `CREATE TABLE IF NOT EXISTS search_items (
+      path TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      item_type TEXT NOT NULL,
+      parent_path TEXT NOT NULL,
+      size INTEGER DEFAULT 0,
+      size_formatted TEXT,
+      preview_type TEXT,
+      last_modified TEXT,
+      indexed_at INTEGER NOT NULL
+    )`,
+    'CREATE INDEX IF NOT EXISTS idx_search_items_type ON search_items(item_type)',
+    'CREATE INDEX IF NOT EXISTS idx_search_items_parent ON search_items(parent_path)',
+    'CREATE INDEX IF NOT EXISTS idx_search_items_name ON search_items(name)',
+    `CREATE TABLE IF NOT EXISTS favorites (
+      owner_key TEXT NOT NULL,
+      path TEXT NOT NULL,
+      name TEXT NOT NULL,
+      item_type TEXT NOT NULL,
+      size_formatted TEXT,
+      preview_type TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (owner_key, path)
+    )`,
+    'CREATE INDEX IF NOT EXISTS idx_favorites_owner_updated ON favorites(owner_key, updated_at DESC)',
+    `CREATE TABLE IF NOT EXISTS recent_items (
+      owner_key TEXT NOT NULL,
+      path TEXT NOT NULL,
+      name TEXT NOT NULL,
+      item_type TEXT NOT NULL,
+      size_formatted TEXT,
+      preview_type TEXT,
+      visited_at INTEGER NOT NULL,
+      PRIMARY KEY (owner_key, path)
+    )`,
+    'CREATE INDEX IF NOT EXISTS idx_recent_items_owner_visited ON recent_items(owner_key, visited_at DESC)',
+    `CREATE TABLE IF NOT EXISTS share_links (
+      share_id TEXT PRIMARY KEY,
+      file_path TEXT NOT NULL,
+      file_name TEXT NOT NULL,
+      file_size INTEGER NOT NULL DEFAULT 0,
+      password_hash TEXT,
+      expires_at INTEGER,
+      view_count INTEGER NOT NULL DEFAULT 0,
+      download_count INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    )`,
+    'CREATE INDEX IF NOT EXISTS idx_share_links_created ON share_links(created_at DESC)',
+    'CREATE INDEX IF NOT EXISTS idx_share_links_expires ON share_links(expires_at)',
+    `CREATE TABLE IF NOT EXISTS app_stats (
+      key TEXT PRIMARY KEY,
+      value INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL
+    )`
+  ];
+
+  for (const statement of ddlStatements) {
+    await env.D1_DB.prepare(statement).run();
+  }
+
+  if (env.KV_STORE) await env.KV_STORE.put(D1_SCHEMA_KV_KEY, '1');
+  d1SchemaReady = true;
+}
+
+function ownerKeyFromAuth(auth) {
+  return auth && auth.role === 'admin' ? 'admin' : `user:${auth.email || ''}`;
+}
+
+function d1RowToClientItem(row) {
+  return {
+    path: row.path,
+    name: row.name,
+    itemType: row.item_type,
+    isFolder: row.item_type === 'folder',
+    size: row.size || 0,
+    sizeFormatted: row.size_formatted || '',
+    previewType: row.preview_type || '',
+    parentPath: row.parent_path || parentPathFromItemPath(row.path),
+    lastModified: row.last_modified || null,
+    indexedAt: row.indexed_at || null,
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+    visitedAt: row.visited_at || null
+  };
+}
+
+async function cleanupD1ItemPath(env, path) {
+  if (!env.D1_DB) return;
+
+  try {
+    await ensureD1Schema(env);
+    const normalized = normalizeItemPath(path);
+    if (!normalized || normalized === '/') return;
+    const childPattern = normalized + '/%';
+    const statements = [
+      env.D1_DB.prepare('DELETE FROM search_items WHERE path = ? OR path LIKE ?').bind(normalized, childPattern),
+      env.D1_DB.prepare('DELETE FROM favorites WHERE path = ? OR path LIKE ?').bind(normalized, childPattern),
+      env.D1_DB.prepare('DELETE FROM recent_items WHERE path = ? OR path LIKE ?').bind(normalized, childPattern)
+    ];
+    await env.D1_DB.batch(statements);
+  } catch (e) {
+    console.warn('D1 item reference cleanup failed:', e.message);
+  }
+}
+
+function normalizeD1ItemFromBody(body) {
+  const path = normalizeItemPath(body.path || '');
+  if (!path || path === '/') {
+    throw new Error('请提供有效路径');
+  }
+
+  const itemType = body.itemType || body.item_type || (body.isFolder ? 'folder' : 'file');
+  if (!['file', 'folder'].includes(itemType)) {
+    throw new Error('项目类型无效');
+  }
+
+  const name = (body.name || nameFromItemPath(path)).trim();
+  if (!name) {
+    throw new Error('项目名称无效');
+  }
+
+  return {
+    path,
+    name,
+    itemType,
+    sizeFormatted: body.sizeFormatted || body.size_formatted || '',
+    previewType: body.previewType || body.preview_type || ''
+  };
+}
+
+function addFolderSearchRows(folderRows, folderPath, indexedAt) {
+  const normalized = normalizeDirectoryPath(folderPath);
+  if (normalized === '/') return;
+  if (!folderRows.has(normalized)) {
+    folderRows.set(normalized, {
+      path: normalized,
+      name: nameFromItemPath(normalized),
+      item_type: 'folder',
+      parent_path: parentPathFromItemPath(normalized),
+      size: 0,
+      size_formatted: '',
+      preview_type: '',
+      last_modified: null,
+      indexed_at: indexedAt
+    });
+  }
+}
+
+function addFolderSearchRowsFromR2Key(folderRows, key, indexedAt) {
+  const parts = (key || '').split('/').filter(Boolean);
+  const folderParts = parts.slice(0, -1);
+  for (let index = 0; index < folderParts.length; index++) {
+    addFolderSearchRows(folderRows, '/' + folderParts.slice(0, index + 1).join('/'), indexedAt);
+  }
+}
+
+async function rebuildSearchIndex(env) {
+  await ensureD1Schema(env);
+
+  const indexedAt = Date.now();
+  const folderRows = new Map();
+  const fileRows = new Map();
+  let cursor;
+  let scanned = 0;
+
+  do {
+    const listed = await env.R2_BUCKET.list({ cursor, limit: 1000 });
+    for (const obj of listed.objects || []) {
+      scanned++;
+      addFolderSearchRowsFromR2Key(folderRows, obj.key, indexedAt);
+      if (obj.key.endsWith('/.folder') || obj.key === '.folder') continue;
+
+      const path = r2KeyToPath(obj.key);
+      const name = nameFromItemPath(path);
+      if (!name) continue;
+
+      fileRows.set(path, {
+        path,
+        name,
+        item_type: 'file',
+        parent_path: parentPathFromItemPath(path),
+        size: obj.size || 0,
+        size_formatted: formatFileSize(obj.size || 0),
+        preview_type: getPreviewType(name) || '',
+        last_modified: isoDateString(obj.uploaded),
+        indexed_at: indexedAt
+      });
+    }
+    cursor = listed.truncated ? listed.cursor : null;
+  } while (cursor);
+
+  const rows = [...folderRows.values(), ...fileRows.values()];
+  const upsert = env.D1_DB.prepare(`
+    INSERT INTO search_items (
+      path, name, item_type, parent_path, size, size_formatted, preview_type, last_modified, indexed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(path) DO UPDATE SET
+      name = excluded.name,
+      item_type = excluded.item_type,
+      parent_path = excluded.parent_path,
+      size = excluded.size,
+      size_formatted = excluded.size_formatted,
+      preview_type = excluded.preview_type,
+      last_modified = excluded.last_modified,
+      indexed_at = excluded.indexed_at
+  `);
+
+  for (let index = 0; index < rows.length; index += 50) {
+    const batch = rows.slice(index, index + 50).map(item => upsert.bind(
+      item.path,
+      item.name,
+      item.item_type,
+      item.parent_path,
+      item.size,
+      item.size_formatted,
+      item.preview_type,
+      item.last_modified,
+      item.indexed_at
+    ));
+    if (batch.length > 0) {
+      await env.D1_DB.batch(batch);
+    }
+  }
+
+  await env.D1_DB.prepare('DELETE FROM search_items WHERE indexed_at != ?').bind(indexedAt).run();
+
+  return { indexedAt, scanned, count: rows.length };
+}
+
+async function handleSearch(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    await ensureD1Schema(env);
+    const url = new URL(request.url);
+    const refresh = ['1', 'true', 'yes'].includes((url.searchParams.get('refresh') || '').toLowerCase());
+    const refreshResult = refresh ? await rebuildSearchIndex(env) : null;
+    const q = (url.searchParams.get('q') || '').trim().toLowerCase();
+    const type = url.searchParams.get('type') || 'all';
+    const requestedLimit = Number(url.searchParams.get('limit') || 100);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(500, Math.max(1, requestedLimit)) : 100;
+
+    const clauses = [];
+    const params = [];
+    if (q) {
+      clauses.push('(lower(name) LIKE ? OR lower(path) LIKE ?)');
+      params.push('%' + q + '%', '%' + q + '%');
+    }
+    if (type === 'files') {
+      clauses.push("item_type = 'file'");
+    } else if (type === 'folders') {
+      clauses.push("item_type = 'folder'");
+    }
+
+    const where = clauses.length ? 'WHERE ' + clauses.join(' AND ') : '';
+    const results = await env.D1_DB.prepare(`
+      SELECT * FROM search_items
+      ${where}
+      ORDER BY item_type DESC, name COLLATE NOCASE ASC, path COLLATE NOCASE ASC
+      LIMIT ?
+    `).bind(...params, limit).all();
+
+    return jsonResponse({
+      success: true,
+      items: (results.results || []).map(d1RowToClientItem),
+      refresh: refreshResult
+    });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '搜索失败: ' + e.message }, 500);
+  }
+}
+
+async function handleFavorites(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    await ensureD1Schema(env);
+    const ownerKey = ownerKeyFromAuth(auth);
+
+    if (request.method === 'GET') {
+      const requestedLimit = Number(new URL(request.url).searchParams.get('limit') || 200);
+      const limit = Number.isFinite(requestedLimit) ? Math.min(500, Math.max(1, requestedLimit)) : 200;
+      const results = await env.D1_DB.prepare(`
+        SELECT * FROM favorites
+        WHERE owner_key = ?
+        ORDER BY updated_at DESC
+        LIMIT ?
+      `).bind(ownerKey, limit).all();
+      return jsonResponse({ success: true, favorites: (results.results || []).map(d1RowToClientItem) });
+    }
+
+    if (request.method === 'POST') {
+      const item = normalizeD1ItemFromBody(await request.json());
+      const now = Date.now();
+      await env.D1_DB.prepare(`
+        INSERT INTO favorites (owner_key, path, name, item_type, size_formatted, preview_type, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(owner_key, path) DO UPDATE SET
+          name = excluded.name,
+          item_type = excluded.item_type,
+          size_formatted = excluded.size_formatted,
+          preview_type = excluded.preview_type,
+          updated_at = excluded.updated_at
+      `).bind(ownerKey, item.path, item.name, item.itemType, item.sizeFormatted, item.previewType, now, now).run();
+      return jsonResponse({ success: true, favorite: { ...item, updatedAt: now } });
+    }
+
+    if (request.method === 'DELETE') {
+      const url = new URL(request.url);
+      const body = await request.json().catch(() => ({}));
+      const path = normalizeItemPath(body.path || url.searchParams.get('path') || '');
+      if (!path || path === '/') {
+        return jsonResponse({ success: false, message: '请提供有效路径' }, 400);
+      }
+      await env.D1_DB.prepare('DELETE FROM favorites WHERE owner_key = ? AND path = ?').bind(ownerKey, path).run();
+      return jsonResponse({ success: true });
+    }
+
+    return jsonResponse({ success: false, message: '方法不支持' }, 405);
+  } catch (e) {
+    return jsonResponse({ success: false, message: '收藏操作失败: ' + e.message }, 500);
+  }
+}
+
+async function pruneRecentItems(env, ownerKey, keepCount = 100) {
+  const oldRows = await env.D1_DB.prepare(`
+    SELECT path FROM recent_items
+    WHERE owner_key = ?
+    ORDER BY visited_at DESC
+    LIMIT 1000 OFFSET ?
+  `).bind(ownerKey, keepCount).all();
+
+  const paths = (oldRows.results || []).map(row => row.path);
+  if (paths.length === 0) return;
+  const statement = env.D1_DB.prepare('DELETE FROM recent_items WHERE owner_key = ? AND path = ?');
+  for (let index = 0; index < paths.length; index += 50) {
+    await env.D1_DB.batch(paths.slice(index, index + 50).map(path => statement.bind(ownerKey, path)));
+  }
+}
+
+async function saveRecentItem(env, auth, item) {
+  await ensureD1Schema(env);
+  const ownerKey = ownerKeyFromAuth(auth);
+  const now = Date.now();
+  await env.D1_DB.prepare(`
+    INSERT INTO recent_items (owner_key, path, name, item_type, size_formatted, preview_type, visited_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(owner_key, path) DO UPDATE SET
+      name = excluded.name,
+      item_type = excluded.item_type,
+      size_formatted = excluded.size_formatted,
+      preview_type = excluded.preview_type,
+      visited_at = excluded.visited_at
+  `).bind(ownerKey, item.path, item.name, item.itemType, item.sizeFormatted, item.previewType, now).run();
+  await pruneRecentItems(env, ownerKey, 100);
+  return now;
+}
+
+async function recordRecentVisit(env, auth, item) {
+  try {
+    await saveRecentItem(env, auth, item);
+  } catch (e) {
+    console.warn('D1 recent visit record failed:', e.message);
+  }
+}
+
+async function handleRecent(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    await ensureD1Schema(env);
+    const ownerKey = ownerKeyFromAuth(auth);
+
+    if (request.method === 'GET') {
+      const requestedLimit = Number(new URL(request.url).searchParams.get('limit') || 100);
+      const limit = Number.isFinite(requestedLimit) ? Math.min(200, Math.max(1, requestedLimit)) : 100;
+      const results = await env.D1_DB.prepare(`
+        SELECT * FROM recent_items
+        WHERE owner_key = ?
+        ORDER BY visited_at DESC
+        LIMIT ?
+      `).bind(ownerKey, limit).all();
+      return jsonResponse({ success: true, recent: (results.results || []).map(d1RowToClientItem) });
+    }
+
+    if (request.method === 'POST') {
+      const item = normalizeD1ItemFromBody(await request.json());
+      const visitedAt = await saveRecentItem(env, auth, item);
+      return jsonResponse({ success: true, recent: { ...item, visitedAt } });
+    }
+
+    return jsonResponse({ success: false, message: '方法不支持' }, 405);
+  } catch (e) {
+    return jsonResponse({ success: false, message: '最近访问操作失败: ' + e.message }, 500);
+  }
 }
 
 // ============================================================================
@@ -2972,6 +3698,104 @@ const CSS_STYLES = `
     flex-wrap: wrap;
   }
 
+  .view-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+  }
+
+  .view-tabs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px;
+    height: 36px;
+    background: var(--surface);
+    border: 1px solid var(--surface-light);
+    border-radius: 8px;
+    box-sizing: border-box;
+    flex: 0 0 auto;
+  }
+
+  .view-tab {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-muted);
+    height: 100%;
+    padding: 6px 10px;
+    margin: 0;
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    white-space: nowrap;
+  }
+
+  .view-tab.active {
+    background: var(--primary);
+    color: white;
+  }
+
+  .search-tools {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 1 560px;
+    min-width: 260px;
+  }
+
+  .search-tools .form-input {
+    flex: 1 1 auto;
+    min-width: 150px;
+    height: 34px;
+    padding: 6px 10px;
+    margin: 0;
+    font-size: 13px;
+  }
+
+  .search-tools .form-select {
+    width: 96px;
+    height: 34px;
+    padding: 6px 28px 6px 10px;
+    margin: 0;
+    font-size: 13px;
+  }
+
+  .search-tools .btn {
+    height: 34px;
+    padding: 6px 10px;
+    margin: 0;
+    font-size: 13px;
+    white-space: nowrap;
+  }
+
+  .section-title {
+    margin: 0 0 16px;
+    color: var(--text-muted);
+    font-size: 14px;
+    font-weight: 500;
+  }
+
+  .qr-panel {
+    display: flex;
+    justify-content: center;
+    margin: 14px 0 18px;
+  }
+
+  #shareQrCanvas {
+    width: 180px;
+    height: 180px;
+    padding: 10px;
+    background: white;
+    border-radius: 8px;
+  }
+
   .batch-toolbar {
     display: none;
     align-items: center;
@@ -3043,1253 +3867,49 @@ const CSS_STYLES = `
     cursor: pointer;
     transition: all 0.2s ease;
   }
-  
+
   .upload-area:hover, .upload-area.dragover {
     border-color: var(--primary);
     background: rgba(99, 102, 241, 0.1);
   }
-  
+
   .upload-area input {
     display: none;
   }
+
+  @media (max-width: 768px) {
+    .view-toolbar {
+      align-items: stretch;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .view-tabs {
+      width: 100%;
+    }
+
+    .view-tab {
+      flex: 1 1 0;
+    }
+
+    .search-tools {
+      min-width: 0;
+      flex: 1 1 auto;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 92px;
+      gap: 6px;
+    }
+
+    .search-tools .form-select {
+      width: 100%;
+    }
+
+    .search-tools .btn {
+      width: 100%;
+      padding: 6px 8px;
+    }
+  }
 </style>
-`;
-
-const LOGIN_PAGE = `
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>登录 - EdgeStash</title>
-  ${CSS_STYLES}
-</head>
-<body>
-  <div class="login-container">
-    <div class="login-card">
-      <div class="login-header">
-        <div class="login-logo">EdgeStash</div>
-        <div class="logibtitle">基于 Cloudflare 的云盘服务</div>
-      </div>
-      
-      <div class="login-tabs">
-        <button class="login-tab active" onclick="switchLoginTab('admin')">管理员登录</button>
-        <button class="login-tab" onclick="switchLoginTab('user')">用户登录</button>
-      </div>
-      
-      <form id="loginForm" onsubmit="handleLogin(event)">
-        <div id="emailField" class="form-group" style="display: none;">
-          <label class="form-label">邮箱</label>
-          <input type="l" id="email" class="form-input" placeholder="请输入邮箱">
-        </div>
-        
-        <div class="form-group">
-          <label class="form-label">密码</label>
-          <input type="password" id="password" class="form-input" placeholder="请输入密码" required>
-        </div>
-        
-        <button type="submit" class="btn btn-primary" style="width: 100%;">
-          登录
-        </button>
-      </form>
-    </div>
-  </div>
-  
-  <div class="toast-container" id="toastContainer"></div>
-  
-   let isAdminLogin = true;
-    
-    function switchLoginTab(type) {
-      isAdminLogin = type === 'admin';
-      document.querySelectorAll('.login-tab').forEach((tab, index) => {
-        tab.classList.toggle('active', (index === 0 && isAdminLogin) || (index === 1 && !isAdminLogin));
-      });
-      document.getElementById('emailField').style.display = isAdminLogin ? 'none' : 'block';
-    }
-    
-    async function handleLogin(e) {
-      e.preventDefault();
-      
-      const password = document.getElementById('password').value;
-      const email = document.getElementById('email').value;
-      
-      try {
-        const response = await fetch('/api/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            isAdmin: isAdminLogin,
-            email: isAdminLogin ? undefined : email,
-            password
-          })
-        });
-        
-        const data = await response.json();
-        
-        if (data.success) {
-          showToast('登录成功', 'success');
-          setTimeout(() => {
-            window.location.href = '/';
-          }, 500);
-        } else {
-          showToast(data.message || '登录失败', 'error');
-        }
-      } catch (error) {
-        showToast('登录失败: ' + error.message, 'error');
-      }
-    }
-    
-    function showToast(message, type = 'info') {
-      const container = document.getElementById('toastContainer');
-      const toast = document.createElement('div');
-      toast.className = 'toast t type;
-      toast.textContent = message;
-      container.appendChild(toast);
-      
-      setTimeout(() => {
-        toast.remove();
-      }, 3000);
-    }
-  </script>
-</body>
-</html>
-`;
-
-const INDEX_PAGE = `
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>EdgeStash - 云盘</title>
-  ${CSS_STYLES}
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <script src="https://cdn.jsdelivt/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
-</head>
-<body>
-  <div class="header">
-    <div class="logo">EdgeStash</div>
-    <div class="header-actions">
-      <button class="btn btn-secondary" onclick="window.location.href='/admin.html'">管理后台</button>
-      <button class="btn btn-secondary" onclick="logout()">退出登录</button>
-    </div>
-  </div>
-  
-  <div class="container">
-    <div class="breadcrumb" id="breadcrumb"></div>
-    
-    <div class="toolbar">
-      <button class="btn btn-primary" onclick="showNewFolderModal()">
-        📁 新建文件夹
-      </button>
-      <button class="btn btn-primary" onclick="document.getElementById('fileInput').click()">
-        📤 上传文件
-      </button>
-      <input type="file" id="fileInput" multiple style="display: none;" onchange="handleFileUpload(event)">
-    </div>
-    
-    <div class="card">
-      <div id="fileList" class="file-grid"></div>
-      <div id="emptyState" class="empty-state" style="display: none;">
-        <div class="empon">📂</div>
-        <div>此文件夹为空</div>
-      </div>
-    </div>
-  </div>
-  
-  <!-- New Folder Modal -->
-  <div class="modal-overlay" id="newFolderModal">
-    <div class="modal">
-      <div class="modal-header">
-        <div class="modal-title">新建文件夹</div>
-        <button class="modal-close" onclick="closeModal('newFolderModal')">&times;</button>
-      </div>
-      <form onsubmit="createFolder(event)">
-        <div class="form-group">
-          <label class="form-label">文件夹名称label>
-          <input type="text" id="folderName" class="form-input" placeholder="请输入文件夹名称" required>
-        </div>
-        <button type="submit" class="btn btn-primary" style="width: 100%;">创建</button>
-      </form>
-    </div>
-  </div>
-  
-  <!-- Rename Modal -->
-  <div class="modal-overlay" id="renameModal">
-    <div class="modal">
-      <div class="modal-header">
-        <div class="modal-title">重命名</div>
-        <button class="modal-close" onclick="closeModal('renameModal')">utton>
-      </div>
-      <form onsubmit="renameFile(event)">
-        <div class="form-group">
-          <label class="form-label">新名称</label>
-          <input type="text" id="newFileName" class="form-input" required>
-        </div>
-        <input type="hidden" id="renameFilePath">
-        <button type="submit" class="btn btn-primary" style="width: 100%;">确认</button>
-      </form>
-    </div>
-  </div>
-  
-  <!-- Share Modal -->
-  <div class="modal-overlay" id="shareModal">
-    <div class="modal">
-  lass="modal-header">
-        <div class="modal-title">创建分享链接</div>
-        <button class="modal-close" onclick="closeModal('shareModal')">&times;</button>
-      </div>
-      <form onsubmit="createShare(event)">
-        <div class="form-group">
-          <label class="form-label">分享密码（留空则无密码）</label>
-          <input type="text" id="sharePassword" class="form-input" placeholder="可选">
-        </div>
-        <div class="form-group">
-          <label class="form-label">æ
-          <select id="shareExpiry" class="form-select">
-            <option value="1h">1小时</option>
-            <option value="1d" selected>1天</option>
-            <option value="1m">1个月</option>
-            <option value="permanent">永久有效</option>
-          </select>
-        </div>
-        <input type="hidden" id="shareFilePath">
-        <button type="submit" class="btn btn-primary" style="width: 100%;">创建分享链接</button>
-      </form>
-    </div>
-  </div>
-  
-  <!-- Share Result iv class="modal-overlay" id="shareResultModal">
-    <div class="modal">
-      <div class="modal-header">
-        <div class="modal-title">分享链接已创建</div>
-        <button class="modal-close" onclick="closeModal('shareResultModal')">&times;</button>
-      </div>
-      <div class="form-group">
-        <label class="form-label">分享链接</label>
-        <input type="text" id="shareResultUrl" class="form-input" readonly>
-      </div>
-      <button class="btn btn-primary" style="width: 100%;" onclipyShareLink()">复制链接</button>
-    </div>
-  </div>
-  
-  <!-- Preview Modal -->
-  <div class="preview-overlay" id="previewOverlay">
-    <div class="preview-header">
-      <div class="preview-filename" id="previewFilename"></div>
-      <div class="preview-actions">
-        <button class="btn btn-primary" id="previewDownloadBtn">下载</button>
-        <button class="btn btn-secondary" onclick="closePreview()">关闭</button>
-        <button type="button" class="preview-icon-btn preview-download" onclick="document.getElementById('previewDownloadBtn').click()">⬇</button>
-        <button type="button" class="preview-icon-btn preview-close" onclick="closePreview()">✕</button>
-      </div>
-    </div>
-    <div class="preview-content" id="previewContent">
-      <div class="preview-loading">
-        <div class="spinner"></div>
-        <div>加载中...</div>
-      </div>
-    </div>
-  </div>
-  
-  <div class="toast-container" id="toastContainer"></div>
-  
-  <div class="loading-overlay" id="loadingOverlay" style="display: none;">
-    <div class="spinner"></div>
-  </div>
-  
-  <script>
-    let currentPath = '/';
-
-    function encodePathForUrl(path) {
-      if (!path || path === '/') return '/';
-      return path.split('/').map((part, index) => {
-        if (index === 0 && part === '') return '';
-        return encodeURIComponent(part);
-      }).join('/');
-    }
-
-    function apiFileUrl(prefix, path) {
-      return prefix + encodePathForUrl(path);
-    }
-    
-    async function checkAuth() {
-      try {
-        const response = await fetch('/api/auth/check');
-        const data = await response.json();
-     (!data.authenticated) {
-          window.location.href = '/login.html';
-        }
-      } catch (error) {
-        window.location.href = '/login.html';
-      }
-    }
-    
-    async function loadFiles() {
-      showLoading(true);
-      try {
-        const response = await fetch(apiFileUrl('/api/files', currentPath));
-        const data = await response.json();
-        
-        if (!data.success) {
-          if (response.status === 401) {
-            window.location.href = '/login.html';
-            return;
-          }
-          throw new Error(data.message);
-        }
-        
-        renderBreadcrumb();
-        renderFiles(data.folders, data.files);
-      } catch (error) {
-        showToast('加载文件失败: ' + error.message, 'error');
-      } finally {
-        showLoading(false);
-      }
-    }
-    
-    function renderBreadcrumb() {
-      const breadcrumb = document.getElementById('breadcrumb');
-      const parts = currentPath.split('/').filter(p => p);
-      
-      let html = '<a href="#" class="breadcrumb-item" ogateTo(\\'/\\')">🏠 根目录</a>';
-      
-      let path = '';
-      parts.forEach((part, index) => {
-        path += '/' + part;
-        const isLast = index === parts.length - 1;
-        html += '<span class="breadcrumb-separator">/</span>';
-        if (isLast) {
-          html += '<span class="breadcrumb-item active">' + part + '</span>';
-        } else {
-          html += '<a href="#" class="breadcrumb-item" onclick="navigateTo(\\'' + path + '\\')">' + part + '</a>';
-        }
-      });
-      
-      mb.innerHTML = html;
-    }
-    
-    function renderFiles(folders, files) {
-      const fileList = document.getElementById('fileList');
-      const emptyState = document.getElementById('emptyState');
-      
-      if (folders.length === 0 && files.length === 0) {
-        fileList.innerHTML = '';
-        emptyState.style.display = 'block';
-        return;
-      }
-      
-      emptyState.style.display = 'none';
-      
-      let html = '';
-      
-      // Render folders
-      folders.forEach(folder => {
-        html += \`
-          <div class="file-item" ondblclick="navigateTo('\${folder.path}')">
-            <div class="file-icon">📁</div>
-            <div class="file-name">\${escapeHtml(folder.name)}</div>
-            <div class="file-meta">文件夹</div>
-            <div class="file-actions">
-              <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation(); showRenameModal('\${folder.path}', '\${escapeHtml(folder.name)}')">重命名</button>
-              <button class="btn btn-sm btn-k="event.stopPropagation(); deleteFile('\${folder.path}')">删除</button>
-            </div>
-          </div>
-        \`;
-      });
-      
-      // Render files
-      files.forEach(file => {
-        const icon = getFileIcon(file.name);
-        const previewable = file.previewType ? 'true' : 'false';
-        const previewType = file.previewType || '';
-        html += \`
-          <div class="file-item" ondblclick="handleFileClick('\${file.path}', '\${previewType}', '\${escapeHtml(file.name)}')" data-preview="\${previewable}">
-            <div class="file-icon">\${icon}</div>
-            <div class="file-name">\${escapeHtml(file.name)}</div>
-            <div class="file-meta">\${file.sizeFormatted}\${previewType ? ' <span class="badge badge-info">可预览</span>' : ''}</div>
-            <div class="file-actions">
-              \${previewType ? '<button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); previewFile(\\'' + file.path + '\\', \\'' + previewType + '\\', \\'' + escapeHtml(file.name) +">预览</button>' : ''}
-              <button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); downloadFile('\${file.path}')">下载</button>
-              <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation(); showShareModal('\${file.path}')">分享</button>
-              <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation(); showRenameModal('\${file.path}', '\${escapeHtml(file.name)}')">重命名</button>
-              <button class="btn btn-sm btn-nger" onclick="event.stopPropagation(); deleteFile('\${file.path}')">删除</button>
-            </div>
-          </div>
-        \`;
-      });
-      
-      fileList.innerHTML = html;
-    }
-    
-    function handleFileClick(path, previewType, filename) {
-      if (previewType) {
-        previewFile(path, previewType, filename);
-      } else {
-        downloadFile(path);
-      }
-    }
-    
-    function getFileIcon(filename) {
-      const ext = filename.split('.').pop().toLowerCase();
-      const icons = {
-    'pdf': '📕',
-        'doc': '📘', 'docx': '📘',
-        'xls': '📗', 'xlsx': '📗',
-        'ppt': '📙', 'pptx': '📙',
-        'jpg': '🖼️', 'jpeg': '🖼️', 'png': '🖼️', 'gif': '🖼️', 'svg': '🖼️', 'webp': '🖼️',
-        'mp3': '🎵', 'wav': '🎵', 'flac': '🎵',
-        'mp4': '🎬', 'avi': '🎬', 'mkv': '🎬', 'mov': '🎬',
-        'zip': '📦', 'rar': '📦', '7z': '📦', 'tar': '📦', 'gz': '📦',
-        'js': '📜', 'ts': '📜', 'py': '📜', 'java': 📜', 'c': '📜',
-        'html': '🌐', 'css': '🎨', 'json': '📋',
-        'txt': '📄', 'md': '📝'
-      };
-      return icons[ext] || '📄';
-    }
-    
-    function navigateTo(path) {
-      currentPath = path;
-      loadFiles();
-    }
-    
-    // ========== Preview Functions ==========
-    
-    async function previewFile(path, previewType, filename) {
-      const overlay = document.getElementById('previewOverlay');
-      const content = document.getElementById('previewContent');
-      const fiocument.getElementById('previewFilename');
-      const downloadBtn = document.getElementById('previewDownloadBtn');
-      
-      filenameEl.textContent = filename;
-      downloadBtn.onclick = () => downloadFile(path);
-      
-      // Show loading
-      content.innerHTML = '<div class="preview-loading"><div class="spinner"></div><div>加载中...</div></div>';
-      overlay.classList.add('active');
-      
-      try {
-        const previewUrl = apiFileUrl('/api/preview', path);
-        
-        switch (previewType) {
-    case 'image':
-            content.innerHTML = '<img class="preview-image" src="' + previewUrl + '" alt="' + escapeHtml(filename) + '">';
-            break;
-            
-          case 'pdf':
-            content.innerHTML = '<iframe class="preview-pdf" src="' + previewUrl + '"></iframe>';
-            break;
-            
-          case 'text':
-            const textResponse = await fetch(previewUrl);
-            const text = await textResponse.text();
-            const ext = filename.split('.').pop().toLowerCase();
-            
-            if (ext === 'md') {
-              // Render Markdown
-              const htmlContent = marked.parse(text);
-              content.innerHTML = '<div class="preview-markdown">' + htmlContent + '</div>';
-            } else if (ext === 'json') {
-              // Pretty print JSON
-              try {
-                const json = JSON.parse(text);
-                content.innerHTML = '<pre class="preview-text">' + escapeHtml(JSON.stringify(json, null, 2)) + '</pre>';
-              } catch {
-                content.innerHTML = '<pre class="preview-text">' + escapeHtml(text) + '</pre>';
-              }
-            } else {
-              content.innerHTML = '<pre class="preview-text">' + escapeHtml(text) + '</pre>';
-            }
-            break;
-            
-          case 'video':
-            content.innerHTML = '<video class="preview-video" controls autoplay><source src="' + previewUrl + '"></video>';
-            break;
-            
-          case 'audio':
-            content.innerHTML = '<audio class="preview-audio" controls autoplay><source src="' + previewUrl + '"></audio>';
-            break;
-            
-          case 'word':
-            // Use Mammoth.js to convert docx to HTML
-            const docxResponse = await fetch(previewUrl);
-            const docxArrayBuffer = await docxResponse.arrayBuffer();
-            const result = await mammoth.convertToHtml({ arrayBuffer: docxArrayBuffer });
-            content.innerHTML = '<div class="preview-markdown">' + result.value + '</div>';
-            break;
-            
-          default:
-            content.innerHTML = '<div class="preview-error">不支持预览此文件类型</div>';
-        }
-      } catch (error) {
-        content.innerHTML = '<div class="preview-error">预览加载失败: ' + escapeHtml(error.message) + '</div>';
-      }
-    }
-    
-    function closePreview() {
-      const overlay = document.getElementById('previewOverlay');
-      overlay.classList.remove('active');
-      // Clear content to stop any playing media
-      document.getElementById('previewContent').innerHTML = '';
-    }
-    
-    // Close preview on Escape key
-    document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') {
-        closePreview();
-      }
-    });
-    
-    // ========== File Operations ==========
-    
-    async function handleFileUpload(event) {
-      const files = event.target.files;
-      if (!files.length) return;
-      
-      showLoading(true);
-      
-      for (const file of files) {
-        try {
-          const formData = new FormData();
-          formData.append('file', file);
-          
-          const response = await fetch(apiFileUrl('/api/files', currentPath), {
-            method: 'POST',
-            body: formData
-          });
-          
-          const data = await response.json();
-          
-          if (data.success) {
-            showToast('文件 ' + file.name + ' 上传成功', 'success');
-          } else {
-            showToast('文件 ' + file.name + ' 上传失败: ' + data.message, 'error');
-          }
-    tch (error) {
-          showToast('文件 ' + file.name + ' 上传失败: ' + error.message, 'error');
-        }
-      }
-      
-      event.target.value = '';
-      loadFiles();
-    }
-    
-    function showNewFolderModal() {
-      document.getElementById('folderName').value = '';
-      document.getElementById('newFolderModal').classList.add('active');
-    }
-    
-    async function createFolder(event) {
-      event.preventDefault();
-      const name = document.getElementById('folderName').value.trim();
-     !name) {
-        showToast('请输入文件夹名称', 'error');
-        return;
-      }
-      
-      showLoading(true);
-      closeModal('newFolderModal');
-      
-      try {
-        let folderPath = currentPath;
-        if (!folderPath.endsWith('/')) folderPath += '/';
-        folderPath += name;
-        
-        const response = await fetch('/api/folders', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: folderPath })
-        });
-        
-        const data = await response.json();
-        
-        if (data.success) {
-          showToast('文件夹创建成功', 'success');
-          loadFiles();
-        } else {
-          showToast('创建失败: ' + data.message, 'error');
-        }
-      } catch (error) {
-        showToast('创建失败: ' + error.message, 'error');
-      } finally {
-        showLoading(false);
-      }
-    }
-    
-    function showRenameModal(path, currentName) {
-      document.getElementById('renameFilePath').v     document.getElementById('newFileName').value = currentName;
-      document.getElementById('renameModal').classList.add('active');
-    }
-    
-    async function renameFile(event) {
-      event.preventDefault();
-      const path = document.getElementById('renameFilePath').value;
-      const newName = document.getElementById('newFileName').value.trim();
-      
-      if (!newName) {
-        showToast('请输入新名称', 'error');
-        return;
-      }
-      
-      showLoading(true);
-      closeModal('r;
-      
-      try {
-        const response = await fetch(apiFileUrl('/api/files', path), {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ newName })
-        });
-        
-        const data = await response.json();
-        
-        if (data.success) {
-          showToast('重命名成功', 'success');
-          loadFiles();
-        } else {
-          showToast('重命名失败: ' + data.message, 'error');
-        }
-      } catch (error) {
-        shast('重命名失败: ' + error.message, 'error');
-      } finally {
-        showLoading(false);
-      }
-    }
-    
-    async function deleteFile(path) {
-      if (!confirm('确定要删除吗？此操作不可恢复。')) return;
-      
-      showLoading(true);
-      
-      try {
-        const response = await fetch(apiFileUrl('/api/files', path), {
-          method: 'DELETE'
-        });
-        
-        const data = await response.json();
-        
-        if (data.success) {
-          showToast('删除成功', 'success');
-          loadFiles();
-        } else {
-          showToast('删除失败: ' + data.message, 'error');
-        }
-      } catch (error) {
-        showToast('删除失败: ' + error.message, 'error');
-      } finally {
-        showLoading(false);
-      }
-    }
-    
-    async function downloadFile(path) {
-      window.open(apiFileUrl('/api/download', path), '_blank');
-    }
-    
-    function showShareModal(path) {
-      document.getElementById('shareFilePath').value = path;
-      document.getElementById('sharePassword').value = '';
-      document.getElementById('shareExpiry').value = '1d';
-      document.getElementById('shareModal').classList.add('active');
-    }
-    
-    async function createShare(event) {
-      event.preventDefault();
-      const filePath = document.getElementById('shareFilePath').value;
-      const password = document.getElementById('sharePassword').value;
-      const expiresIn = document.getElementById('shareExpiry').value;
-      
-      showLoading(true);
-      closeModal('shareModal');
-      
-      try {
-        const response = await fetch('/api/share', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ filePath, password, expiresIn })
-        });
-        
-        const data = await response.json();
-        
-        if (data.success) {
-          const fullUrl = window.location.origin + data.shareUrl;
-          document.getElementById('shareResultUrl').value = fullUrl;
-          document.getElementById('shareResultModal').classList.add('active');
-        } else {
-          showToast('创建分享链接失败: ' + data.message, 'error');
-        }
-      } catch (error) {
-        showToast('创建分享链接失败: ' + error.message, 'error');
-      } finally {
-        showLoading(false);
-      }
-    }
-    
-    function copyShareLink() {
-      const input = document.getElementById('shareResultUrl');
-      input.select();
-      document.execCommand('copy');
-      showToast('链接已复制到剪贴板', 'success');
-    }
-    
-    asc function logout() {
-      try {
-        await fetch('/api/logout', { method: 'POST' });
-        window.location.href = '/login.html';
-      } catch (error) {
-        window.location.href = '/login.html';
-      }
-    }
-    
-    function closeModal(id) {
-      document.getElementById(id).classList.remove('active');
-    }
-    
-    function showLoading(show) {
-      document.getElementById('loadingOverlay').style.display = show ? 'flex' : 'none';
-    }
-    
-    function showToast(message, type = 'info') {
-      const container = document.getElementById('toastContainer');
-      const toast = document.createElement('div');
-      toast.className = 'toast toast-' + type;
-      toast.textContent = message;
-      container.appendChild(toast);
-      
-      setTimeout(() => {
-        toast.remove();
-      }, 3000);
-    }
-    
-    function escapeHtml(text) {
-      const div = document.createElement('div');
-      div.textContent = text;
-      return div.innerHTML;
-    }
-    
-    // Initialize
-    checkAuth();
-    loadFiles();
-  </script>
-</body>
-</html>
-`;
-
-const ADMIN_PAGE = `
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>管理后台 - EdgeStash</title>
-  ${CSS_STYLES}
-</head>
-<body>
-  <div class="header">
-    <div class="logo">EdgeStash 管理后台</div>
-    <div class="header-actions">
-      <button class="btn btn-secondary" onclick="window.location.href='/'">返回云盘</button>
-      <button class="btn btn-secondlick="logout()">退出登录</button>
-    </div>
-  </div>
-  
-  <div class="container">
-    <div class="tabs">
-      <button class="tab active" onclick="switchTab('stats')">统计数据</button>
-      <button class="tab" onclick="switchTab('shares')">分享链接</button>
-      <button class="tab" onclick="switchTab('users')">授权用户</button>
-    </div>
-    
-    <!-- Stats Tab -->
-    <div id="statsTab" class="tab-content active">
-      <div class="stats-grid">
-        <div class="stat-card">
-          <div class="stat-value" id="totalShares">0</div>
-          <div class="stat-label">总分享链接数</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-value" id="totalViews">0</div>
-          <div class="stat-label">总浏览次数</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-value" id="totalDownloads">0</div>
-          <div class="stat-label">总下载次数</div>
-        </div>
-      </div>
-    </div>
-    
-    <!-- Shares Tab -->
-    <div id="sharesTab" class="tab-content">
-      <div class="card">
-        <div class="card-header">
-          <div class="card-title">分享链接管理</div>
-        </div>
-        <div class="table-container">
-          <table>
-            <thead>
-              <tr>
-                <th>文件名</th>
-                <th>分享ID</th>
-                <th>密码保护</th>
-                <th>浏览次数</th>
-                <th>下载次数</th>
-                <th>状态</th>
-                <th>操作</th>
-        </tr>
-            </thead>
-            <tbody id="sharesTable"></tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-    
-    <!-- Users Tab -->
-    <div id="usersTab" class="tab-content">
-      <div class="card">
-        <div class="card-header">
-          <div class="card-title">授权用户管理</div>
-          <button class="btn btn-primary" onclick="showAddUserModal()">添加用户</button>
-        </div>
-        <div class="table-container">
-          <table>
-            <thead>
-          <tr>
-                <th>邮箱</th>
-                <th>角色</th>
-                <th>创建时间</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody id="usersTable"></tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-  </div>
-  
-  <!-- Add User Modal -->
-  <div class="modal-overlay" id="addUserModal">
-    <div class="modal">
-      <div class="modal-header">
-        <div class="modal-title">添加授权用户</div>
-        <button class="modal-close" onclick="closeModal('addUserModal')">&times;</button>
-      </div>
-      <form onsubmit="addUser(event)">
-        <div class="form-group">
-          <label class="form-label">邮箱</label>
-          <input type="email" id="newUserEmail" class="form-input" placeholder="请输入邮箱" required>
-        </div>
-        <div class="form-group">
-          <label class="form-label">密码</label>
-          <input type="text" id="newUserPassword" class="form-input" placeholder="请输入密码" re    </div>
-        <button type="submit" class="btn btn-primary" style="width: 100%;">添加用户</button>
-      </form>
-    </div>
-  </div>
-  
-  <div class="toast-container" id="toastContainer"></div>
-  
-  <div class="loading-overlay" id="loadingOverlay" style="display: none;">
-    <div class="spinner"></div>
-  </div>
-  
-  <script>
-    async function checkAdminAuth() {
-      try {
-        const response = await fetch('/api/auth/check');
-        const data = await response.json();
-        if (!data.authent| data.role !== 'admin') {
-          window.location.href = '/login.html';
-        }
-      } catch (error) {
-        window.location.href = '/login.html';
-      }
-    }
-    
-    function switchTab(tab) {
-      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-      
-      event.target.classList.add('active');
-      document.getElementById(tab + 'Tab').classList.add('active');
-      
-      if (tab === 'stats') loadStats();
-      else if (tab === 'shares') loadShares();
-      else if (tab === 'users') loadUsers();
-    }
-    
-    async function loadStats() {
-      try {
-        const response = await fetch('/api/admin/stats');
-        const data = await response.json();
-        
-        if (data.success) {
-          document.getElementById('totalShares').textContent = data.totalShares;
-          document.getElementById('totalViews').textContent = data.totalViews;
-          document.getElementById('totalDownloads').textContent = data.totalDownloads;
-        }
-      } catch (error) {
-        showToast('加载统计数据失败', 'error');
-      }
-    }
-    
-    async function loadShares() {
-      showLoading(true);
-      try {
-        const response = await fetch('/api/admin/shares');
-        const data = await response.json();
-        
-        if (data.success) {
-          const tbody = document.getElementById('sharesTable');
-          
-          if (data.shares.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted);">暂无分享链接</td></tr>';
-            return;
-          }
-          
-          tbody.innerHTML = data.shares.map(share => \`
-            <tr>
-              <td>\${escapeHtml(share.fileName)}</td>
-              <td><code>\${share.shareId}</code></td>
-              <td>\${share.passwordHash ? '是' : '否'}</td>
-              <td>\${share.viewCount}</td>
-              <td>\${share.downloadCount}</td>
-              <td>
-                \${share.isExpired 
-                  ? '<span class="badge badge-error">已过期</span>' 
-                  : '<span class="badge badge-success">有效</span>'}
-              </td>
-              <td>
-                <button class="btn btn-sm btn-secondary" onclick="copyShareLink('\${share.shareId}')">复制链接</button>
-                <button class="btn btn-sm btn-danger" onclick="deleteShare('\${share.shareId}')">删除</button>
-              </td>
-            </tr>
-          \`).join(       }
-      } catch (error) {
-        showToast('加载分享列表失败', 'error');
-      } finally {
-        showLoading(false);
-      }
-    }
-    
-    async function loadUsers() {
-      showLoading(true);
-      try {
-        const response = await fetch('/api/admin/users');
-        const data = await response.json();
-        
-        if (data.success) {
-          const tbody = document.getElementById('usersTable');
-          
-          if (data.users.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-muted);">暂无授权用户</td></tr>';
-            return;
-          }
-          
-          tbody.innerHTML = data.users.map(user => \`
-            <tr>
-              <td>\${escapeHtml(user.email)}</td>
-              <td>\${user.role === 'admin' ? '管理员' : '普通用户'}</td>
-              <td>\${user.createdAt ? new Date(user.createdAt).toLocaleString() : '-'}</td>
-              <td>
-                <button class="btn btn-sm btn-danger" oleteUser('\${encodeURIComponent(user.email)}')">撤销授权</button>
-              </td>
-            </tr>
-          \`).join('');
-        }
-      } catch (error) {
-        showToast('加载用户列表失败', 'error');
-      } finally {
-        showLoading(false);
-      }
-    }
-    
-    function showAddUserModal() {
-      document.getElementById('newUserEmail').value = '';
-      document.getElementById('newUserPassword').value = '';
-      document.getElementById('addUserModal').classList.add('active');
-  
-    async function addUser(event) {
-      event.preventDefault();
-      const email = document.getElementById('newUserEmail').value;
-      const password = document.getElementById('newUserPassword').value;
-      
-      showLoading(true);
-      closeModal('addUserModal');
-      
-      try {
-        const response = await fetch('/api/admin/users', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email, password })
-        });
-        
-        const data = await response.json();
-        
-        if (data.success) {
-          showToast('用户添加成功', 'success');
-          loadUsers();
-        } else {
-          showToast('添加失败: ' + data.message, 'error');
-        }
-      } catch (error) {
-        showToast('添加失败: ' + error.message, 'error');
-      } finally {
-        showLoading(false);
-      }
-    }
-    
-    async function deleteUser(email) {
-      if (!confirm('确定要撤销该用户的授权吗？')) return;
-       showLoading(true);
-      
-      try {
-        const response = await fetch('/api/admin/users/' + email, {
-          method: 'DELETE'
-        });
-        
-        const data = await response.json();
-        
-        if (data.success) {
-          showToast('用户已删除', 'success');
-          loadUsers();
-        } else {
-          showToast('删除失败: ' + data.message, 'error');
-        }
-      } catch (error) {
-        showToast('删除失败: ' + error.message, 'error');
-      } finally {
-       ng(false);
-      }
-    }
-    
-    async function deleteShare(shareId) {
-      if (!confirm('确定要删除该分享链接吗？')) return;
-      
-      showLoading(true);
-      
-      try {
-        const response = await fetch('/api/admin/shares/' + shareId, {
-          method: 'DELETE'
-        });
-        
-        const data = await response.json();
-        
-        if (data.success) {
-          showToast('分享链接已删除', 'success');
-          loadShares();
-        } else {
-          showToast('å data.message, 'error');
-        }
-      } catch (error) {
-        showToast('删除失败: ' + error.message, 'error');
-      } finally {
-        showLoading(false);
-      }
-    }
-    
-    function copyShareLink(shareId) {
-      const url = window.location.origin + '/s/' + shareId;
-      navigator.clipboard.writeText(url).then(() => {
-        showToast('链接已复制', 'success');
-      }).catch(() => {
-        showToast('复制失败', 'error');
-      });
-    }
-    
-    async function logout() {
-          await fetch('/api/logout', { method: 'POST' });
-        window.location.href = '/login.html';
-      } catch (error) {
-        window.location.href = '/login.html';
-      }
-    }
-    
-    function closeModal(id) {
-      document.getElementById(id).classList.remove('active');
-    }
-    
-    function showLoading(show) {
-      document.getElementById('loadingOverlay').style.display = show ? 'flex' : 'none';
-    }
-    
-    function showToast(message, type = 'info') {
-      const container = document.getElementById('toastContainer');
-      const toast = document.createElement('div');
-      toast.className = 'toast toast-' + type;
-      toast.textContent = message;
-      container.appendChild(toast);
-      
-      setTimeout(() => {
-        toast.remove();
-      }, 3000);
-    }
-    
-    function escapeHtml(text) {
-      const div = document.createElement('div');
-      div.textContent = text;
-      return div.innerHTML;
-    }
-    
-    // Initialize
-    checkAdminAuth();
-    loadStats();
-  </script>
-</body>
-</html>
-`;
-
-const SHARE_PAGE = `
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>文件分享 - EdgeStash</title>
-  ${CSS_STYLES}
-</head>
-<body>
-  <div class="share-container">
-    <div class="share-card" id="shareCard">
-      <div id="loadingState">
-        <div class="spinner" style="margin: 0 auto 20px;"></div>
-        <div>加载中...</div>
-      </div>
-      
-      <div id="expiredState" style="display: noneiv class="share-icon">⚠️</div>
-        <div class="share-expired">分享链接已过期或不存在</div>
-        <p style="color: var(--text-muted); margin-top: 16px;">请联系分享者获取新的链接</p>
-      </div>
-      
-      <div id="shareContent" style="display: none;">
-        <div class="share-icon">📄</div>
-        <div class="share-filename" id="fileName"></div>
-        <div class="share-filesize" id="fileSize"></div>
-        
-        <div id="passwordForm" style="display: none;">
-      <div class="form-group">
-            <label class="form-label">请输入分享密码</label>
-            <input type="password" id="sharePassword" class="form-input" placeholder="输入密码">
-          </div>
-        </div>
-        
-        <button class="btn btn-primary" style="width: 100%; margin-top: 20px;" onclick="downloadFile()">
-          下载文件
-        </button>
-      </div>
-    </div>
-  </div>
-  
-  <div class="toast-container" id="toastContainer"></div>
-  
-  <script>
-    let shareId = '';resPassword = false;
-    
-    async function loadShareInfo() {
-      // Get share ID from URL
-      const pathParts = window.location.pathname.split('/');
-      shareId = pathParts[pathParts.length - 1];
-      
-      if (!shareId) {
-        showExpired();
-        return;
-      }
-      
-      try {
-        const response = await fetch('/api/share/' + shareId);
-        const data = await response.json();
-        
-        if (!data.success) {
-          showExpired();
-          return;
-        }
-        
-        document.getElementById('loadingState').style.display = 'none';
-        document.getElementById('shareContent').style.display = 'block';
-        
-        document.getElementById('fileName').textContent = data.fileName;
-        document.getElementById('fileSize').textContent = data.fileSizeFormatted;
-        
-        requiresPassword = data.requiresPassword;
-        if (requiresPassword) {
-          document.getElementById('passwordForm').style.display = 'block';
-        }
-      } catch (error) {
-        showExpired();
-      }
-    }
-    
-    function showExpired() {
-      document.getElementById('loadingState').style.display = 'none';
-      document.getElementById('expiredState').style.display = 'block';
-    }
-    
-    async function downloadFile() {
-      const password = document.getElementById('sharePassword')?.value || '';
-      
-      if (requiresPassword && !password) {
-        showToast('请输入分享密码', 'error');
-        return;
-      }
-      
-      try {
-        const response = await fetch(' shareId + '/download', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ password })
-        });
-        
-        if (response.ok) {
-          // Get filename from Content-Disposition header
-          const contentDisposition = response.headers.get('Content-Disposition');
-          let filename = 'download';
-          if (contentDisposition) {
-            const utf8Match = contentDisposition.match(/filename\\*=UTF-8''([^;\\n]+)/i);
-            const fallbackMatch = contentDisposition.match(/filename=["']?([^"';\\n]+)/i);
-            if (utf8Match) {
-              filename = decodeURIComponent(utf8Match[1]);
-            } else if (fallbackMatch) {
-              filename = fallbackMatch[1];
-            }
-          }
-          
-          // Download the file
-          const blob = await response.blob();
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = filename;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          URL.revokeObjectURL(url);
-          
-          showToast('下载开始', 'success');
-        } else {
-          const data = await response.json();
-          showToast(data.message || '下载失败', 'error');
-        }
-      } catch (error) {
-        showToast('下载失败: ' + error.message, 'error');
-      }
-    }
-    
-    function showToast(message, type = 'info') {
-      const container = document.getElementById('toastContainer');
-      const toast = document.createElement('div');
-      toast.className = 'toast toast-' + type;
-      toast.textContesage;
-      container.appendChild(toast);
-      
-      setTimeout(() => {
-        toast.remove();
-      }, 3000);
-    }
-    
-    // Initialize
-    loadShareInfo();
-  </script>
-</body>
-</html>
 `;
 
 const FIXED_LOGIN_PAGE = `
@@ -4325,6 +3945,19 @@ const FIXED_LOGIN_PAGE = `
           <input type="password" id="password" class="form-input" placeholder="请输入密码" required>
         </div>
 
+        <div id="otpField" class="form-group">
+          <label class="form-label" for="otp">OTP 验证码</label>
+          <input type="text" id="otp" class="form-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="6 位验证码">
+        </div>
+
+        <div id="otpSetupPanel" class="form-group" style="display: none;">
+          <label class="form-label">首次绑定管理员 OTP</label>
+          <div class="qr-panel">
+            <canvas id="otpQrCanvas" width="180" height="180" aria-label="管理员 OTP 二维码"></canvas>
+          </div>
+          <input type="text" id="otpSecret" class="form-input" readonly>
+        </div>
+
         <button type="submit" class="btn btn-primary" style="width: 100%;">登录</button>
       </form>
     </div>
@@ -4341,6 +3974,8 @@ const FIXED_LOGIN_PAGE = `
       tabs[0].classList.toggle('active', isAdminLogin);
       tabs[1].classList.toggle('active', !isAdminLogin);
       document.getElementById('emailField').style.display = isAdminLogin ? 'none' : 'block';
+      document.getElementById('otpField').style.display = isAdminLogin ? 'block' : 'none';
+      document.getElementById('otpSetupPanel').style.display = 'none';
     }
 
     async function handleLogin(event) {
@@ -4348,6 +3983,7 @@ const FIXED_LOGIN_PAGE = `
 
       const password = document.getElementById('password').value;
       const email = document.getElementById('email').value.trim();
+      const otp = document.getElementById('otp').value.trim();
 
       try {
         const response = await fetch('/api/login', {
@@ -4356,7 +3992,8 @@ const FIXED_LOGIN_PAGE = `
           body: JSON.stringify({
             isAdmin: isAdminLogin,
             email: isAdminLogin ? undefined : email,
-            password
+            password,
+            otp: isAdminLogin ? otp : undefined
           })
         });
 
@@ -4366,12 +4003,202 @@ const FIXED_LOGIN_PAGE = `
           window.setTimeout(function () {
             window.location.href = '/';
           }, 300);
+        } else if (data.requiresOtpSetup) {
+          document.getElementById('otpSetupPanel').style.display = 'block';
+          document.getElementById('otpSecret').value = data.otpSecret || '';
+          if (data.otpUri) renderOtpQr(data.otpUri);
+          showToast(data.message || '请扫码绑定 OTP 后输入验证码', 'info');
+        } else if (data.requiresOtp) {
+          document.getElementById('otpField').style.display = 'block';
+          showToast(data.message || '请输入 OTP 验证码', 'error');
         } else {
           showToast(data.message || '登录失败', 'error');
         }
       } catch (error) {
         showToast('登录失败: ' + error.message, 'error');
       }
+    }
+
+    function renderOtpQr(text) {
+      const canvas = document.getElementById('otpQrCanvas');
+      if (!canvas) return;
+      try {
+        const qr = createQrMatrix(text);
+        const ctx = canvas.getContext('2d');
+        const quiet = 4;
+        const scale = Math.max(1, Math.floor(canvas.width / (qr.size + quiet * 2)));
+        const imageSize = (qr.size + quiet * 2) * scale;
+        const offset = Math.floor((canvas.width - imageSize) / 2);
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#000000';
+        for (let y = 0; y < qr.size; y++) {
+          for (let x = 0; x < qr.size; x++) {
+            if (qr.matrix[y][x]) {
+              ctx.fillRect(offset + (x + quiet) * scale, offset + (y + quiet) * scale, scale, scale);
+            }
+          }
+        }
+      } catch (error) {
+        showToast('二维码生成失败，请手动输入 Secret', 'error');
+      }
+    }
+
+    function createQrMatrix(text) {
+      const version = 6;
+      const size = 17 + version * 4;
+      const dataCodewords = 136;
+      const blockCount = 2;
+      const blockDataCodewords = 68;
+      const eccCodewords = 18;
+      const bytes = Array.from(new TextEncoder().encode(text));
+      const bits = [];
+
+      function pushBits(value, length) {
+        for (let i = length - 1; i >= 0; i--) bits.push((value >>> i) & 1);
+      }
+
+      if (bytes.length > dataCodewords - 3) throw new Error('QR payload too long');
+      pushBits(4, 4);
+      pushBits(bytes.length, 8);
+      bytes.forEach(function (byte) { pushBits(byte, 8); });
+
+      const capacityBits = dataCodewords * 8;
+      for (let i = 0; i < 4 && bits.length < capacityBits; i++) bits.push(0);
+      while (bits.length % 8 !== 0) bits.push(0);
+
+      const data = [];
+      for (let i = 0; i < bits.length; i += 8) {
+        let value = 0;
+        for (let j = 0; j < 8; j++) value = (value << 1) | bits[i + j];
+        data.push(value);
+      }
+      for (let pad = 0xec; data.length < dataCodewords; pad ^= 0xec ^ 0x11) data.push(pad);
+
+      const blocks = [];
+      for (let block = 0; block < blockCount; block++) {
+        const blockData = data.slice(block * blockDataCodewords, (block + 1) * blockDataCodewords);
+        blocks.push({ data: blockData, ecc: reedSolomonCompute(blockData, eccCodewords) });
+      }
+
+      const codewords = [];
+      for (let i = 0; i < blockDataCodewords; i++) {
+        for (let block = 0; block < blockCount; block++) codewords.push(blocks[block].data[i]);
+      }
+      for (let i = 0; i < eccCodewords; i++) {
+        for (let block = 0; block < blockCount; block++) codewords.push(blocks[block].ecc[i]);
+      }
+
+      const matrix = Array.from({ length: size }, function () { return Array(size).fill(false); });
+      const isFunction = Array.from({ length: size }, function () { return Array(size).fill(false); });
+
+      function setModule(x, y, dark, func) {
+        if (x < 0 || y < 0 || x >= size || y >= size) return;
+        matrix[y][x] = !!dark;
+        if (func) isFunction[y][x] = true;
+      }
+
+      function drawFinder(cx, cy) {
+        for (let dy = -4; dy <= 4; dy++) {
+          for (let dx = -4; dx <= 4; dx++) {
+            const dist = Math.max(Math.abs(dx), Math.abs(dy));
+            setModule(cx + dx, cy + dy, dist !== 2 && dist <= 3, true);
+          }
+        }
+      }
+
+      function drawAlignment(cx, cy) {
+        for (let dy = -2; dy <= 2; dy++) {
+          for (let dx = -2; dx <= 2; dx++) {
+            const dist = Math.max(Math.abs(dx), Math.abs(dy));
+            setModule(cx + dx, cy + dy, dist === 2 || dist === 0, true);
+          }
+        }
+      }
+
+      function drawFormat(mask) {
+        const bits = getFormatBits(1, mask);
+        for (let i = 0; i <= 5; i++) setModule(8, i, ((bits >>> i) & 1) !== 0, true);
+        setModule(8, 7, ((bits >>> 6) & 1) !== 0, true);
+        setModule(8, 8, ((bits >>> 7) & 1) !== 0, true);
+        setModule(7, 8, ((bits >>> 8) & 1) !== 0, true);
+        for (let i = 9; i < 15; i++) setModule(14 - i, 8, ((bits >>> i) & 1) !== 0, true);
+        for (let i = 0; i < 8; i++) setModule(size - 1 - i, 8, ((bits >>> i) & 1) !== 0, true);
+        for (let i = 8; i < 15; i++) setModule(8, size - 15 + i, ((bits >>> i) & 1) !== 0, true);
+        setModule(8, size - 8, true, true);
+      }
+
+      drawFinder(3, 3);
+      drawFinder(size - 4, 3);
+      drawFinder(3, size - 4);
+      for (let i = 8; i < size - 8; i++) {
+        setModule(6, i, i % 2 === 0, true);
+        setModule(i, 6, i % 2 === 0, true);
+      }
+      drawAlignment(34, 34);
+      drawFormat(0);
+
+      let bitIndex = 0;
+      let upward = true;
+      for (let right = size - 1; right >= 1; right -= 2) {
+        if (right === 6) right--;
+        for (let vertical = 0; vertical < size; vertical++) {
+          const y = upward ? size - 1 - vertical : vertical;
+          for (let j = 0; j < 2; j++) {
+            const x = right - j;
+            if (isFunction[y][x]) continue;
+            let dark = false;
+            if (bitIndex < codewords.length * 8) {
+              dark = ((codewords[Math.floor(bitIndex / 8)] >>> (7 - (bitIndex % 8))) & 1) !== 0;
+            }
+            bitIndex++;
+            if ((x + y) % 2 === 0) dark = !dark;
+            setModule(x, y, dark, false);
+          }
+        }
+        upward = !upward;
+      }
+      drawFormat(0);
+      return { size: size, matrix: matrix };
+    }
+
+    function getFormatBits(ecl, mask) {
+      let data = (ecl << 3) | mask;
+      let bits = data << 10;
+      for (let i = 14; i >= 10; i--) {
+        if (((bits >>> i) & 1) !== 0) bits ^= 0x537 << (i - 10);
+      }
+      return ((data << 10) | bits) ^ 0x5412;
+    }
+
+    function reedSolomonCompute(data, degree) {
+      const divisor = Array(degree).fill(0);
+      divisor[degree - 1] = 1;
+      let root = 1;
+      for (let i = 0; i < degree; i++) {
+        for (let j = 0; j < degree; j++) {
+          divisor[j] = gfMultiply(divisor[j], root);
+          if (j + 1 < degree) divisor[j] ^= divisor[j + 1];
+        }
+        root = gfMultiply(root, 2);
+      }
+
+      const result = Array(degree).fill(0);
+      data.forEach(function (byte) {
+        const factor = byte ^ result.shift();
+        result.push(0);
+        for (let i = 0; i < degree; i++) result[i] ^= gfMultiply(divisor[i], factor);
+      });
+      return result;
+    }
+
+    function gfMultiply(x, y) {
+      let z = 0;
+      for (let i = 7; i >= 0; i--) {
+        z = (z << 1) ^ ((z >>> 7) * 0x11d);
+        if (((y >>> i) & 1) !== 0) z ^= x;
+      }
+      return z & 0xff;
     }
 
     function showToast(message, type) {
@@ -4396,6 +4223,7 @@ const FIXED_INDEX_PAGE = `
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>EdgeStash - 云盘</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
   ${CSS_STYLES}
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
@@ -4418,6 +4246,24 @@ const FIXED_INDEX_PAGE = `
       <button type="button" class="btn btn-primary" onclick="document.getElementById('fileInput').click()">📤 上传文件</button>
       <input type="file" id="fileInput" multiple style="display: none;" onchange="handleFileUpload(event)">
     </div>
+
+    <div class="view-toolbar">
+      <div class="view-tabs">
+        <button type="button" class="view-tab active" data-view="files" onclick="switchMainView('files')">文件</button>
+        <button type="button" class="view-tab" data-view="favorites" onclick="switchMainView('favorites')">收藏</button>
+        <button type="button" class="view-tab" data-view="recent" onclick="switchMainView('recent')">最近</button>
+      </div>
+      <div class="search-tools">
+        <input type="search" id="globalSearchInput" class="form-input" placeholder="搜索名称或路径" oninput="handleSearchInput()" onkeydown="handleSearchKey(event)">
+        <select id="globalSearchType" class="form-select" onchange="handleSearchTypeChange()">
+          <option value="all">全部</option>
+          <option value="files">文件</option>
+          <option value="folders">文件夹</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="section-title" id="viewTitle">当前目录</div>
 
     <div class="batch-toolbar" id="batchToolbar">
       <label class="batch-count">
@@ -4508,6 +4354,9 @@ const FIXED_INDEX_PAGE = `
         <label class="form-label" for="shareResultUrl">分享链接</label>
         <input type="text" id="shareResultUrl" class="form-input" readonly>
       </div>
+      <div class="qr-panel">
+        <canvas id="shareQrCanvas" width="180" height="180" aria-label="分享二维码"></canvas>
+      </div>
       <button type="button" class="btn btn-primary" style="width: 100%;" onclick="copyShareLink()">复制链接</button>
     </div>
   </div>
@@ -4548,20 +4397,26 @@ const FIXED_INDEX_PAGE = `
   </div>
 
   <div class="toast-container" id="toastContainer"></div>
-  <div class="loading-overlay" id="loadingOverlay" style="display: none;"><div class="spinner"></div></div>
+  <div class="loading-overlay" id="loadingOverlay" style="display: none;"><div class="spinner"></div><div id="loadingMsg" style="color:#fff;margin-top:12px;font-size:14px;"></div></div>
 
   <script>
     let currentPath = '/';
+    let currentView = 'files';
     let currentReader = null;
     let readerSaveTimer = null;
     const selectedItems = new Map();
+    const favoritePaths = new Set();
     let folderSearchTimer = null;
     let folderSearchRequestId = 0;
+    let globalSearchTimer = null;
+    let globalSearchRequestId = 0;
     const ACTION_ICONS = {
       download: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>',
       share: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 10.6l6.8-4.2"/><path d="M8.6 13.4l6.8 4.2"/></svg>',
       rename: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
-      delete: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>'
+      delete: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>',
+      favorite: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5l2.8 5.7 6.3.9-4.5 4.4 1.1 6.3-5.7-3-5.7 3 1.1-6.3-4.5-4.4 6.3-.9Z"/></svg>',
+      favoriteOn: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5l2.8 5.7 6.3.9-4.5 4.4 1.1 6.3-5.7-3-5.7 3 1.1-6.3-4.5-4.4 6.3-.9Z"/></svg>'
     };
 
     function encodePathForUrl(path) {
@@ -4580,15 +4435,27 @@ const FIXED_INDEX_PAGE = `
       try {
         const response = await fetch('/api/auth/check');
         const data = await response.json();
-        if (!data.authenticated) {
-          window.location.href = '/login.html';
+        if (!data.authenticated) { window.location.href = '/login.html'; return; }
+        const initResp = await fetch('/api/d1/init');
+        const initData = await initResp.json();
+        if (initData.initialized) {
+          const msg = document.getElementById('loadingMsg');
+          msg.textContent = '正在初始化数据库...';
+          document.getElementById('loadingOverlay').style.display = 'flex';
+          await new Promise(r => setTimeout(r, 600));
+          document.getElementById('loadingOverlay').style.display = 'none';
+          msg.textContent = '';
         }
       } catch (error) {
         window.location.href = '/login.html';
       }
     }
 
-    async function loadFiles() {
+    async function loadFiles(options) {
+      const searchRequestId = options && options.searchRequestId;
+      if (searchRequestId && searchRequestId !== globalSearchRequestId) return;
+      currentView = 'files';
+      updateViewTabs();
       showLoading(true);
       try {
         const response = await fetch(apiFileUrl('/api/files', currentPath));
@@ -4600,9 +4467,13 @@ const FIXED_INDEX_PAGE = `
           }
           throw new Error(data.message || '加载失败');
         }
+        if (searchRequestId && searchRequestId !== globalSearchRequestId) return;
         currentPath = data.currentPath || currentPath;
         clearSelection(false);
+        await loadFavoritePaths();
+        if (searchRequestId && searchRequestId !== globalSearchRequestId) return;
         renderBreadcrumb();
+        document.getElementById('viewTitle').textContent = '当前目录';
         renderFiles(data.folders || [], data.files || []);
       } catch (error) {
         showToast('加载文件失败: ' + error.message, 'error');
@@ -4611,23 +4482,171 @@ const FIXED_INDEX_PAGE = `
       }
     }
 
-    async function refreshCurrentDirectory() {
+    function updateViewTabs() {
+      document.querySelectorAll('.view-tab').forEach(function (tab) {
+        tab.classList.toggle('active', tab.dataset.view === currentView);
+      });
+      document.getElementById('batchToolbar').classList.toggle('active', currentView === 'files' && selectedItems.size > 0);
+    }
+
+    async function switchMainView(view) {
+      if (view === 'files') {
+        await loadFiles();
+        return;
+      }
+      currentView = view;
+      updateViewTabs();
+      clearSelection(false);
+      if (view === 'favorites') {
+        await loadFavoritesView();
+      } else if (view === 'recent') {
+        await loadRecentView();
+      }
+    }
+
+    async function loadFavoritePaths() {
+      try {
+        const response = await fetch('/api/favorites?limit=500');
+        const data = await response.json();
+        favoritePaths.clear();
+        if (data.success) {
+          (data.favorites || []).forEach(function (item) {
+            favoritePaths.add(item.path);
+          });
+        }
+      } catch (error) {
+        console.warn('Favorites load failed:', error);
+      }
+    }
+
+    async function loadFavoritesView() {
       showLoading(true);
       try {
-        const response = await fetch('/api/cache/refresh', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: currentPath })
-        });
+        const response = await fetch('/api/favorites?limit=500');
         const data = await response.json();
-        if (!data.success) {
-          throw new Error(data.message || '刷新失败');
+        if (!data.success) throw new Error(data.message || '加载失败');
+        favoritePaths.clear();
+        (data.favorites || []).forEach(function (item) {
+          favoritePaths.add(item.path);
+        });
+        document.getElementById('viewTitle').textContent = '收藏';
+        renderItemList(data.favorites || [], '暂无收藏');
+      } catch (error) {
+        showToast('加载收藏失败: ' + error.message, 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    async function loadRecentView() {
+      showLoading(true);
+      try {
+        await loadFavoritePaths();
+        const response = await fetch('/api/recent?limit=100');
+        const data = await response.json();
+        if (!data.success) throw new Error(data.message || '加载失败');
+        document.getElementById('viewTitle').textContent = '最近访问';
+        renderItemList(data.recent || [], '暂无最近访问');
+      } catch (error) {
+        showToast('加载最近访问失败: ' + error.message, 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    function handleSearchKey(event) {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        if (globalSearchTimer) {
+          clearTimeout(globalSearchTimer);
+          globalSearchTimer = null;
         }
+        runSearch(false);
+      }
+    }
+
+    function handleSearchInput() {
+      scheduleGlobalSearch(0);
+    }
+
+    function handleSearchTypeChange() {
+      scheduleGlobalSearch(0);
+    }
+
+    function scheduleGlobalSearch(delay) {
+      if (globalSearchTimer) {
+        clearTimeout(globalSearchTimer);
+        globalSearchTimer = null;
+      }
+
+      const q = document.getElementById('globalSearchInput').value.trim();
+      if (!q) {
+        const requestId = ++globalSearchRequestId;
+        loadFiles({ searchRequestId: requestId });
+        return;
+      }
+
+      globalSearchTimer = window.setTimeout(function () {
+        globalSearchTimer = null;
+        runSearch(false);
+      }, delay);
+    }
+
+    async function runSearch(refresh) {
+      const q = document.getElementById('globalSearchInput').value.trim();
+      if (!q) {
+        const requestId = ++globalSearchRequestId;
+        await loadFiles({ searchRequestId: requestId });
+        return;
+      }
+
+      const requestId = ++globalSearchRequestId;
+      currentView = 'search';
+      updateViewTabs();
+      clearSelection(false);
+      if (refresh) showLoading(true);
+      try {
+        await loadFavoritePaths();
+        const type = document.getElementById('globalSearchType').value;
+        const response = await fetch('/api/search?q=' + encodeURIComponent(q) + '&type=' + encodeURIComponent(type) + '&limit=200&refresh=' + (refresh ? '1' : '0'));
+        const data = await response.json();
+        if (requestId !== globalSearchRequestId) return;
+        if (!data.success) throw new Error(data.message || '搜索失败');
+        document.getElementById('viewTitle').textContent = refresh ? '搜索结果（索引已刷新）' : '搜索结果';
+        renderItemList(data.items || [], '没有匹配的项目');
+        if (data.refresh) {
+          showToast('索引已刷新，共 ' + data.refresh.count + ' 项', 'success');
+        }
+      } catch (error) {
+        if (requestId !== globalSearchRequestId) return;
+        showToast('搜索失败: ' + error.message, 'error');
+      } finally {
+        if (refresh) showLoading(false);
+      }
+    }
+
+    async function refreshCurrentDirectory() {
+      currentView = 'files';
+      updateViewTabs();
+      showLoading(true);
+      try {
+        const [cacheResp, indexResp] = await Promise.all([
+          fetch('/api/cache/refresh', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: currentPath })
+          }),
+          fetch('/api/search?q=&type=all&limit=1&refresh=1')
+        ]);
+        const data = await cacheResp.json();
+        if (!data.success) throw new Error(data.message || '刷新失败');
         currentPath = data.currentPath || currentPath;
         clearSelection(false);
+        await loadFavoritePaths();
         renderBreadcrumb();
+        document.getElementById('viewTitle').textContent = '当前目录';
         renderFiles(data.folders || [], data.files || []);
-        showToast('已刷新当前目录', 'success');
+        showToast('已刷新目录和索引', 'success');
       } catch (error) {
         showToast('刷新失败: ' + error.message, 'error');
       } finally {
@@ -4684,6 +4703,7 @@ const FIXED_INDEX_PAGE = `
 
       if (folders.length === 0 && files.length === 0) {
         emptyState.style.display = 'block';
+        emptyState.querySelector('div:last-child').textContent = '此文件夹为空';
         return;
       }
 
@@ -4692,6 +4712,7 @@ const FIXED_INDEX_PAGE = `
         fileList.appendChild(createFileCard({
           name: folder.name,
           path: folder.path,
+          itemType: 'folder',
           typeLabel: '📁',
           meta: '文件夹',
           isFolder: true
@@ -4702,10 +4723,39 @@ const FIXED_INDEX_PAGE = `
         fileList.appendChild(createFileCard({
           name: file.name,
           path: file.path,
+          itemType: 'file',
           typeLabel: getFileIcon(file.name),
           meta: file.sizeFormatted || '',
+          sizeFormatted: file.sizeFormatted || '',
           previewType: file.previewType || '',
           isFolder: false
+        }));
+      });
+    }
+
+    function renderItemList(items, emptyMessage) {
+      const fileList = document.getElementById('fileList');
+      const emptyState = document.getElementById('emptyState');
+      fileList.replaceChildren();
+
+      if (!items || items.length === 0) {
+        emptyState.style.display = 'block';
+        emptyState.querySelector('div:last-child').textContent = emptyMessage || '暂无项目';
+        return;
+      }
+
+      emptyState.style.display = 'none';
+      items.forEach(function (item) {
+        const isFolder = item.itemType === 'folder' || item.item_type === 'folder' || item.isFolder;
+        fileList.appendChild(createFileCard({
+          name: item.name,
+          path: item.path,
+          itemType: isFolder ? 'folder' : 'file',
+          typeLabel: isFolder ? '📁' : getFileIcon(item.name),
+          meta: isFolder ? '文件夹' : (item.sizeFormatted || ''),
+          sizeFormatted: item.sizeFormatted || '',
+          previewType: item.previewType || '',
+          isFolder
         }));
       });
     }
@@ -4766,6 +4816,9 @@ const FIXED_INDEX_PAGE = `
 
       const actions = document.createElement('div');
       actions.className = 'file-actions';
+      actions.appendChild(createActionButton(favoritePaths.has(item.path) ? 'favoriteOn' : 'favorite', favoritePaths.has(item.path) ? '取消收藏' : '收藏', favoritePaths.has(item.path) ? 'btn-primary' : 'btn-secondary', function () {
+        toggleFavorite(item);
+      }));
       if (!item.isFolder) {
         actions.appendChild(createActionButton('download', '下载', 'btn-secondary', function () {
           downloadFile(item.path);
@@ -4779,8 +4832,8 @@ const FIXED_INDEX_PAGE = `
         actions.appendChild(createActionButton('delete', '删除', 'btn-danger', function () {
           deleteFile(item.path);
         }));
-        card.appendChild(actions);
       }
+      card.appendChild(actions);
       return card;
     }
 
@@ -4796,6 +4849,45 @@ const FIXED_INDEX_PAGE = `
         handler();
       });
       return button;
+    }
+
+    async function toggleFavorite(item) {
+      const isFavorite = favoritePaths.has(item.path);
+      try {
+        const response = await fetch('/api/favorites', {
+          method: isFavorite ? 'DELETE' : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            path: item.path,
+            name: item.name,
+            itemType: item.isFolder ? 'folder' : 'file',
+            sizeFormatted: item.sizeFormatted || item.meta || '',
+            previewType: item.previewType || ''
+          })
+        });
+        const data = await response.json();
+        if (!data.success) throw new Error(data.message || '操作失败');
+        if (isFavorite) {
+          favoritePaths.delete(item.path);
+          showToast('已取消收藏', 'success');
+          if (currentView === 'favorites') {
+            await loadFavoritesView();
+            return;
+          }
+        } else {
+          favoritePaths.add(item.path);
+          showToast('已收藏', 'success');
+        }
+        if (currentView === 'files') {
+          await loadFiles();
+        } else if (currentView === 'recent') {
+          await loadRecentView();
+        } else if (currentView === 'search') {
+          await runSearch(false);
+        }
+      } catch (error) {
+        showToast('收藏操作失败: ' + error.message, 'error');
+      }
     }
 
     function toggleItemSelection(item, checked, card) {
@@ -4850,7 +4942,7 @@ const FIXED_INDEX_PAGE = `
       const selectAll = document.getElementById('selectAllCheckbox');
       const total = document.querySelectorAll('.file-select').length;
 
-      toolbar.classList.toggle('active', count > 0);
+      toolbar.classList.toggle('active', currentView === 'files' && count > 0);
       selectedCount.textContent = String(count);
       selectAll.checked = total > 0 && count === total;
       selectAll.indeterminate = count > 0 && count < total;
@@ -5545,7 +5637,9 @@ const FIXED_INDEX_PAGE = `
         });
         const data = await response.json();
         if (data.success) {
-          document.getElementById('shareResultUrl').value = window.location.origin + data.shareUrl;
+          const fullUrl = window.location.origin + data.shareUrl;
+          document.getElementById('shareResultUrl').value = fullUrl;
+          renderShareQr(fullUrl);
           document.getElementById('shareResultModal').classList.add('active');
         } else {
           showToast('创建分享链接失败: ' + (data.message || '未知错误'), 'error');
@@ -5572,6 +5666,207 @@ const FIXED_INDEX_PAGE = `
         document.execCommand('copy');
         showToast('链接已复制', 'success');
       }
+    }
+
+    function renderShareQr(text) {
+      const canvas = document.getElementById('shareQrCanvas');
+      if (!canvas) return;
+      try {
+        const qr = createQrMatrix(text);
+        const ctx = canvas.getContext('2d');
+        const quiet = 4;
+        const scale = Math.max(1, Math.floor(canvas.width / (qr.size + quiet * 2)));
+        const imageSize = (qr.size + quiet * 2) * scale;
+        const offset = Math.floor((canvas.width - imageSize) / 2);
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#000000';
+        for (let y = 0; y < qr.size; y++) {
+          for (let x = 0; x < qr.size; x++) {
+            if (qr.matrix[y][x]) {
+              ctx.fillRect(offset + (x + quiet) * scale, offset + (y + quiet) * scale, scale, scale);
+            }
+          }
+        }
+      } catch (error) {
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#111111';
+        ctx.font = '12px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('链接过长', canvas.width / 2, canvas.height / 2);
+      }
+    }
+
+    function createQrMatrix(text) {
+      const version = 6;
+      const size = 17 + version * 4;
+      const dataCodewords = 136;
+      const blockCount = 2;
+      const blockDataCodewords = 68;
+      const eccCodewords = 18;
+      const bytes = Array.from(new TextEncoder().encode(text));
+      const bits = [];
+
+      function pushBits(value, length) {
+        for (let i = length - 1; i >= 0; i--) {
+          bits.push((value >>> i) & 1);
+        }
+      }
+
+      if (bytes.length > dataCodewords - 3) {
+        throw new Error('QR payload too long');
+      }
+
+      pushBits(4, 4);
+      pushBits(bytes.length, 8);
+      bytes.forEach(function (byte) {
+        pushBits(byte, 8);
+      });
+
+      const capacityBits = dataCodewords * 8;
+      for (let i = 0; i < 4 && bits.length < capacityBits; i++) bits.push(0);
+      while (bits.length % 8 !== 0) bits.push(0);
+
+      const data = [];
+      for (let i = 0; i < bits.length; i += 8) {
+        let value = 0;
+        for (let j = 0; j < 8; j++) value = (value << 1) | bits[i + j];
+        data.push(value);
+      }
+      for (let pad = 0xec; data.length < dataCodewords; pad ^= 0xec ^ 0x11) {
+        data.push(pad);
+      }
+
+      const blocks = [];
+      for (let block = 0; block < blockCount; block++) {
+        const blockData = data.slice(block * blockDataCodewords, (block + 1) * blockDataCodewords);
+        blocks.push({ data: blockData, ecc: reedSolomonCompute(blockData, eccCodewords) });
+      }
+
+      const codewords = [];
+      for (let i = 0; i < blockDataCodewords; i++) {
+        for (let block = 0; block < blockCount; block++) codewords.push(blocks[block].data[i]);
+      }
+      for (let i = 0; i < eccCodewords; i++) {
+        for (let block = 0; block < blockCount; block++) codewords.push(blocks[block].ecc[i]);
+      }
+
+      const matrix = Array.from({ length: size }, function () { return Array(size).fill(false); });
+      const isFunction = Array.from({ length: size }, function () { return Array(size).fill(false); });
+
+      function setModule(x, y, dark, func) {
+        if (x < 0 || y < 0 || x >= size || y >= size) return;
+        matrix[y][x] = !!dark;
+        if (func) isFunction[y][x] = true;
+      }
+
+      function drawFinder(cx, cy) {
+        for (let dy = -4; dy <= 4; dy++) {
+          for (let dx = -4; dx <= 4; dx++) {
+            const dist = Math.max(Math.abs(dx), Math.abs(dy));
+            setModule(cx + dx, cy + dy, dist !== 2 && dist <= 3, true);
+          }
+        }
+      }
+
+      function drawAlignment(cx, cy) {
+        for (let dy = -2; dy <= 2; dy++) {
+          for (let dx = -2; dx <= 2; dx++) {
+            const dist = Math.max(Math.abs(dx), Math.abs(dy));
+            setModule(cx + dx, cy + dy, dist === 2 || dist === 0, true);
+          }
+        }
+      }
+
+      function drawFormat(mask) {
+        const bits = getFormatBits(1, mask);
+        for (let i = 0; i <= 5; i++) setModule(8, i, ((bits >>> i) & 1) !== 0, true);
+        setModule(8, 7, ((bits >>> 6) & 1) !== 0, true);
+        setModule(8, 8, ((bits >>> 7) & 1) !== 0, true);
+        setModule(7, 8, ((bits >>> 8) & 1) !== 0, true);
+        for (let i = 9; i < 15; i++) setModule(14 - i, 8, ((bits >>> i) & 1) !== 0, true);
+        for (let i = 0; i < 8; i++) setModule(size - 1 - i, 8, ((bits >>> i) & 1) !== 0, true);
+        for (let i = 8; i < 15; i++) setModule(8, size - 15 + i, ((bits >>> i) & 1) !== 0, true);
+        setModule(8, size - 8, true, true);
+      }
+
+      drawFinder(3, 3);
+      drawFinder(size - 4, 3);
+      drawFinder(3, size - 4);
+      for (let i = 8; i < size - 8; i++) {
+        setModule(6, i, i % 2 === 0, true);
+        setModule(i, 6, i % 2 === 0, true);
+      }
+      drawAlignment(34, 34);
+      drawFormat(0);
+
+      let bitIndex = 0;
+      let upward = true;
+      for (let right = size - 1; right >= 1; right -= 2) {
+        if (right === 6) right--;
+        for (let vertical = 0; vertical < size; vertical++) {
+          const y = upward ? size - 1 - vertical : vertical;
+          for (let j = 0; j < 2; j++) {
+            const x = right - j;
+            if (isFunction[y][x]) continue;
+            let dark = false;
+            if (bitIndex < codewords.length * 8) {
+              dark = ((codewords[Math.floor(bitIndex / 8)] >>> (7 - (bitIndex % 8))) & 1) !== 0;
+            }
+            bitIndex++;
+            if ((x + y) % 2 === 0) dark = !dark;
+            setModule(x, y, dark, false);
+          }
+        }
+        upward = !upward;
+      }
+      drawFormat(0);
+      return { size: size, matrix: matrix };
+    }
+
+    function getFormatBits(ecl, mask) {
+      let data = (ecl << 3) | mask;
+      let bits = data << 10;
+      for (let i = 14; i >= 10; i--) {
+        if (((bits >>> i) & 1) !== 0) {
+          bits ^= 0x537 << (i - 10);
+        }
+      }
+      return ((data << 10) | bits) ^ 0x5412;
+    }
+
+    function reedSolomonCompute(data, degree) {
+      const divisor = Array(degree).fill(0);
+      divisor[degree - 1] = 1;
+      let root = 1;
+      for (let i = 0; i < degree; i++) {
+        for (let j = 0; j < degree; j++) {
+          divisor[j] = gfMultiply(divisor[j], root);
+          if (j + 1 < degree) divisor[j] ^= divisor[j + 1];
+        }
+        root = gfMultiply(root, 2);
+      }
+
+      const result = Array(degree).fill(0);
+      data.forEach(function (byte) {
+        const factor = byte ^ result.shift();
+        result.push(0);
+        for (let i = 0; i < degree; i++) {
+          result[i] ^= gfMultiply(divisor[i], factor);
+        }
+      });
+      return result;
+    }
+
+    function gfMultiply(x, y) {
+      let z = 0;
+      for (let i = 7; i >= 0; i--) {
+        z = (z << 1) ^ ((z >>> 7) * 0x11d);
+        if (((y >>> i) & 1) !== 0) z ^= x;
+      }
+      return z & 0xff;
     }
 
     async function logout() {
@@ -6111,6 +6406,14 @@ export default {
       if (path.startsWith('/api/')) {
         // Auth routes
         if (path === '/api/login' && method === 'POST') {
+          try {
+            await ensureD1Schema(env);
+          } catch (error) {
+            return jsonResponse({
+              success: false,
+              message: 'D1 初始化失败，请确认已绑定 D1_DB: ' + error.message
+            }, 500);
+          }
           return await handleLogin(request, env);
         }
         
@@ -6122,8 +6425,29 @@ export default {
           return await handleCheckAuth(request, env);
         }
 
+        if (path === '/api/d1/init' && method === 'GET') {
+          const auth = await verifyAuth(request, env);
+          if (!auth) return jsonResponse({ success: false }, 401);
+          const alreadyReady = d1SchemaReady || (env.KV_STORE ? await env.KV_STORE.get(D1_SCHEMA_KV_KEY) : null);
+          if (alreadyReady) return jsonResponse({ success: true, initialized: false });
+          await ensureD1Schema(env);
+          return jsonResponse({ success: true, initialized: true });
+        }
+
         if (path === '/api/cache/refresh' && method === 'POST') {
           return await handleRefreshDirectoryCache(request, env);
+        }
+
+        if (path === '/api/search' && method === 'GET') {
+          return await handleSearch(request, env);
+        }
+
+        if (path === '/api/favorites' && ['GET', 'POST', 'DELETE'].includes(method)) {
+          return await handleFavorites(request, env);
+        }
+
+        if (path === '/api/recent' && ['GET', 'POST'].includes(method)) {
+          return await handleRecent(request, env);
         }
 
         if (path === '/api/reader/progress' && method === 'GET') {
