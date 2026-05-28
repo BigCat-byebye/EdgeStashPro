@@ -6655,11 +6655,15 @@ const FIXED_INDEX_PAGE = `
       }
     }
 
+    function isBatchSelectionView() {
+      return ['files', 'search', 'favorites', 'recent'].includes(currentView);
+    }
+
     function updateViewTabs() {
       document.querySelectorAll('.view-tab').forEach(function (tab) {
         tab.classList.toggle('active', tab.dataset.view === currentView);
       });
-      document.getElementById('batchToolbar').classList.toggle('active', currentView === 'files' && selectedItems.size > 0);
+      document.getElementById('batchToolbar').classList.toggle('active', isBatchSelectionView() && selectedItems.size > 0);
     }
 
     async function switchMainView(view) {
@@ -7107,7 +7111,7 @@ const FIXED_INDEX_PAGE = `
       const selectAll = document.getElementById('selectAllCheckbox');
       const total = document.querySelectorAll('.file-select').length;
 
-      toolbar.classList.toggle('active', currentView === 'files' && count > 0);
+      toolbar.classList.toggle('active', isBatchSelectionView() && count > 0);
       selectedCount.textContent = String(count);
       selectAll.checked = total > 0 && count === total;
       selectAll.indeterminate = count > 0 && count < total;
@@ -7730,7 +7734,7 @@ const FIXED_INDEX_PAGE = `
 
       batchTaskOriginElement = lastTaskOriginElement;
       document.getElementById('batchOperation').value = operation;
-      document.getElementById('batchDestinationPath').value = currentPath;
+      document.getElementById('batchDestinationPath').value = currentView === 'files' ? currentPath : '/';
       document.getElementById('batchFolderSearch').value = '';
       clearBatchFolderSearchResults();
       document.getElementById('batchTargetTitle').textContent = operation === 'copy' ? '复制到' : '移动到';
