@@ -1,5 +1,5 @@
 /**
- * EdgeStash - Cloudflare-based Cloud Drive
+ * EdgeStashPro - Cloudflare-based Cloud Drive
  * 
  * A complete cloud storage solution built on Cloudflare Worker, R2, and KV.
  * 
@@ -132,7 +132,7 @@ async function verifyTotp(secret, token) {
 }
 
 function createOtpUri(secret) {
-  const issuer = 'EdgeStash';
+  const issuer = 'EdgeStashPro';
   const label = `${issuer}:admin`;
   return `otpauth://totp/${encodeURIComponent(label)}?secret=${encodeURIComponent(secret)}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`;
 }
@@ -812,18 +812,22 @@ async function handleListFiles(request, env, path) {
     }
 
     if (cached) {
+      const folders = await mergeSearchItemTags(env, await filterItemsByPermission(env, auth, cached.folders || [], 'view'));
+      const files = await mergeSearchItemTags(env, await filterItemsByPermission(env, auth, cached.files || [], 'view'));
       return jsonResponse({
         ...cached,
-        folders: await filterItemsByPermission(env, auth, cached.folders || [], 'view'),
-        files: await filterItemsByPermission(env, auth, cached.files || [], 'view')
+        folders,
+        files
       });
     }
 
     const fresh = await refreshDirectoryCache(env, currentPath);
+    const folders = await mergeSearchItemTags(env, await filterItemsByPermission(env, auth, fresh.folders || [], 'view'));
+    const files = await mergeSearchItemTags(env, await filterItemsByPermission(env, auth, fresh.files || [], 'view'));
     return jsonResponse({
       ...fresh,
-      folders: await filterItemsByPermission(env, auth, fresh.folders || [], 'view'),
-      files: await filterItemsByPermission(env, auth, fresh.files || [], 'view')
+      folders,
+      files
     });
   } catch (e) {
     return jsonResponse({ success: false, message: '获取文件列表失败: ' + e.message }, 500);
@@ -845,10 +849,12 @@ async function handleRefreshDirectoryCache(request, env) {
     }
 
     const refreshed = await refreshDirectoryCache(env, currentPath);
+    const folders = await mergeSearchItemTags(env, await filterItemsByPermission(env, auth, refreshed.folders || [], 'view'));
+    const files = await mergeSearchItemTags(env, await filterItemsByPermission(env, auth, refreshed.files || [], 'view'));
     return jsonResponse({
       ...refreshed,
-      folders: await filterItemsByPermission(env, auth, refreshed.folders || [], 'view'),
-      files: await filterItemsByPermission(env, auth, refreshed.files || [], 'view')
+      folders,
+      files
     });
   } catch (e) {
     return jsonResponse({ success: false, message: '刷新缓存失败: ' + e.message }, 500);
@@ -875,19 +881,28 @@ async function handleUploadFile(request, env, path) {
     let filePath = path || '';
     if (filePath.startsWith('/')) filePath = filePath.slice(1);
     if (filePath && !filePath.endsWith('/')) filePath += '/';
-    
-    const key = filePath + file.name;
-    
+
+    // Some browsers (notably Chrome's webkitdirectory uploads) put the relative
+    // path into the multipart filename, so file.name can be e.g. "util/index.js".
+    // Always reduce it to a basename to avoid duplicating the parent prefix.
+    const rawName = (file.name || '').replace(/\\/g, '/');
+    const baseName = rawName.split('/').filter(Boolean).pop() || '';
+    if (!baseName) {
+      return jsonResponse({ success: false, message: '文件名无效' }, 400);
+    }
+
+    const key = filePath + baseName;
+
     await env.R2_BUCKET.put(key, file.stream(), {
-      httpMetadata: { contentType: file.type || getMimeType(file.name) }
+      httpMetadata: { contentType: file.type || getMimeType(baseName) }
     });
 
     await syncFileCacheIfParentCached(env, key, {
       size: file.size || 0,
-      contentType: file.type || getMimeType(file.name),
+      contentType: file.type || getMimeType(baseName),
       lastModified: new Date().toISOString()
     });
-    
+
     return jsonResponse({ success: true, message: '文件上传成功', path: '/' + key });
   } catch (e) {
     return jsonResponse({ success: false, message: '文件上传失败: ' + e.message }, 500);
@@ -1297,6 +1312,12 @@ async function getTaskForAuth(env, auth, taskId) {
 async function updateTaskStatus(env, taskId, status, fields = {}) {
   const now = Date.now();
   const completedAt = ['succeeded', 'failed', 'canceled'].includes(status) ? now : null;
+  // 注意：error_message / result_json 使用 CASE 表达式区分"未传"和"显式置空"。
+  // 调用方未传该字段时保留旧值；显式传 null 才清空。
+  // 此前直接 ?, ? 绑定会导致只传 status 的更新把这两列抹成 NULL，
+  // 例如批量下载任务的 items 存在 result_json 中，被覆盖后 /api/tasks/:id/download 拿到 items=[] 失败。
+  const errorMessageProvided = Object.prototype.hasOwnProperty.call(fields, 'errorMessage');
+  const resultProvided = Object.prototype.hasOwnProperty.call(fields, 'result');
   await env.D1_DB.prepare(`
     UPDATE file_tasks
     SET status = ?,
@@ -1304,8 +1325,8 @@ async function updateTaskStatus(env, taskId, status, fields = {}) {
         total_bytes = COALESCE(?, total_bytes),
         processed_items = COALESCE(?, processed_items),
         total_items = COALESCE(?, total_items),
-        error_message = ?,
-        result_json = ?,
+        error_message = CASE WHEN ? = 1 THEN ? ELSE error_message END,
+        result_json = CASE WHEN ? = 1 THEN ? ELSE result_json END,
         updated_at = ?,
         completed_at = COALESCE(?, completed_at)
     WHERE id = ?
@@ -1315,8 +1336,10 @@ async function updateTaskStatus(env, taskId, status, fields = {}) {
     fields.totalBytes ?? null,
     fields.processedItems ?? null,
     fields.totalItems ?? null,
-    fields.errorMessage ?? null,
-    fields.result ? JSON.stringify(fields.result) : null,
+    errorMessageProvided ? 1 : 0,
+    errorMessageProvided ? (fields.errorMessage ?? null) : null,
+    resultProvided ? 1 : 0,
+    resultProvided ? (fields.result ? JSON.stringify(fields.result) : null) : null,
     now,
     completedAt,
     taskId
@@ -1682,14 +1705,20 @@ async function handleUpdateTaskProgress(request, env, taskId) {
     const status = body.status && ['queued', 'running', 'succeeded', 'failed', 'canceled'].includes(body.status)
       ? body.status
       : task.status;
-    await updateTaskStatus(env, taskId, status, {
+    // 只把客户端实际带上来的字段塞进 fields，避免误把 result_json/error_message 抹空。
+    const updateFields = {
       processedBytes: Number.isFinite(Number(body.processedBytes)) ? Math.max(0, Math.floor(Number(body.processedBytes))) : null,
       totalBytes: Number.isFinite(Number(body.totalBytes)) ? Math.max(0, Math.floor(Number(body.totalBytes))) : null,
       processedItems: Number.isFinite(Number(body.processedItems)) ? Math.max(0, Math.floor(Number(body.processedItems))) : null,
-      totalItems: Number.isFinite(Number(body.totalItems)) ? Math.max(0, Math.floor(Number(body.totalItems))) : null,
-      errorMessage: body.errorMessage || null,
-      result: body.result || null
-    });
+      totalItems: Number.isFinite(Number(body.totalItems)) ? Math.max(0, Math.floor(Number(body.totalItems))) : null
+    };
+    if (Object.prototype.hasOwnProperty.call(body, 'errorMessage')) {
+      updateFields.errorMessage = body.errorMessage || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'result')) {
+      updateFields.result = body.result || null;
+    }
+    await updateTaskStatus(env, taskId, status, updateFields);
 
     const updated = await getTaskForAuth(env, auth, taskId);
     return jsonResponse({ success: true, task: taskRowToClient(updated) });
@@ -2104,20 +2133,6 @@ function addZipEntry(entries, usedNames, entry) {
   entries.push({ ...entry, name, nameBytes });
 }
 
-function calculateZipContentLength(entries) {
-  let total = 22;
-  for (const entry of entries) {
-    const nameLength = entry.nameBytes.length;
-    const dataLength = entry.isDirectory ? 0 : Number(entry.size || 0);
-    total += 30 + nameLength + dataLength + (entry.isDirectory ? 0 : 16);
-    total += 46 + nameLength;
-  }
-  if (total > 0xffffffff) {
-    throw new Error('打包文件过大，暂不支持超过 4GB 的 zip');
-  }
-  return total;
-}
-
 async function collectBatchDownloadEntries(env, items) {
   const entries = [];
   const usedNames = new Set();
@@ -2291,13 +2306,18 @@ async function createBatchDownloadResponse(env, auth, items) {
   }
 
   const entries = await collectBatchDownloadEntries(env, items);
-  const filename = 'edgestash-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.zip';
+  const filename = 'edgestashpro-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.zip';
 
+  // 注意：不要预先设置 Content-Length。
+  // zip 的字节是在 createZipStream 边读 R2 边算 CRC/size 的过程中动态生成的，
+  // 若用 head()/list() 返回的 size 预先计算并写入 Content-Length，一旦与真实流出的字节数有任何
+  // 偏差（例如 R2 索引与对象间瞬时不一致、搜索结果跨目录、文件在 head 之后被修改等），
+  // 浏览器就会按 Content-Length 截断响应，得到一个"损坏/截断"的 zip。
+  // 让 Cloudflare 用 Transfer-Encoding: chunked 输出即可，少了进度百分比但保证不会被截断。
   return new Response(createZipStream(env, entries), {
     headers: {
       'Content-Type': 'application/zip',
-      'Content-Disposition': createAttachmentDisposition(filename),
-      'Content-Length': String(calculateZipContentLength(entries))
+      'Content-Disposition': createAttachmentDisposition(filename)
     }
   });
 }
@@ -3423,6 +3443,7 @@ async function handleAdminListResources(request, env) {
 
 let d1SchemaReady = false;
 const D1_SCHEMA_KV_KEY = 'd1:schema:v1';
+const D1_SCHEMA_TAGS_KV_KEY = 'd1:schema:v2-tags';
 
 async function ensureD1Schema(env) {
   if (!env.D1_DB) throw new Error('D1_DB binding 未配置');
@@ -3439,6 +3460,7 @@ async function ensureD1Schema(env) {
       size_formatted TEXT,
       preview_type TEXT,
       last_modified TEXT,
+      tags TEXT NOT NULL DEFAULT '[]',
       indexed_at INTEGER NOT NULL
     )`,
     'CREATE INDEX IF NOT EXISTS idx_search_items_type ON search_items(item_type)',
@@ -3501,6 +3523,16 @@ async function ensureD1Schema(env) {
 
   for (const statement of ddlStatements) {
     await env.D1_DB.prepare(statement).run();
+  }
+
+  const tagsReady = env.KV_STORE ? await env.KV_STORE.get(D1_SCHEMA_TAGS_KV_KEY) : null;
+  if (!tagsReady) {
+    const tableInfo = await env.D1_DB.prepare('PRAGMA table_info(search_items)').all();
+    const hasTags = (tableInfo.results || []).some(row => row.name === 'tags');
+    if (!hasTags) {
+      await env.D1_DB.prepare("ALTER TABLE search_items ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'").run();
+    }
+    if (env.KV_STORE) await env.KV_STORE.put(D1_SCHEMA_TAGS_KV_KEY, '1');
   }
 
   if (!kvReady && env.KV_STORE) await env.KV_STORE.put(D1_SCHEMA_KV_KEY, '1');
@@ -3793,6 +3825,27 @@ async function filterItemsByPermission(env, auth, items, action = 'view') {
   return allowed;
 }
 
+async function mergeSearchItemTags(env, items) {
+  if (!env.D1_DB || !Array.isArray(items) || items.length === 0) return items || [];
+  await ensureD1Schema(env);
+  const tagMap = new Map();
+  const paths = items.map(item => normalizeItemPath(item.path || '')).filter(path => path && path !== '/');
+  for (let index = 0; index < paths.length; index += 50) {
+    const chunk = paths.slice(index, index + 50);
+    const placeholders = chunk.map(() => '?').join(',');
+    const rows = await env.D1_DB.prepare(`SELECT path, tags FROM search_items WHERE path IN (${placeholders})`).bind(...chunk).all();
+    for (const row of rows.results || []) {
+      try {
+        const tags = JSON.parse(row.tags || '[]');
+        tagMap.set(row.path, Array.isArray(tags) ? tags.filter(tag => typeof tag === 'string') : []);
+      } catch (error) {
+        tagMap.set(row.path, []);
+      }
+    }
+  }
+  return items.map(item => ({ ...item, tags: tagMap.get(item.path) || [] }));
+}
+
 async function listVirtualPermissionDirectory(env, auth, dirPath) {
   if (!auth || auth.role === 'admin' || !auth.email) return null;
   const currentPath = normalizeDirectoryPath(dirPath);
@@ -3843,6 +3896,13 @@ async function listVirtualPermissionDirectory(env, auth, dirPath) {
 }
 
 function d1RowToClientItem(row) {
+  let tags = [];
+  try {
+    const parsed = JSON.parse(row.tags || '[]');
+    if (Array.isArray(parsed)) tags = parsed.filter(tag => typeof tag === 'string');
+  } catch (error) {
+    tags = [];
+  }
   return {
     path: row.path,
     name: row.name,
@@ -3856,8 +3916,105 @@ function d1RowToClientItem(row) {
     indexedAt: row.indexed_at || null,
     createdAt: row.created_at || null,
     updatedAt: row.updated_at || null,
-    visitedAt: row.visited_at || null
+    visitedAt: row.visited_at || null,
+    tags
   };
+}
+
+function escapeLike(value) {
+  return String(value || '').replace(/[\\%_]/g, match => '\\' + match);
+}
+
+function normalizeTags(input) {
+  if (!Array.isArray(input)) throw new Error('tags 必须是数组');
+  const seen = new Set();
+  const tags = [];
+  for (const raw of input) {
+    const tag = String(raw || '').trim();
+    if (!tag) continue;
+    if (tag.length > 20) throw new Error('单个标签不能超过 20 个字符');
+    if (!seen.has(tag)) {
+      seen.add(tag);
+      tags.push(tag);
+    }
+  }
+  if (tags.length > 20) throw new Error('每个项目最多 20 个标签');
+  return tags.sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
+}
+
+async function handleListTags(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    await ensureD1Schema(env);
+    const rows = await env.D1_DB.prepare("SELECT path, tags FROM search_items WHERE tags IS NOT NULL AND tags != '[]'").all();
+    const counts = new Map();
+    for (const row of rows.results || []) {
+      if (!(await hasPathPermission(env, auth, 'view', row.path))) continue;
+      let tags = [];
+      try {
+        const parsed = JSON.parse(row.tags || '[]');
+        if (Array.isArray(parsed)) tags = parsed;
+      } catch (error) {
+        tags = [];
+      }
+      for (const tag of tags) {
+        if (typeof tag !== 'string' || !tag) continue;
+        counts.set(tag, (counts.get(tag) || 0) + 1);
+      }
+    }
+    const tags = Array.from(counts.entries())
+      .map(([tag, count]) => ({ tag, count }))
+      .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag, 'zh-Hans-CN'));
+    return jsonResponse({ success: true, tags });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '读取标签失败: ' + e.message }, 500);
+  }
+}
+
+async function handleUpdateTags(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    await ensureD1Schema(env);
+    const url = new URL(request.url);
+    const path = normalizeItemPath(url.searchParams.get('path') || '');
+    if (!path || path === '/') return jsonResponse({ success: false, message: '请提供有效路径' }, 400);
+    const permissionError = await requirePathPermission(env, auth, 'modify', path);
+    if (permissionError) return permissionError;
+
+    const body = await request.json().catch(() => ({}));
+    const tags = normalizeTags(body.tags || []);
+    const existing = await env.D1_DB.prepare('SELECT * FROM search_items WHERE path = ?').bind(path).first();
+    const now = Date.now();
+    const bodyItemType = body.itemType || body.item_type || (body.isFolder ? 'folder' : '');
+    const itemType = existing?.item_type || (['file', 'folder'].includes(bodyItemType) ? bodyItemType : 'file');
+    const parentPath = existing?.parent_path || parentPathFromItemPath(path);
+    await env.D1_DB.prepare(`
+      INSERT INTO search_items (
+        path, name, item_type, parent_path, size, size_formatted, preview_type, last_modified, tags, indexed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(path) DO UPDATE SET
+        tags = excluded.tags,
+        indexed_at = CASE WHEN search_items.indexed_at IS NULL OR search_items.indexed_at = 0 THEN excluded.indexed_at ELSE search_items.indexed_at END
+    `).bind(
+      path,
+      existing?.name || nameFromItemPath(path),
+      itemType,
+      parentPath,
+      existing?.size || 0,
+      existing?.size_formatted || '',
+      existing?.preview_type || '',
+      existing?.last_modified || null,
+      JSON.stringify(tags),
+      existing?.indexed_at || now
+    ).run();
+    return jsonResponse({ success: true, path, tags });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '保存标签失败: ' + e.message }, 500);
+  }
 }
 
 async function cleanupD1ItemPath(env, path) {
@@ -4028,6 +4185,11 @@ async function handleSearch(request, env) {
     } else if (type === 'folders') {
       clauses.push("item_type = 'folder'");
     }
+    const tagFilters = url.searchParams.getAll('tag').map(tag => tag.trim()).filter(Boolean);
+    for (const tag of tagFilters) {
+      clauses.push("tags LIKE ? ESCAPE '\\'");
+      params.push('%"' + escapeLike(tag) + '"%');
+    }
 
     const where = clauses.length ? 'WHERE ' + clauses.join(' AND ') : '';
     const results = await env.D1_DB.prepare(`
@@ -4059,7 +4221,9 @@ async function handleFavorites(request, env) {
       const requestedLimit = Number(new URL(request.url).searchParams.get('limit') || 200);
       const limit = Number.isFinite(requestedLimit) ? Math.min(500, Math.max(1, requestedLimit)) : 200;
       const results = await env.D1_DB.prepare(`
-        SELECT * FROM favorites
+        SELECT favorites.*, search_items.tags AS tags
+        FROM favorites
+        LEFT JOIN search_items ON search_items.path = favorites.path
         WHERE owner_key = ?
         ORDER BY updated_at DESC
         LIMIT ?
@@ -4159,7 +4323,9 @@ async function handleRecent(request, env) {
       const requestedLimit = Number(new URL(request.url).searchParams.get('limit') || 100);
       const limit = Number.isFinite(requestedLimit) ? Math.min(200, Math.max(1, requestedLimit)) : 100;
       const results = await env.D1_DB.prepare(`
-        SELECT * FROM recent_items
+        SELECT recent_items.*, search_items.tags AS tags
+        FROM recent_items
+        LEFT JOIN search_items ON search_items.path = recent_items.path
         WHERE owner_key = ?
         ORDER BY visited_at DESC
         LIMIT ?
@@ -4732,6 +4898,10 @@ const CSS_STYLES = `
   .toast-info {
     background: var(--primary);
   }
+
+  .toast-warning {
+    background: var(--warning);
+  }
   
   @keyframes slideIn {
     from {
@@ -5002,6 +5172,51 @@ const CSS_STYLES = `
     font-size: 12px;
     color: var(--text-muted);
     text-align: center;
+  }
+
+  .tag-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    justify-content: center;
+    margin-top: 8px;
+  }
+
+  .tag-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    max-width: 100%;
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+    line-height: 1.3;
+    color: white;
+    overflow: hidden;
+  }
+
+  .tag-chip span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .tag-chip button {
+    width: 16px;
+    height: 16px;
+    border: none;
+    border-radius: 50%;
+    padding: 0;
+    line-height: 1;
+    cursor: pointer;
+    background: rgba(255, 255, 255, 0.22);
+    color: white;
+  }
+
+  .tag-editor-list {
+    justify-content: flex-start;
+    min-height: 30px;
+    margin: 0 0 12px;
   }
   
   .file-actions {
@@ -5484,6 +5699,121 @@ const CSS_STYLES = `
     font-size: 13px;
   }
 
+  .search-tools .tag-filter {
+    position: relative;
+    width: 150px;
+    height: 34px;
+  }
+
+  .tag-filter-trigger {
+    width: 100%;
+    height: 34px;
+    padding: 6px 28px 6px 10px;
+    margin: 0;
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  .tag-filter-trigger #tagFilterLabel {
+    display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: middle;
+    color: var(--text-muted);
+  }
+
+  .tag-filter-trigger.has-selection #tagFilterLabel {
+    color: var(--text);
+  }
+
+  .tag-filter-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 50;
+    width: 240px;
+    max-width: 80vw;
+    background: var(--surface);
+    border: 1px solid var(--surface-light);
+    border-radius: 8px;
+    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.32);
+    overflow: hidden;
+  }
+
+  .tag-filter-menu-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--surface-light);
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  .tag-filter-clear {
+    background: transparent;
+    border: none;
+    color: var(--primary-light);
+    cursor: pointer;
+    font-size: 12px;
+    padding: 2px 4px;
+  }
+
+  .tag-filter-clear:hover {
+    color: var(--primary);
+  }
+
+  .tag-filter-list {
+    max-height: 240px;
+    overflow-y: auto;
+    padding: 4px 0;
+  }
+
+  .tag-filter-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    font-size: 13px;
+    color: var(--text);
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .tag-filter-item:hover {
+    background: var(--surface-light);
+  }
+
+  .tag-filter-item input[type="checkbox"] {
+    margin: 0;
+    accent-color: var(--primary);
+    cursor: pointer;
+  }
+
+  .tag-filter-item .tag-filter-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .tag-filter-item .tag-filter-count {
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+
+  .tag-filter-empty {
+    padding: 16px 12px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+
   .search-tools .btn {
     height: 34px;
     padding: 6px 10px;
@@ -5706,6 +6036,10 @@ const CSS_STYLES = `
       width: 100%;
     }
 
+    .search-tools .tag-filter {
+      width: 100%;
+    }
+
     .search-tools .btn {
       width: 100%;
       padding: 6px 8px;
@@ -5720,14 +6054,14 @@ const FIXED_LOGIN_PAGE = `
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>登录 - EdgeStash</title>
+  <title>登录 - EdgeStashPro</title>
   ${CSS_STYLES}
 </head>
 <body>
   <div class="login-container">
     <div class="login-card">
       <div class="login-header">
-        <div class="login-logo">EdgeStash</div>
+        <div class="login-logo">EdgeStashPro</div>
         <div class="login-subtitle">基于 Cloudflare 的云盘服务</div>
       </div>
 
@@ -6024,7 +6358,7 @@ const FIXED_INDEX_PAGE = `
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>EdgeStash - 云盘</title>
+  <title>EdgeStashPro - 云盘</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
   ${CSS_STYLES}
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
@@ -6032,7 +6366,7 @@ const FIXED_INDEX_PAGE = `
 </head>
 <body>
   <div class="header">
-    <div class="logo">EdgeStash</div>
+    <div class="logo">EdgeStashPro</div>
     <div class="header-actions">
       <button type="button" class="task-chip" id="taskChip" onclick="openTaskPanel()">
         <span class="task-chip-text" id="taskChipText"></span>
@@ -6049,7 +6383,9 @@ const FIXED_INDEX_PAGE = `
     <div class="toolbar">
       <button type="button" class="btn btn-primary" onclick="showNewFolderModal()">📁 新建文件夹</button>
       <button type="button" class="btn btn-primary" onclick="setTaskOrigin(this);document.getElementById('fileInput').click()">📤 上传文件</button>
+      <button type="button" class="btn btn-primary" onclick="setTaskOrigin(this);document.getElementById('folderInput').click()">📁 上传文件夹</button>
       <input type="file" id="fileInput" multiple style="display: none;" onchange="handleFileUpload(event)">
+      <input type="file" id="folderInput" webkitdirectory directory multiple style="display: none;" onchange="handleFolderUpload(event)">
     </div>
 
     <div class="view-toolbar">
@@ -6065,6 +6401,19 @@ const FIXED_INDEX_PAGE = `
           <option value="files">文件</option>
           <option value="folders">文件夹</option>
         </select>
+        <div class="tag-filter" id="tagFilterWrap">
+          <button type="button" id="tagFilterTrigger" class="form-select tag-filter-trigger" onclick="toggleTagFilterMenu(event)" title="按标签筛选" aria-haspopup="listbox" aria-expanded="false">
+            <span id="tagFilterLabel">标签</span>
+          </button>
+          <div id="tagFilterMenu" class="tag-filter-menu" hidden>
+            <div class="tag-filter-menu-head">
+              <span>按标签筛选</span>
+              <button type="button" class="tag-filter-clear" onclick="clearTagFilters()">清除</button>
+            </div>
+            <div id="tagFilterList" class="tag-filter-list"></div>
+            <div id="tagFilterEmpty" class="tag-filter-empty" hidden>暂无标签</div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -6200,6 +6549,25 @@ const FIXED_INDEX_PAGE = `
     </div>
   </div>
 
+  <div class="modal-overlay" id="tagModal">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">编辑标签</div>
+        <button type="button" class="modal-close" onclick="closeModal('tagModal')">&times;</button>
+      </div>
+      <form onsubmit="saveTags(event)">
+        <div class="form-group">
+          <label class="form-label" id="tagItemName"></label>
+          <div class="tag-list tag-editor-list" id="tagEditorList"></div>
+          <input type="text" id="tagInput" class="form-input" maxlength="20" placeholder="输入标签后回车">
+        </div>
+        <input type="hidden" id="tagItemPath">
+        <input type="hidden" id="tagItemType">
+        <button type="submit" class="btn btn-primary" style="width: 100%;">保存</button>
+      </form>
+    </div>
+  </div>
+
   <div class="preview-overlay" id="previewOverlay">
     <div class="preview-header">
       <div class="preview-filename" id="previewFilename"></div>
@@ -6227,6 +6595,9 @@ const FIXED_INDEX_PAGE = `
     let folderSearchRequestId = 0;
     let globalSearchTimer = null;
     let globalSearchRequestId = 0;
+    let tagOptionsLoaded = false;
+    let editingTagItem = null;
+    let editingTags = [];
     const taskStore = new Map();
     const runningTaskLoops = new Set();
     const uploadQueue = [];
@@ -6246,6 +6617,7 @@ const FIXED_INDEX_PAGE = `
       download: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>',
       share: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 10.6l6.8-4.2"/><path d="M8.6 13.4l6.8 4.2"/></svg>',
       rename: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
+      tag: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8Z"/><circle cx="7.5" cy="7.5" r=".5" fill="currentColor"/></svg>',
       delete: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>',
       favorite: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5l2.8 5.7 6.3.9-4.5 4.4 1.1 6.3-5.7-3-5.7 3 1.1-6.3-4.5-4.4 6.3-.9Z"/></svg>',
       favoriteOn: '<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5l2.8 5.7 6.3.9-4.5 4.4 1.1 6.3-5.7-3-5.7 3 1.1-6.3-4.5-4.4 6.3-.9Z"/></svg>'
@@ -6261,6 +6633,18 @@ const FIXED_INDEX_PAGE = `
 
     function apiFileUrl(prefix, path) {
       return prefix + encodePathForUrl(path);
+    }
+
+    function normalizeClientPath(path) {
+      const parts = String(path || '').split('/').filter(Boolean);
+      return parts.length ? '/' + parts.join('/') : '/';
+    }
+
+    function parentClientPath(path) {
+      const normalized = normalizeClientPath(path);
+      if (normalized === '/') return '/';
+      const index = normalized.lastIndexOf('/');
+      return index <= 0 ? '/' : normalized.slice(0, index);
     }
 
     function setTaskOrigin(element) {
@@ -6619,6 +7003,7 @@ const FIXED_INDEX_PAGE = `
           document.getElementById('loadingOverlay').style.display = 'none';
           msg.textContent = '';
         }
+        await loadTagOptions();
       } catch (error) {
         window.location.href = '/login.html';
       }
@@ -6696,6 +7081,117 @@ const FIXED_INDEX_PAGE = `
       }
     }
 
+    const selectedTagFilters = new Set();
+
+    async function loadTagOptions(force) {
+      if (tagOptionsLoaded && !force) return;
+      const list = document.getElementById('tagFilterList');
+      const empty = document.getElementById('tagFilterEmpty');
+      if (!list) return;
+      try {
+        const response = await fetch('/api/tags/list');
+        const data = await response.json();
+        if (!data.success) throw new Error(data.message || '读取标签失败');
+        const tags = data.tags || [];
+        const validTags = new Set(tags.map(function (t) { return t.tag; }));
+        Array.from(selectedTagFilters).forEach(function (tag) {
+          if (!validTags.has(tag)) selectedTagFilters.delete(tag);
+        });
+        list.replaceChildren();
+        tags.forEach(function (item) {
+          const label = document.createElement('label');
+          label.className = 'tag-filter-item';
+          const checkbox = document.createElement('input');
+          checkbox.type = 'checkbox';
+          checkbox.value = item.tag;
+          checkbox.checked = selectedTagFilters.has(item.tag);
+          checkbox.addEventListener('change', function () {
+            if (checkbox.checked) selectedTagFilters.add(item.tag);
+            else selectedTagFilters.delete(item.tag);
+            updateTagFilterLabel();
+            handleTagFilterChange();
+          });
+          const name = document.createElement('span');
+          name.className = 'tag-filter-name';
+          name.textContent = item.tag;
+          const count = document.createElement('span');
+          count.className = 'tag-filter-count';
+          count.textContent = item.count;
+          label.appendChild(checkbox);
+          label.appendChild(name);
+          label.appendChild(count);
+          list.appendChild(label);
+        });
+        if (empty) empty.hidden = tags.length > 0;
+        list.hidden = tags.length === 0;
+        updateTagFilterLabel();
+        tagOptionsLoaded = true;
+      } catch (error) {
+        console.warn('Tag options load failed:', error);
+      }
+    }
+
+    function updateTagFilterLabel() {
+      const trigger = document.getElementById('tagFilterTrigger');
+      const label = document.getElementById('tagFilterLabel');
+      if (!trigger || !label) return;
+      const count = selectedTagFilters.size;
+      if (count === 0) {
+        label.textContent = '标签';
+        trigger.classList.remove('has-selection');
+      } else if (count === 1) {
+        label.textContent = Array.from(selectedTagFilters)[0];
+        trigger.classList.add('has-selection');
+      } else {
+        label.textContent = '已选 ' + count + ' 个标签';
+        trigger.classList.add('has-selection');
+      }
+    }
+
+    function toggleTagFilterMenu(event) {
+      if (event) event.stopPropagation();
+      const menu = document.getElementById('tagFilterMenu');
+      const trigger = document.getElementById('tagFilterTrigger');
+      if (!menu || !trigger) return;
+      const willOpen = menu.hidden;
+      menu.hidden = !willOpen;
+      trigger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+    }
+
+    function closeTagFilterMenu() {
+      const menu = document.getElementById('tagFilterMenu');
+      const trigger = document.getElementById('tagFilterTrigger');
+      if (menu && !menu.hidden) menu.hidden = true;
+      if (trigger) trigger.setAttribute('aria-expanded', 'false');
+    }
+
+    function clearTagFilters() {
+      if (selectedTagFilters.size === 0) return;
+      selectedTagFilters.clear();
+      const list = document.getElementById('tagFilterList');
+      if (list) {
+        list.querySelectorAll('input[type="checkbox"]').forEach(function (cb) {
+          cb.checked = false;
+        });
+      }
+      updateTagFilterLabel();
+      handleTagFilterChange();
+    }
+
+    document.addEventListener('click', function (event) {
+      const wrap = document.getElementById('tagFilterWrap');
+      if (!wrap) return;
+      if (!wrap.contains(event.target)) closeTagFilterMenu();
+    });
+
+    document.addEventListener('keydown', function (event) {
+      if (event.key === 'Escape') closeTagFilterMenu();
+    });
+
+    function getSelectedTagFilters() {
+      return Array.from(selectedTagFilters).filter(Boolean);
+    }
+
     async function loadFavoritesView() {
       showLoading(true);
       try {
@@ -6750,6 +7246,10 @@ const FIXED_INDEX_PAGE = `
       scheduleGlobalSearch(0);
     }
 
+    function handleTagFilterChange() {
+      scheduleGlobalSearch(0);
+    }
+
     function scheduleGlobalSearch(delay) {
       if (globalSearchTimer) {
         clearTimeout(globalSearchTimer);
@@ -6757,7 +7257,8 @@ const FIXED_INDEX_PAGE = `
       }
 
       const q = document.getElementById('globalSearchInput').value.trim();
-      if (!q) {
+      const tags = getSelectedTagFilters();
+      if (!q && tags.length === 0) {
         const requestId = ++globalSearchRequestId;
         loadFiles({ searchRequestId: requestId });
         return;
@@ -6771,7 +7272,8 @@ const FIXED_INDEX_PAGE = `
 
     async function runSearch(refresh) {
       const q = document.getElementById('globalSearchInput').value.trim();
-      if (!q) {
+      const tags = getSelectedTagFilters();
+      if (!q && tags.length === 0) {
         const requestId = ++globalSearchRequestId;
         await loadFiles({ searchRequestId: requestId });
         return;
@@ -6785,7 +7287,14 @@ const FIXED_INDEX_PAGE = `
       try {
         await loadFavoritePaths();
         const type = document.getElementById('globalSearchType').value;
-        const response = await fetch('/api/search?q=' + encodeURIComponent(q) + '&type=' + encodeURIComponent(type) + '&limit=200&refresh=' + (refresh ? '1' : '0'));
+        const params = new URLSearchParams({
+          q: q,
+          type: type,
+          limit: '200',
+          refresh: refresh ? '1' : '0'
+        });
+        tags.forEach(function (tag) { params.append('tag', tag); });
+        const response = await fetch('/api/search?' + params.toString());
         const data = await response.json();
         if (requestId !== globalSearchRequestId) return;
         if (!data.success) throw new Error(data.message || '搜索失败');
@@ -6892,7 +7401,8 @@ const FIXED_INDEX_PAGE = `
           itemType: 'folder',
           typeLabel: '📁',
           meta: '文件夹',
-          isFolder: true
+          isFolder: true,
+          tags: folder.tags || []
         }));
       });
 
@@ -6905,7 +7415,8 @@ const FIXED_INDEX_PAGE = `
           meta: file.sizeFormatted || '',
           sizeFormatted: file.sizeFormatted || '',
           previewType: file.previewType || '',
-          isFolder: false
+          isFolder: false,
+          tags: file.tags || []
         }));
       });
     }
@@ -6932,7 +7443,8 @@ const FIXED_INDEX_PAGE = `
           meta: isFolder ? '文件夹' : (item.sizeFormatted || ''),
           sizeFormatted: item.sizeFormatted || '',
           previewType: item.previewType || '',
-          isFolder
+          isFolder,
+          tags: item.tags || []
         }));
       });
     }
@@ -6991,10 +7503,17 @@ const FIXED_INDEX_PAGE = `
       }
       card.appendChild(meta);
 
+      if (item.tags && item.tags.length > 0) {
+        card.appendChild(renderTagChips(item.tags, false));
+      }
+
       const actions = document.createElement('div');
       actions.className = 'file-actions';
       actions.appendChild(createActionButton(favoritePaths.has(item.path) ? 'favoriteOn' : 'favorite', favoritePaths.has(item.path) ? '取消收藏' : '收藏', favoritePaths.has(item.path) ? 'btn-primary' : 'btn-secondary', function () {
         toggleFavorite(item);
+      }));
+      actions.appendChild(createActionButton('tag', '编辑标签', 'btn-secondary', function () {
+        showTagModal(item);
       }));
       if (!item.isFolder) {
         actions.appendChild(createActionButton('rename', '重命名', 'btn-secondary', function () {
@@ -7019,6 +7538,132 @@ const FIXED_INDEX_PAGE = `
       });
       return button;
     }
+
+    function tagColor(tag) {
+      const palette = ['#2563eb', '#047857', '#b45309', '#be123c', '#6d28d9', '#0f766e', '#4338ca', '#a21caf'];
+      let hash = 0;
+      for (let index = 0; index < tag.length; index++) {
+        hash = ((hash << 5) - hash + tag.charCodeAt(index)) | 0;
+      }
+      return palette[Math.abs(hash) % palette.length];
+    }
+
+    function renderTagChips(tags, removable) {
+      const list = document.createElement('div');
+      list.className = 'tag-list' + (removable ? ' tag-editor-list' : '');
+      (tags || []).forEach(function (tag) {
+        const chip = document.createElement('span');
+        chip.className = 'tag-chip';
+        chip.style.background = tagColor(tag);
+        const text = document.createElement('span');
+        text.textContent = tag;
+        chip.appendChild(text);
+        if (removable) {
+          const remove = document.createElement('button');
+          remove.type = 'button';
+          remove.textContent = 'x';
+          remove.setAttribute('aria-label', '移除标签 ' + tag);
+          remove.addEventListener('click', function () {
+            editingTags = editingTags.filter(function (item) { return item !== tag; });
+            renderTagEditor();
+          });
+          chip.appendChild(remove);
+        }
+        list.appendChild(chip);
+      });
+      return list;
+    }
+
+    function showTagModal(item) {
+      editingTagItem = item;
+      editingTags = normalizeClientTags(item.tags || []);
+      document.getElementById('tagItemName').textContent = item.name;
+      document.getElementById('tagItemPath').value = item.path;
+      document.getElementById('tagItemType').value = item.isFolder ? 'folder' : 'file';
+      document.getElementById('tagInput').value = '';
+      renderTagEditor();
+      document.getElementById('tagModal').classList.add('active');
+      window.setTimeout(function () {
+        document.getElementById('tagInput').focus();
+      }, 0);
+    }
+
+    function renderTagEditor() {
+      const list = document.getElementById('tagEditorList');
+      list.replaceChildren();
+      const chips = renderTagChips(editingTags, true);
+      Array.from(chips.children).forEach(function (chip) {
+        list.appendChild(chip);
+      });
+    }
+
+    function normalizeClientTags(tags) {
+      const seen = new Set();
+      const normalized = [];
+      (tags || []).forEach(function (raw) {
+        const tag = String(raw || '').trim();
+        if (tag && tag.length <= 20 && !seen.has(tag)) {
+          seen.add(tag);
+          normalized.push(tag);
+        }
+      });
+      return normalized.sort(function (a, b) { return a.localeCompare(b, 'zh-Hans-CN'); });
+    }
+
+    function addTagFromInput() {
+      const input = document.getElementById('tagInput');
+      const tag = input.value.trim();
+      if (!tag) return;
+      if (tag.length > 20) {
+        showToast('单个标签不能超过 20 个字符', 'warning');
+        return;
+      }
+      if (editingTags.length >= 20 && !editingTags.includes(tag)) {
+        showToast('每个项目最多 20 个标签', 'warning');
+        return;
+      }
+      editingTags = normalizeClientTags(editingTags.concat(tag));
+      input.value = '';
+      renderTagEditor();
+    }
+
+    async function saveTags(event) {
+      event.preventDefault();
+      addTagFromInput();
+      const path = document.getElementById('tagItemPath').value;
+      const itemType = document.getElementById('tagItemType').value;
+      try {
+        const response = await fetch('/api/tags?path=' + encodeURIComponent(path), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tags: editingTags, itemType: itemType })
+        });
+        const data = await response.json();
+        if (!data.success) throw new Error(data.message || '保存失败');
+        closeModal('tagModal');
+        if (editingTagItem) editingTagItem.tags = data.tags || [];
+        await loadTagOptions(true);
+        showToast('标签已保存', 'success');
+        if (currentView === 'files') {
+          await loadFiles();
+        } else if (currentView === 'favorites') {
+          await loadFavoritesView();
+        } else if (currentView === 'recent') {
+          await loadRecentView();
+        } else if (currentView === 'search') {
+          await runSearch(false);
+        }
+      } catch (error) {
+        showToast('保存标签失败: ' + error.message, 'error');
+      }
+    }
+
+    document.addEventListener('keydown', function (event) {
+      if (event.target && event.target.id === 'tagInput' && event.key === 'Enter') {
+        event.preventDefault();
+        addTagFromInput();
+      }
+    });
 
     async function toggleFavorite(item) {
       const isFavorite = favoritePaths.has(item.path);
@@ -7476,6 +8121,57 @@ const FIXED_INDEX_PAGE = `
       processUploadQueue();
     }
 
+    async function handleFolderUpload(event) {
+      const files = Array.from(event.target.files || []);
+      if (files.length === 0) {
+        showToast('所选文件夹为空，无法上传', 'warning');
+        event.target.value = '';
+        return;
+      }
+
+      const origin = lastTaskOriginElement;
+      const folderPaths = new Set();
+      files.forEach(function (file) {
+        const relativePath = file.webkitRelativePath || file.name;
+        const parts = relativePath.split('/').filter(Boolean);
+        for (let index = 0; index < parts.length - 1; index++) {
+          folderPaths.add(normalizeClientPath(currentPath + '/' + parts.slice(0, index + 1).join('/')));
+        }
+      });
+
+      for (const folderPath of Array.from(folderPaths).sort(function (a, b) { return a.length - b.length; })) {
+        try {
+          await fetch('/api/folders', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: folderPath })
+          });
+        } catch (error) {
+          console.warn('Folder pre-create failed:', folderPath, error);
+        }
+      }
+
+      for (const file of files) {
+        const relativePath = file.webkitRelativePath || file.name;
+        const targetFilePath = normalizeClientPath(currentPath + '/' + relativePath);
+        const targetParentPath = parentClientPath(targetFilePath);
+        try {
+          const task = await createTask({
+            type: 'upload',
+            title: '上传 ' + relativePath,
+            name: file.name,
+            destinationPath: targetParentPath,
+            totalBytes: file.size || 0
+          }, origin);
+          enqueueUpload(task, file, targetParentPath);
+        } catch (error) {
+          showToast('创建上传任务失败: ' + error.message, 'error');
+        }
+      }
+      event.target.value = '';
+      processUploadQueue();
+    }
+
     function enqueueUpload(task, file, path) {
       uploadQueue.push({ task: task, file: file, path: path });
     }
@@ -7527,7 +8223,7 @@ const FIXED_INDEX_PAGE = `
                 totalBytes: file.size || task.totalBytes || 0,
                 result: { path: data.path }
               }, true);
-              if (path === currentPath) await loadFiles();
+              if (path === currentPath || path.startsWith(currentPath === '/' ? '/' : currentPath + '/')) await loadFiles();
             } else {
               throw new Error(data.message || xhr.statusText || '上传失败');
             }
@@ -8212,12 +8908,12 @@ const FIXED_ADMIN_PAGE = `
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>管理后台 - EdgeStash</title>
+  <title>管理后台 - EdgeStashPro</title>
   ${CSS_STYLES}
 </head>
 <body>
   <div class="header">
-    <div class="logo">EdgeStash 管理后台</div>
+    <div class="logo">EdgeStashPro 管理后台</div>
     <div class="header-actions">
       <button type="button" class="btn btn-secondary" onclick="window.location.href='/'">返回云盘</button>
       <button type="button" class="btn btn-secondary" onclick="logout()">退出登录</button>
@@ -8881,7 +9577,7 @@ const FIXED_SHARE_PAGE = `
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>文件分享 - EdgeStash</title>
+  <title>文件分享 - EdgeStashPro</title>
   ${CSS_STYLES}
 </head>
 <body>
@@ -9246,6 +9942,14 @@ export default {
 
         if (path === '/api/search' && method === 'GET') {
           return await handleSearch(request, env);
+        }
+
+        if (path === '/api/tags/list' && method === 'GET') {
+          return await handleListTags(request, env);
+        }
+
+        if (path === '/api/tags' && method === 'PUT') {
+          return await handleUpdateTags(request, env);
         }
 
         if (path === '/api/favorites' && ['GET', 'POST', 'DELETE'].includes(method)) {
