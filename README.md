@@ -4,6 +4,9 @@ EdgeStash 是一个单文件 Cloudflare Worker 网盘。核心代码在 `worker.
 
 项目当前需要 R2、KV、D1 和 `ADMIN_PASSWORD`，不需要单独构建前端，也不需要额外的运行时服务。
 
+
+![预览图片](merged-images.png)
+
 ### 备注
 Fork来自 https://github.com/hhy-2021/EdgeStash , 做了一些自己需要用的增强
 
