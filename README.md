@@ -1,6 +1,6 @@
-# EdgeStash
+# EdgeStashPro
 
-EdgeStash 是一个单文件 Cloudflare Worker 网盘。核心代码在 `worker.js`，页面、样式、前端交互和后端逻辑都内嵌在这个 Worker 中；文件存储使用 Cloudflare R2，用户、目录缓存、阅读进度和管理员 OTP 状态使用 Workers KV，搜索索引、收藏、最近访问、分享、统计和文件任务使用 Cloudflare D1。
+EdgeStashPro 是一个单文件 Cloudflare Worker 网盘。核心代码在 `worker.js`，页面、样式、前端交互和后端逻辑都内嵌在这个 Worker 中；文件存储使用 Cloudflare R2，用户、目录缓存、阅读进度和管理员 OTP 状态使用 Workers KV，搜索索引、收藏、最近访问、分享、统计和文件任务使用 Cloudflare D1。
 
 项目当前需要 R2、KV、D1 和 `ADMIN_PASSWORD`，不需要单独构建前端，也不需要额外的运行时服务。
 
@@ -8,7 +8,7 @@ EdgeStash 是一个单文件 Cloudflare Worker 网盘。核心代码在 `worker.
 ![预览图片](merged-images.png)
 
 ### 备注
-Fork来自 https://github.com/hhy-2021/EdgeStash , 做了一些自己需要用的增强
+Fork来自 https://github.com/hhy-2021/EdgeStashPro , 做了一些自己需要用的增强
 
 ## 在线 Demo
 
@@ -29,11 +29,12 @@ https://s3.chenzhou.dev/
 
 ## 产品特性
 
-- 文件管理：上传、下载、删除、重命名、创建文件夹。
+- 文件管理：上传文件、上传文件夹、下载、删除、重命名、创建文件夹。
 - 批量操作：批量复制、移动、删除和打包下载；批量下载由浏览器原生下载 ZIP 压缩包。
 - 后台任务：上传、下载、复制、移动和批量删除会进入顶部任务状态栏，可查看进度、历史状态、停止或删除任务。
 - 目录浏览：支持中文路径、中文文件名和 KV 目录缓存。
-- 搜索：支持按名称或路径即时搜索，可筛选全部、文件、文件夹。
+- 搜索：支持按名称、路径或标签即时搜索，可筛选全部、文件、文件夹。
+- 标签：可为文件/文件夹维护标签，并在搜索结果、收藏、最近访问和目录列表中展示。
 - 收藏和最近访问：支持文件/文件夹收藏、最近访问列表。
 - 在线预览：图片、PDF、文本、Markdown、音视频、docx。
 - TXT 阅读：支持常见中文编码，并保存阅读进度。
@@ -69,9 +70,110 @@ imgs/        # 文档展示图片
 | --- | --- |
 | `ADMIN_PASSWORD` | 管理员密码，也是当前 JWT 签名密钥 |
 
-Binding 名必须和代码一致。如果你改了 binding 名，需要同步改 `worker.js`。
+Binding 名必须和代码一致。如果你改了 binding 名，需要同步改 `worker.js` 和 `wrangler.toml`。
+
+## Wrangler 部署流程
+
+推荐使用 Wrangler 部署。这样 Worker 代码和 R2/KV/D1 绑定会一起由 `wrangler.toml` 管理，后续更新不需要在 Dashboard 中手工粘贴代码。
+
+### 1. 安装并登录 Wrangler
+
+```bash
+npm install -g wrangler
+wrangler login
+wrangler whoami
+```
+
+如果已经在本机配置并认证好 Wrangler，可以跳过安装和登录。
+
+### 2. 创建 Cloudflare 资源
+
+可以在 Dashboard 中创建 R2 Bucket、KV Namespace 和 D1 Database，也可以用 Wrangler 创建：
+
+```bash
+wrangler r2 bucket create YOUR_R2_BUCKET
+wrangler kv namespace create KV_STORE
+wrangler d1 create YOUR_D1_DATABASE
+```
+
+记下输出中的 KV namespace ID、D1 database name 和 D1 database ID。
+
+### 3. 修改 `wrangler.toml`
+
+仓库已包含 `wrangler.toml` 模板。部署自己的实例前需要替换：
+
+```toml
+name = "your-worker-name"
+
+[[kv_namespaces]]
+binding = "KV_STORE"
+id = "YOUR_KV_NAMESPACE_ID"
+
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "YOUR_R2_BUCKET"
+
+[[d1_databases]]
+binding = "D1_DB"
+database_name = "YOUR_D1_DATABASE"
+database_id = "YOUR_D1_DATABASE_ID"
+```
+
+`binding` 字段不要改，代码固定读取 `R2_BUCKET`、`KV_STORE`、`D1_DB`。`keep_vars = true` 建议保留，它可以避免 `wrangler deploy` 清掉 Dashboard 中配置的 `ADMIN_PASSWORD` 等变量。
+
+### 4. 设置管理员密码
+
+推荐使用 secret 保存管理员密码：
+
+```bash
+wrangler secret put ADMIN_PASSWORD
+```
+
+按提示输入强密码。`ADMIN_PASSWORD` 也是 JWT 签名密钥，修改后所有已登录会话都会失效。
+
+### 5. 预检并部署
+
+```bash
+node --check worker.js
+wrangler deploy --dry-run
+wrangler deploy
+```
+
+`--dry-run` 输出中应该能看到这些绑定：
+
+```txt
+env.KV_STORE
+env.D1_DB
+env.R2_BUCKET
+```
+
+部署成功后，Wrangler 会输出 `workers.dev` 地址。如果你使用自定义域名，请在 Cloudflare Dashboard 中给该 Worker 配置 Route 或 Custom Domain。
+
+### 6. 部署后验证
+
+打开：
+
+```txt
+https://your-worker.your-subdomain.workers.dev/login.html
+```
+
+管理员首次登录会初始化 D1 表结构和 OTP。登录后进入首页，管理员应能看到 R2 根目录；普通用户只会看到管理员授权过的文件或目录。
+
+也可以用接口快速确认：
+
+```bash
+curl -i https://your-domain.example/api/auth/check
+```
+
+未登录时应返回：
+
+```json
+{"authenticated":false}
+```
 
 ## Dashboard 部署流程
+
+如果不想使用 Wrangler，也可以在 Dashboard 中手动部署。
 
 1. 进入 Cloudflare Dashboard，创建一个 R2 Bucket。
 2. 创建一个 KV Namespace。
@@ -97,6 +199,8 @@ Binding 名必须和代码一致。如果你改了 binding 名，需要同步改
 ```txt
 https://your-worker.your-subdomain.workers.dev/
 ```
+
+注意：手动粘贴部署时必须粘贴完整 `worker.js`。如果只复制了部分内容，或浏览器/编辑器改坏了内嵌脚本中的正则转义，首页脚本可能无法执行。
 
 ## 首次初始化
 
@@ -166,6 +270,7 @@ D1 初始化标记 key：
 
 ```txt
 d1:schema:v1
+d1:schema:v2-tags
 ```
 
 说明：
@@ -174,17 +279,20 @@ d1:schema:v1
 - `admin:otp:pending` 是首次初始化时的临时 Secret，有效期约 10 分钟。
 - 如果只删除 `admin:otp:secret`，但 `admin:otp:pending` 还存在，页面可能继续复用旧的临时初始化 Secret。
 - 删除 OTP key 后，旧 Authenticator 中的验证码会失效，下一次管理员密码登录会重新显示初始化二维码。
+- 项目名改为 EdgeStashPro 后，已绑定的 Authenticator 仍能正常生成验证码；如想让 App 里的条目名称也更新，可在管理后台重置 OTP 后重新扫码。
 - 删除 `d1:schema:v1` 不会删除 D1 数据，只会让 Worker 下次访问相关 API 时重新执行建表检查。
+- 删除 `d1:schema:v2-tags` 不会删除标签数据，只会让 Worker 下次访问相关 API 时重新检查 `search_items.tags` 列。
 
 ### 在 Dashboard 里重置
 
 1. 打开 Cloudflare Dashboard。
 2. 进入 Workers KV。
-3. 选择绑定到 EdgeStash 的 KV Namespace。
+3. 选择绑定到 EdgeStashPro 的 KV Namespace。
 4. 按需要搜索并删除：
    - `admin:otp:secret`
    - `admin:otp:pending`
    - `d1:schema:v1`
+   - `d1:schema:v2-tags`
 5. 如果重置了 OTP，回到 `/login.html`，输入管理员密码，重新扫码绑定。
 
 ### 用 Wrangler 删除 KV key
@@ -195,6 +303,7 @@ d1:schema:v1
 wrangler kv key delete "admin:otp:secret" --binding KV_STORE
 wrangler kv key delete "admin:otp:pending" --binding KV_STORE
 wrangler kv key delete "d1:schema:v1" --binding KV_STORE
+wrangler kv key delete "d1:schema:v2-tags" --binding KV_STORE
 ```
 
 如果你更习惯使用 KV namespace ID：
@@ -203,6 +312,7 @@ wrangler kv key delete "d1:schema:v1" --binding KV_STORE
 wrangler kv key delete "admin:otp:secret" --namespace-id YOUR_KV_NAMESPACE_ID
 wrangler kv key delete "admin:otp:pending" --namespace-id YOUR_KV_NAMESPACE_ID
 wrangler kv key delete "d1:schema:v1" --namespace-id YOUR_KV_NAMESPACE_ID
+wrangler kv key delete "d1:schema:v2-tags" --namespace-id YOUR_KV_NAMESPACE_ID
 ```
 
 ## 日常使用
@@ -342,9 +452,9 @@ file_task_items
 
 请同时删除 `admin:otp:pending`。临时初始化 Secret 可能仍在 10 分钟有效期内。
 
-### 当前目录不显示文件，控制台报 `Unexpected token 'if'` 怎么办？
+### 当前目录不显示文件，控制台报 `Unexpected token` 或 `switchMainView is not defined` 怎么办？
 
-这通常是线上 Worker 仍在运行旧版页面模板，或手动粘贴部署时改坏了内嵌脚本中的正则转义。先确认 Cloudflare Worker 中部署的是当前仓库的完整 `worker.js`，保存后强制刷新浏览器缓存。
+这通常是首页内嵌脚本没有成功执行。常见原因是线上 Worker 仍在运行旧版页面模板，或手动粘贴部署时改坏了内嵌脚本中的正则转义。先确认 Cloudflare Worker 中部署的是当前仓库的完整 `worker.js`，保存后强制刷新浏览器缓存。
 
 如果你在旧代码里看到类似这一行：
 
@@ -358,7 +468,13 @@ normalized = normalized.replace(//+/g, '/');
 normalized = normalized.replace(/[/]+/g, '/');
 ```
 
-当前仓库版本已不包含这段旧逻辑；如果重新部署当前 `worker.js` 后仍然目录为空，再检查 `R2_BUCKET`、`KV_STORE`、`D1_DB` binding 是否配置正确，以及普通用户是否已经授权了可访问目录。
+如果控制台报 `switchMainView is not defined`，说明页面脚本在定义函数前已经因为语法错误中断。请使用当前仓库版本重新部署，并确认浏览器强刷后线上 HTML 中不再包含被破坏的正则，例如 `^data:image/(?:...)`。
+
+当前仓库版本已修复这些转义问题；如果重新部署当前 `worker.js` 后仍然目录为空，再检查 `R2_BUCKET`、`KV_STORE`、`D1_DB` binding 是否配置正确，以及普通用户是否已经授权了可访问目录。
+
+### 普通用户登录后根目录为什么只看到几个目录，或看不到根目录文件？
+
+普通用户不是全盘默认可见。根目录会显示管理员授权资源的入口，例如授权了 `/public` 时，用户在根目录只会看到 `public`，进入后才能看到该目录内允许查看的文件。要让普通用户看到全盘内容，需要在管理后台给该用户授权 `/` 文件夹的“查看”权限，并按需要勾选预览、下载、上传等权限。
 
 ### 需要 D1 吗？
 
