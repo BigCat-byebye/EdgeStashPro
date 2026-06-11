@@ -395,55 +395,59 @@ function cacheItemsToResponse(items, currentPath) {
 async function listDirectoryFromR2(env, dirPath) {
   const currentPath = normalizeDirectoryPath(dirPath);
   const prefix = directoryPathToR2Prefix(currentPath);
+  const slashPrefix = '/' + prefix;
+  const prefixes = slashPrefix === prefix ? [prefix] : [prefix, slashPrefix];
   const folderMap = new Map();
   const fileMap = new Map();
-  let cursor;
 
-  do {
-    const listed = await env.R2_BUCKET.list({ prefix, delimiter: '/', cursor });
+  for (const listPrefix of prefixes) {
+    let cursor;
+    do {
+      const listed = await env.R2_BUCKET.list({ prefix: listPrefix, delimiter: '/', cursor });
 
-    if (listed.delimitedPrefixes) {
-      for (const folderPath of listed.delimitedPrefixes) {
-        const path = r2KeyToPath(folderPath.slice(0, -1));
-        const name = folderPath.slice(prefix.length, -1);
-        if (name) {
-          folderMap.set(path, {
-            itemType: 'folder',
+      if (listed.delimitedPrefixes) {
+        for (const folderPath of listed.delimitedPrefixes) {
+          const path = r2KeyToPath(folderPath.slice(0, -1));
+          const name = folderPath.slice(listPrefix.length, -1);
+          if (name) {
+            folderMap.set(path, {
+              itemType: 'folder',
+              name,
+              path,
+              parentPath: currentPath,
+              r2Key: folderPath.slice(0, -1),
+              size: 0,
+              contentType: null,
+              previewType: null,
+              lastModified: null
+            });
+          }
+        }
+      }
+
+      if (listed.objects) {
+        for (const obj of listed.objects) {
+          const name = obj.key.slice(listPrefix.length);
+          if (!name || name === '.folder' || name.includes('/')) continue;
+
+          const path = r2KeyToPath(obj.key);
+          fileMap.set(path, {
+            itemType: 'file',
             name,
             path,
             parentPath: currentPath,
-            r2Key: folderPath.slice(0, -1),
-            size: 0,
-            contentType: null,
-            previewType: null,
-            lastModified: null
+            r2Key: obj.key,
+            size: obj.size || 0,
+            contentType: obj.httpMetadata?.contentType || getMimeType(name),
+            previewType: getPreviewType(name),
+            lastModified: isoDateString(obj.uploaded)
           });
         }
       }
-    }
 
-    if (listed.objects) {
-      for (const obj of listed.objects) {
-        const name = obj.key.slice(prefix.length);
-        if (!name || name === '.folder' || name.includes('/')) continue;
-
-        const path = r2KeyToPath(obj.key);
-        fileMap.set(path, {
-          itemType: 'file',
-          name,
-          path,
-          parentPath: currentPath,
-          r2Key: obj.key,
-          size: obj.size || 0,
-          contentType: obj.httpMetadata?.contentType || getMimeType(name),
-          previewType: getPreviewType(name),
-          lastModified: isoDateString(obj.uploaded)
-        });
-      }
-    }
-
-    cursor = listed.truncated ? listed.cursor : null;
-  } while (cursor);
+      cursor = listed.truncated ? listed.cursor : null;
+    } while (cursor);
+  }
 
   const items = [...folderMap.values(), ...fileMap.values()];
   return {
@@ -645,6 +649,20 @@ function jsonResponse(data, status = 200, headers = {}) {
   });
 }
 
+function missingRequiredConfig(env, names) {
+  return names.filter(name => {
+    if (name === 'ADMIN_PASSWORD') return !env.ADMIN_PASSWORD;
+    return !env[name];
+  });
+}
+
+function requireRequiredConfig(env, names) {
+  const missing = missingRequiredConfig(env, names);
+  if (missing.length > 0) {
+    throw new Error('缺少必要配置: ' + missing.join(', '));
+  }
+}
+
 /**
  * Create HTML response
  */
@@ -664,6 +682,7 @@ function htmlResponse(html, status = 200, headers = {}) {
 
 async function handleLogin(request, env) {
   try {
+    requireRequiredConfig(env, ['ADMIN_PASSWORD', 'KV_STORE', 'D1_DB']);
     const body = await request.json();
     const { email, password, isAdmin, otp } = body;
     
@@ -787,6 +806,9 @@ async function handleListFiles(request, env, path) {
   if (auth instanceof Response) return auth;
   
   try {
+    requireRequiredConfig(env, ['KV_STORE', 'R2_BUCKET', 'D1_DB']);
+    const url = new URL(request.url);
+    const forceRefresh = url.searchParams.get('refresh') === '1';
     const currentPath = normalizeDirectoryPath(path);
     const permissionError = await requirePathPermission(env, auth, 'view', currentPath);
     if (permissionError) {
@@ -805,10 +827,12 @@ async function handleListFiles(request, env, path) {
       });
     }
     let cached = null;
-    try {
-      cached = await readDirectoryCache(env, currentPath);
-    } catch (cacheError) {
-      console.warn('KV directory cache read failed:', cacheError.message);
+    if (!forceRefresh) {
+      try {
+        cached = await readDirectoryCache(env, currentPath);
+      } catch (cacheError) {
+        console.warn('KV directory cache read failed:', cacheError.message);
+      }
     }
 
     if (cached) {
@@ -839,6 +863,7 @@ async function handleRefreshDirectoryCache(request, env) {
   if (auth instanceof Response) return auth;
 
   try {
+    requireRequiredConfig(env, ['KV_STORE', 'R2_BUCKET', 'D1_DB']);
     const body = await request.json().catch(() => ({}));
     const currentPath = normalizeDirectoryPath(body.path || '/');
     const permissionError = await requirePathPermission(env, auth, 'view', currentPath);
@@ -946,15 +971,16 @@ async function handleRenameFile(request, env, path) {
     const newKey = parentPath + newName;
     
     // Get the old file
-    const oldObject = await env.R2_BUCKET.get(oldKey);
-    if (oldObject) {
+    const resolvedOld = await getR2Object(env, oldKey);
+    if (resolvedOld) {
+      const oldObject = resolvedOld.object;
       // Copy to new location
       await env.R2_BUCKET.put(newKey, oldObject.body, {
         httpMetadata: oldObject.httpMetadata
       });
 
       // Delete old file
-      await env.R2_BUCKET.delete(oldKey);
+      await env.R2_BUCKET.delete(resolvedOld.key);
       await invalidateCachePath(env, r2KeyToPath(oldKey));
       await cleanupD1ItemPath(env, r2KeyToPath(oldKey));
 
@@ -969,36 +995,32 @@ async function handleRenameFile(request, env, path) {
     }
 
     const oldPrefix = oldKey.endsWith('/') ? oldKey : oldKey + '/';
-    const folderCheck = await env.R2_BUCKET.list({ prefix: oldPrefix, limit: 1 });
+    const folderCheck = await listR2Prefix(env, oldPrefix, { limit: 1 });
     if (!folderCheck.objects || folderCheck.objects.length === 0) {
       return jsonResponse({ success: false, message: '文件不存在' }, 404);
     }
 
     const newPrefix = newKey.endsWith('/') ? newKey : newKey + '/';
-    let cursor;
-    do {
-      const batch = await env.R2_BUCKET.list({ prefix: oldPrefix, cursor });
-      const oldKeys = [];
+    const batch = await listR2Prefix(env, oldPrefix);
+    const oldKeys = [];
 
-      if (batch.objects && batch.objects.length > 0) {
-        for (const obj of batch.objects) {
-          const targetKey = newPrefix + obj.key.slice(oldPrefix.length);
-          const source = await env.R2_BUCKET.get(obj.key);
-          if (source) {
-            await env.R2_BUCKET.put(targetKey, source.body, {
-              httpMetadata: source.httpMetadata
-            });
-            oldKeys.push(obj.key);
-          }
+    if (batch.objects && batch.objects.length > 0) {
+      for (const obj of batch.objects) {
+        const relativeKey = obj.key.replace(/^\/+/, '').slice(oldPrefix.length);
+        const targetKey = newPrefix + relativeKey;
+        const source = await env.R2_BUCKET.get(obj.key);
+        if (source) {
+          await env.R2_BUCKET.put(targetKey, source.body, {
+            httpMetadata: source.httpMetadata
+          });
+          oldKeys.push(obj.key);
         }
       }
+    }
 
-      if (oldKeys.length > 0) {
-        await env.R2_BUCKET.delete(oldKeys);
-      }
-
-      cursor = batch.truncated ? batch.cursor : null;
-    } while (cursor);
+    if (oldKeys.length > 0) {
+      await env.R2_BUCKET.delete(oldKeys);
+    }
 
     await invalidateCachePath(env, r2KeyToPath(oldKey));
     await cleanupD1ItemPath(env, r2KeyToPath(oldKey));
@@ -1015,6 +1037,54 @@ function itemPathToR2Key(path) {
   return normalized === '/' ? '' : normalized.slice(1);
 }
 
+function r2KeyCandidates(key) {
+  const normalized = String(key || '').replace(/^\/+/, '');
+  if (!normalized) return [''];
+  return [normalized, '/' + normalized];
+}
+
+async function headR2Object(env, key) {
+  for (const candidate of r2KeyCandidates(key)) {
+    const object = await env.R2_BUCKET.head(candidate);
+    if (object) return { key: candidate, object };
+  }
+  return null;
+}
+
+async function getR2Object(env, key, options) {
+  for (const candidate of r2KeyCandidates(key)) {
+    const object = await env.R2_BUCKET.get(candidate, options);
+    if (object) return { key: candidate, object };
+  }
+  return null;
+}
+
+async function listR2Prefix(env, prefix, options = {}) {
+  const normalized = String(prefix || '').replace(/^\/+/, '');
+  const prefixes = normalized ? [normalized, '/' + normalized] : ['', '/'];
+  const objects = [];
+  const delimitedPrefixes = new Set();
+  let truncated = false;
+
+  for (const listPrefix of prefixes) {
+    let cursor;
+    do {
+      const listed = await env.R2_BUCKET.list({ ...options, prefix: listPrefix, cursor });
+      objects.push(...(listed.objects || []));
+      for (const folder of listed.delimitedPrefixes || []) delimitedPrefixes.add(folder);
+      if (options.limit && objects.length >= options.limit) {
+        truncated = truncated || !!listed.truncated;
+        break;
+      }
+      cursor = listed.truncated ? listed.cursor : null;
+      truncated = truncated || !!listed.truncated;
+    } while (cursor);
+    if (options.limit && objects.length >= options.limit) break;
+  }
+
+  return { objects, delimitedPrefixes: Array.from(delimitedPrefixes), truncated };
+}
+
 function joinItemPath(parentPath, name) {
   const parent = normalizeDirectoryPath(parentPath);
   return parent === '/' ? '/' + name : parent + '/' + name;
@@ -1025,16 +1095,16 @@ async function folderExists(env, folderPath) {
   if (normalized === '/') return true;
 
   const prefix = directoryPathToR2Prefix(normalized);
-  const listed = await env.R2_BUCKET.list({ prefix, limit: 1 });
+  const listed = await listR2Prefix(env, prefix, { limit: 1 });
   return !!(listed.objects && listed.objects.length > 0);
 }
 
 async function destinationExists(env, key, isFolder) {
   if (isFolder) {
-    const listed = await env.R2_BUCKET.list({ prefix: key + '/', limit: 1 });
+    const listed = await listR2Prefix(env, key + '/', { limit: 1 });
     return !!(listed.objects && listed.objects.length > 0);
   }
-  return !!(await env.R2_BUCKET.head(key));
+  return !!(await headR2Object(env, key));
 }
 
 function copyNameCandidate(name, index) {
@@ -1091,19 +1161,16 @@ async function deleteItemAtPath(env, path) {
   const key = itemPathToR2Key(path);
   if (!key) throw new Error('不能操作根目录');
 
-  const listed = await env.R2_BUCKET.list({ prefix: key + '/', limit: 1 });
+  const listed = await listR2Prefix(env, key + '/', { limit: 1 });
   if (listed.objects && listed.objects.length > 0) {
-    let cursor;
-    do {
-      const batch = await env.R2_BUCKET.list({ prefix: key + '/', cursor });
-      if (batch.objects && batch.objects.length > 0) {
-        await deleteR2Keys(env, batch.objects.map(obj => obj.key));
-      }
-      cursor = batch.truncated ? batch.cursor : null;
-    } while (cursor);
+    const batch = await listR2Prefix(env, key + '/');
+    if (batch.objects && batch.objects.length > 0) {
+      await deleteR2Keys(env, batch.objects.map(obj => obj.key));
+    }
   }
 
-  await env.R2_BUCKET.delete(key);
+  const resolved = await headR2Object(env, key);
+  if (resolved) await env.R2_BUCKET.delete(resolved.key);
   await invalidateCachePath(env, r2KeyToPath(key));
   await cleanupD1ItemPath(env, r2KeyToPath(key));
 }
@@ -1136,9 +1203,11 @@ async function copyOrMoveItem(env, sourcePath, destinationPath, shouldMove) {
     throw new Error('目标文件夹不存在: ' + normalizedDestinationPath);
   }
 
-  const sourceObject = await env.R2_BUCKET.head(sourceKey);
+  const resolvedSource = await headR2Object(env, sourceKey);
+  const sourceObject = resolvedSource?.object || null;
+  const actualSourceKey = resolvedSource?.key || sourceKey;
   const sourcePrefix = sourceKey + '/';
-  const folderCheck = sourceObject ? null : await env.R2_BUCKET.list({ prefix: sourcePrefix, limit: 1 });
+  const folderCheck = sourceObject ? null : await listR2Prefix(env, sourcePrefix, { limit: 1 });
   const isFolder = !sourceObject && !!(folderCheck.objects && folderCheck.objects.length > 0);
 
   if (!sourceObject && !isFolder) {
@@ -1162,24 +1231,24 @@ async function copyOrMoveItem(env, sourcePath, destinationPath, shouldMove) {
     const copiedKeys = [];
     let cursor;
     do {
-      const batch = await env.R2_BUCKET.list({ prefix: sourcePrefix, cursor });
+      const batch = await listR2Prefix(env, sourcePrefix);
       if (batch.objects && batch.objects.length > 0) {
         for (const obj of batch.objects) {
-          const relativeKey = obj.key.slice(sourcePrefix.length);
+          const relativeKey = obj.key.replace(/^\/+/, '').slice(sourcePrefix.length);
           const copied = await copyR2Object(env, obj.key, targetPrefix + relativeKey);
           if (copied) copiedKeys.push(obj.key);
         }
       }
-      cursor = batch.truncated ? batch.cursor : null;
+      cursor = null;
     } while (cursor);
 
     if (shouldMove && copiedKeys.length > 0) {
       await deleteR2Keys(env, copiedKeys);
     }
   } else {
-    await copyR2Object(env, sourceKey, targetKey);
+    await copyR2Object(env, actualSourceKey, targetKey);
     if (shouldMove) {
-      await env.R2_BUCKET.delete(sourceKey);
+      await env.R2_BUCKET.delete(actualSourceKey);
     }
   }
 
@@ -1410,9 +1479,11 @@ async function buildCopyMoveTaskItems(env, auth, operation, selectedItems, desti
       }
 
       const sourceKey = itemPathToR2Key(itemPath);
-      const sourceObject = await env.R2_BUCKET.head(sourceKey);
+      const resolvedSource = await headR2Object(env, sourceKey);
+      const sourceObject = resolvedSource?.object || null;
+      const actualSourceKey = resolvedSource?.key || sourceKey;
       const sourcePrefix = sourceKey + '/';
-      const folderCheck = sourceObject ? null : await env.R2_BUCKET.list({ prefix: sourcePrefix, limit: 1 });
+      const folderCheck = sourceObject ? null : await listR2Prefix(env, sourcePrefix, { limit: 1 });
       const isFolder = !sourceObject && !!(folderCheck.objects && folderCheck.objects.length > 0);
       if (!sourceObject && !isFolder) throw new Error('项目不存在: ' + itemPath);
 
@@ -1432,9 +1503,9 @@ async function buildCopyMoveTaskItems(env, auth, operation, selectedItems, desti
 
         let cursor;
         do {
-          const listed = await env.R2_BUCKET.list({ prefix: sourcePrefix, cursor });
+          const listed = await listR2Prefix(env, sourcePrefix);
           for (const obj of listed.objects || []) {
-            const relativeKey = obj.key.slice(sourcePrefix.length);
+            const relativeKey = obj.key.replace(/^\/+/, '').slice(sourcePrefix.length);
             taskItems.push({
               sourcePath: r2KeyToPath(obj.key),
               sourceKey: obj.key,
@@ -1443,12 +1514,12 @@ async function buildCopyMoveTaskItems(env, auth, operation, selectedItems, desti
               size: obj.size || 0
             });
           }
-          cursor = listed.truncated ? listed.cursor : null;
+          cursor = null;
         } while (cursor);
       } else {
         taskItems.push({
           sourcePath: itemPath,
-          sourceKey,
+          sourceKey: actualSourceKey,
           targetPath,
           targetKey,
           size: sourceObject.size || 0
@@ -1483,19 +1554,21 @@ async function buildDeleteTaskItems(env, auth, selectedItems) {
       }
 
       const sourceKey = itemPathToR2Key(itemPath);
-      const sourceObject = await env.R2_BUCKET.head(sourceKey);
+      const resolvedSource = await headR2Object(env, sourceKey);
+      const sourceObject = resolvedSource?.object || null;
+      const actualSourceKey = resolvedSource?.key || sourceKey;
       const sourcePrefix = sourceKey + '/';
-      const folderCheck = await env.R2_BUCKET.list({ prefix: sourcePrefix, limit: 1 });
+      const folderCheck = await listR2Prefix(env, sourcePrefix, { limit: 1 });
       const isFolder = !!(folderCheck.objects && folderCheck.objects.length > 0);
       if (!sourceObject && !isFolder) throw new Error('项目不存在: ' + itemPath);
 
-      if (sourceObject && !reservedKeys.has(sourceKey)) {
-        reservedKeys.add(sourceKey);
+      if (sourceObject && !reservedKeys.has(actualSourceKey)) {
+        reservedKeys.add(actualSourceKey);
         taskItems.push({
           sourcePath: itemPath,
-          sourceKey,
+          sourceKey: actualSourceKey,
           targetPath: itemPath,
-          targetKey: sourceKey,
+          targetKey: actualSourceKey,
           size: sourceObject.size || 0
         });
       }
@@ -1503,7 +1576,7 @@ async function buildDeleteTaskItems(env, auth, selectedItems) {
       if (isFolder) {
         let cursor;
         do {
-          const listed = await env.R2_BUCKET.list({ prefix: sourcePrefix, cursor });
+          const listed = await listR2Prefix(env, sourcePrefix);
           for (const obj of listed.objects || []) {
             if (reservedKeys.has(obj.key)) continue;
             reservedKeys.add(obj.key);
@@ -1516,7 +1589,7 @@ async function buildDeleteTaskItems(env, auth, selectedItems) {
               size: obj.size || 0
             });
           }
-          cursor = listed.truncated ? listed.cursor : null;
+          cursor = null;
         } while (cursor);
       }
     } catch (error) {
@@ -1581,8 +1654,9 @@ async function handleCreateTask(request, env) {
       const filePath = normalizeItemPath(body.path || body.sourcePath || '');
       const permissionError = await requirePathPermission(env, auth, 'download', filePath);
       if (permissionError) return permissionError;
-      const object = await env.R2_BUCKET.head(itemPathToR2Key(filePath));
-      if (!object) return jsonResponse({ success: false, message: '文件不存在' }, 404);
+      const resolved = await headR2Object(env, itemPathToR2Key(filePath));
+      if (!resolved) return jsonResponse({ success: false, message: '文件不存在' }, 404);
+      const object = resolved.object;
       taskId = await insertFileTask(env, auth, {
         type,
         status: 'running',
@@ -1938,7 +2012,7 @@ async function cleanupMovedTaskSources(env, taskId) {
   const folderList = Array.from(folders).sort((a, b) => b.length - a.length);
   for (const folder of folderList) {
     const key = itemPathToR2Key(folder);
-    const listed = await env.R2_BUCKET.list({ prefix: key + '/', limit: 1 });
+    const listed = await listR2Prefix(env, key + '/', { limit: 1 });
     if (!listed.objects || listed.objects.length === 0) {
       await env.R2_BUCKET.delete(key + '/.folder').catch(() => null);
     }
@@ -2143,13 +2217,15 @@ async function collectBatchDownloadEntries(env, items) {
     const key = itemPathToR2Key(itemPath);
     if (!key) throw new Error('不能打包根目录');
 
-    const fileObject = await env.R2_BUCKET.head(key);
-    if (fileObject) {
-      if (usedKeys.has(key)) continue;
-      usedKeys.add(key);
+    const resolvedFile = await headR2Object(env, key);
+    if (resolvedFile) {
+      const actualKey = resolvedFile.key;
+      const fileObject = resolvedFile.object;
+      if (usedKeys.has(actualKey)) continue;
+      usedKeys.add(actualKey);
       addZipEntry(entries, usedNames, {
         name: nameFromItemPath(itemPath),
-        key,
+        key: actualKey,
         isDirectory: false,
         size: fileObject.size || 0,
         lastModified: fileObject.uploaded
@@ -2173,10 +2249,10 @@ async function collectBatchDownloadEntries(env, items) {
     });
 
     do {
-      const listed = await env.R2_BUCKET.list({ prefix, cursor });
+      const listed = await listR2Prefix(env, prefix, { cursor });
       for (const obj of listed.objects || []) {
         foundFolderObject = true;
-        const relativeName = obj.key.slice(prefix.length);
+        const relativeName = obj.key.replace(/^\/+/, '').slice(prefix.length);
         if (!relativeName || relativeName === '.folder') continue;
         if (relativeName.endsWith('/.folder')) {
           addZipEntry(entries, usedNames, {
@@ -2428,12 +2504,13 @@ async function handleDownloadFile(request, env, path) {
     const permissionError = await requirePathPermission(env, auth, 'download', itemPath);
     if (permissionError) return permissionError;
     
-    const object = await env.R2_BUCKET.get(key);
-    if (!object) {
+    const resolved = await getR2Object(env, key);
+    if (!resolved) {
       return jsonResponse({ success: false, message: '文件不存在' }, 404);
     }
+    const object = resolved.object;
     
-    const filename = key.split('/').pop();
+    const filename = nameFromItemPath(itemPath);
     await recordRecentVisit(env, auth, {
       path: itemPath,
       name: filename,
@@ -2468,14 +2545,15 @@ async function handlePreviewFile(request, env, path) {
     const permissionError = await requirePathPermission(env, auth, 'preview', itemPath);
     if (permissionError) return permissionError;
     
-    const object = await env.R2_BUCKET.get(key, {
+    const resolved = await getR2Object(env, key, {
       range: request.headers
     });
-    if (!object) {
+    if (!resolved) {
       return jsonResponse({ success: false, message: '文件不存在' }, 404);
     }
+    const object = resolved.object;
     
-    const filename = key.split('/').pop();
+    const filename = nameFromItemPath(itemPath);
     const contentType = object.httpMetadata?.contentType || getMimeType(filename);
     await recordRecentVisit(env, auth, {
       path: itemPath,
@@ -2635,8 +2713,9 @@ async function describeShareItem(env, rawPath) {
   if (!path || path === '/') throw new Error('不能分享根目录');
 
   const key = itemPathToR2Key(path);
-  const object = await env.R2_BUCKET.head(key);
-  if (object) {
+  const resolved = await headR2Object(env, key);
+  if (resolved) {
+    const object = resolved.object;
     return {
       path,
       name: nameFromItemPath(path),
@@ -2647,7 +2726,7 @@ async function describeShareItem(env, rawPath) {
     };
   }
 
-  const folderCheck = await env.R2_BUCKET.list({ prefix: key + '/', limit: 1 });
+  const folderCheck = await listR2Prefix(env, key + '/', { limit: 1 });
   if (folderCheck.objects && folderCheck.objects.length > 0) {
     return {
       path,
@@ -3012,8 +3091,9 @@ async function buildShareRootListing(env, share) {
       continue;
     }
 
-    const object = await env.R2_BUCKET.head(itemPathToR2Key(item.path));
-    if (!object) continue;
+    const resolved = await headR2Object(env, itemPathToR2Key(item.path));
+    if (!resolved) continue;
+    const object = resolved.object;
     files.push({
       name: item.name,
       path: normalizeItemPath(item.path),
@@ -3144,10 +3224,11 @@ async function handleShareDownload(request, env, shareId) {
     
     // Get file from R2
     const filename = nameFromItemPath(targetPath);
-    const object = await env.R2_BUCKET.get(itemPathToR2Key(targetPath));
-    if (!object) {
+    const resolved = await getR2Object(env, itemPathToR2Key(targetPath));
+    if (!resolved) {
       return jsonResponse({ success: false, message: '文件不存在' }, 404);
     }
+    const object = resolved.object;
     
     await env.D1_DB.prepare(`
       UPDATE share_links
@@ -3434,6 +3515,77 @@ async function handleAdminListResources(request, env) {
     });
   } catch (e) {
     return jsonResponse({ success: false, message: '读取资源列表失败: ' + e.message }, 500);
+  }
+}
+
+async function handleAdminStorageDebug(request, env) {
+  const auth = await requireAdmin(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    requireRequiredConfig(env, ['KV_STORE', 'R2_BUCKET', 'D1_DB']);
+    const url = new URL(request.url);
+    const currentPath = normalizeDirectoryPath(url.searchParams.get('path') || '/');
+    const prefix = directoryPathToR2Prefix(currentPath);
+    const slashPrefix = '/' + prefix;
+    const cached = await readDirectoryCache(env, currentPath).catch(error => ({
+      error: error.message
+    }));
+    const directoryListing = await env.R2_BUCKET.list({ prefix, delimiter: '/', limit: 20 });
+    const slashDirectoryListing = slashPrefix === prefix
+      ? null
+      : await env.R2_BUCKET.list({ prefix: slashPrefix, delimiter: '/', limit: 20 });
+    const rawListing = await env.R2_BUCKET.list({ limit: 20 });
+    const d1Count = await env.D1_DB.prepare('SELECT COUNT(*) AS count FROM search_items').first().catch(error => ({
+      error: error.message
+    }));
+
+    return jsonResponse({
+      success: true,
+      path: currentPath,
+      prefix,
+      slashPrefix,
+      cache: cached
+        ? {
+            error: cached.error || null,
+            cached: cached.cached === true,
+            files: Array.isArray(cached.files) ? cached.files.length : 0,
+            folders: Array.isArray(cached.folders) ? cached.folders.length : 0,
+            refreshedAt: cached.refreshedAt || null
+          }
+        : null,
+      r2Directory: {
+        files: (directoryListing.objects || []).map(obj => ({
+          key: obj.key,
+          size: obj.size || 0,
+          uploaded: isoDateString(obj.uploaded)
+        })),
+        folders: directoryListing.delimitedPrefixes || [],
+        truncated: !!directoryListing.truncated
+      },
+      r2SlashDirectory: slashDirectoryListing
+        ? {
+            files: (slashDirectoryListing.objects || []).map(obj => ({
+              key: obj.key,
+              size: obj.size || 0,
+              uploaded: isoDateString(obj.uploaded)
+            })),
+            folders: slashDirectoryListing.delimitedPrefixes || [],
+            truncated: !!slashDirectoryListing.truncated
+          }
+        : null,
+      r2RawSample: {
+        objects: (rawListing.objects || []).map(obj => ({
+          key: obj.key,
+          size: obj.size || 0,
+          uploaded: isoDateString(obj.uploaded)
+        })),
+        truncated: !!rawListing.truncated
+      },
+      d1SearchItems: d1Count && d1Count.error ? d1Count : Number(d1Count?.count || 0)
+    });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '存储诊断失败: ' + e.message }, 500);
   }
 }
 
@@ -4088,6 +4240,7 @@ function addFolderSearchRowsFromR2Key(folderRows, key, indexedAt) {
 }
 
 async function rebuildSearchIndex(env) {
+  requireRequiredConfig(env, ['R2_BUCKET', 'D1_DB']);
   await ensureD1Schema(env);
 
   const indexedAt = Date.now();
@@ -6133,7 +6286,9 @@ const FIXED_LOGIN_PAGE = `
           })
         });
 
-        const data = await response.json();
+        const data = await response.json().catch(function () {
+          return { success: false, message: '服务返回异常，请检查 Worker 日志和绑定配置' };
+        });
         if (data.success) {
           showToast('登录成功', 'success');
           window.setTimeout(function () {
@@ -6587,6 +6742,7 @@ const FIXED_INDEX_PAGE = `
   <script>
     let currentPath = '/';
     let currentView = 'files';
+    let currentUserRole = null;
     let currentReader = null;
     let readerSaveTimer = null;
     const selectedItems = new Map();
@@ -6992,7 +7148,8 @@ const FIXED_INDEX_PAGE = `
       try {
         const response = await fetch('/api/auth/check');
         const data = await response.json();
-        if (!data.authenticated) { window.location.href = '/login.html'; return; }
+        if (!data.authenticated) { window.location.href = '/login.html'; return false; }
+        currentUserRole = data.role || null;
         const initResp = await fetch('/api/d1/init');
         const initData = await initResp.json();
         if (initData.initialized) {
@@ -7004,8 +7161,10 @@ const FIXED_INDEX_PAGE = `
           msg.textContent = '';
         }
         await loadTagOptions();
+        return true;
       } catch (error) {
         window.location.href = '/login.html';
+        return false;
       }
     }
 
@@ -7017,13 +7176,19 @@ const FIXED_INDEX_PAGE = `
       showLoading(true);
       try {
         const response = await fetch(apiFileUrl('/api/files', currentPath));
-        const data = await response.json();
+        let data = await response.json().catch(function () {
+          return { success: false, message: '文件列表接口返回异常' };
+        });
         if (!data.success) {
           if (response.status === 401) {
             window.location.href = '/login.html';
             return;
           }
           throw new Error(data.message || '加载失败');
+        }
+        if (!searchRequestId && data.cached && isEmptyFileListing(data)) {
+          const refreshed = await refreshDirectoryFromSource();
+          if (refreshed && refreshed.success) data = refreshed;
         }
         if (searchRequestId && searchRequestId !== globalSearchRequestId) return;
         currentPath = data.currentPath || currentPath;
@@ -7037,6 +7202,26 @@ const FIXED_INDEX_PAGE = `
         showToast('加载文件失败: ' + error.message, 'error');
       } finally {
         showLoading(false);
+      }
+    }
+
+    function isEmptyFileListing(data) {
+      return (!data.folders || data.folders.length === 0) && (!data.files || data.files.length === 0);
+    }
+
+    async function refreshDirectoryFromSource() {
+      try {
+        const response = await fetch(apiFileUrl('/api/files', currentPath) + '?refresh=1');
+        const data = await response.json().catch(function () {
+          return { success: false, message: '目录刷新接口返回异常' };
+        });
+        if (!response.ok || !data.success) {
+          throw new Error(data.message || '目录刷新失败');
+        }
+        return data;
+      } catch (error) {
+        console.warn('Directory source refresh failed:', error);
+        return null;
       }
     }
 
@@ -7324,8 +7509,10 @@ const FIXED_INDEX_PAGE = `
           }),
           fetch('/api/search?q=&type=all&limit=1&refresh=1')
         ]);
-        const data = await cacheResp.json();
-        if (!data.success) throw new Error(data.message || '刷新失败');
+        const data = await cacheResp.json().catch(function () { return {}; });
+        const indexData = await indexResp.json().catch(function () { return {}; });
+        if (!cacheResp.ok || !data.success) throw new Error(data.message || '目录刷新失败');
+        if (!indexResp.ok || !indexData.success) throw new Error(indexData.message || '索引刷新失败');
         currentPath = data.currentPath || currentPath;
         clearSelection(false);
         await loadFavoritePaths();
@@ -7389,7 +7576,10 @@ const FIXED_INDEX_PAGE = `
 
       if (folders.length === 0 && files.length === 0) {
         emptyState.style.display = 'block';
-        emptyState.querySelector('div:last-child').textContent = '此文件夹为空';
+        emptyState.querySelector('div:last-child').textContent =
+          currentUserRole === 'user' && currentPath === '/'
+            ? '暂无可访问资源，请联系管理员授权'
+            : '此文件夹为空';
         return;
       }
 
@@ -7867,7 +8057,7 @@ const FIXED_INDEX_PAGE = `
           const result = await window.mammoth.convertToHtml({ arrayBuffer: buffer });
           const wrapper = document.createElement('div');
           wrapper.className = 'preview-markdown';
-          wrapper.innerHTML = result.value;
+          wrapper.innerHTML = sanitizePreviewHtml(result.value);
           content.replaceChildren(wrapper);
         } else if (previewType === 'text') {
           const response = await fetch(previewUrl);
@@ -7880,7 +8070,7 @@ const FIXED_INDEX_PAGE = `
           } else if (ext === 'md' && window.marked) {
             const wrapper = document.createElement('div');
             wrapper.className = 'preview-markdown';
-            wrapper.innerHTML = window.marked.parse(text);
+            wrapper.innerHTML = sanitizePreviewHtml(window.marked.parse(text));
             content.replaceChildren(wrapper);
           } else {
             const pre = document.createElement('pre');
@@ -8058,24 +8248,103 @@ const FIXED_INDEX_PAGE = `
     function decodeTextBuffer(buffer) {
       const bytes = new Uint8Array(buffer);
       if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
-        return new TextDecoder('utf-8').decode(bytes.subarray(3));
+        return decodeBytes(bytes.subarray(3), 'utf-8');
       }
       if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
-        return new TextDecoder('utf-16le').decode(bytes.subarray(2));
+        return decodeBytes(bytes.subarray(2), 'utf-16le');
       }
       if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
-        return new TextDecoder('utf-16be').decode(bytes.subarray(2));
+        return decodeUtf16Be(bytes.subarray(2));
       }
 
-      try {
-        return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-      } catch (error) {
-        try {
-          return new TextDecoder('gb18030').decode(bytes);
-        } catch (gbError) {
-          return new TextDecoder('utf-8').decode(bytes);
-        }
+      const utf8Text = tryDecodeBytes(bytes, 'utf-8', { fatal: true });
+      if (utf8Text !== null) return utf8Text;
+
+      for (const label of ['gb18030', 'gbk']) {
+        const decoded = tryDecodeBytes(bytes, label);
+        if (decoded !== null) return decoded;
       }
+
+      return decodeBytes(bytes, 'utf-8');
+    }
+
+    function tryDecodeBytes(bytes, label, options) {
+      try {
+        return new TextDecoder(label, options || {}).decode(bytes);
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function decodeBytes(bytes, label) {
+      const decoded = tryDecodeBytes(bytes, label);
+      return decoded !== null ? decoded : latin1Fallback(bytes);
+    }
+
+    function latin1Fallback(bytes) {
+      const chunkSize = 8192;
+      let text = '';
+      for (let index = 0; index < bytes.length; index += chunkSize) {
+        text += String.fromCharCode.apply(null, Array.from(bytes.subarray(index, index + chunkSize)));
+      }
+      return text;
+    }
+
+    function decodeUtf16Be(bytes) {
+      const chars = [];
+      for (let index = 0; index + 1 < bytes.length; index += 2) {
+        chars.push(String.fromCharCode((bytes[index] << 8) | bytes[index + 1]));
+      }
+      return chars.join('');
+    }
+
+    function sanitizePreviewHtml(html) {
+      const template = document.createElement('template');
+      template.innerHTML = html || '';
+      const blockedTags = new Set(['script', 'style', 'iframe', 'object', 'embed', 'form', 'input', 'button', 'textarea', 'select', 'meta', 'link', 'base']);
+
+      function cleanElement(element) {
+        const tagName = element.tagName.toLowerCase();
+        if (blockedTags.has(tagName)) {
+          element.remove();
+          return;
+        }
+
+        Array.from(element.attributes).forEach(function (attr) {
+          const name = attr.name.toLowerCase();
+          const value = attr.value.trim();
+
+          if (name.startsWith('on') || name === 'srcdoc' || name === 'style') {
+            element.removeAttribute(attr.name);
+            return;
+          }
+
+          if (['href', 'src', 'xlink:href'].includes(name) && !isSafePreviewUrl(value, tagName, name)) {
+            element.removeAttribute(attr.name);
+          }
+        });
+
+        Array.from(element.children).forEach(cleanElement);
+      }
+
+      Array.from(template.content.children).forEach(cleanElement);
+      return template.innerHTML;
+    }
+
+    function isSafePreviewUrl(value, tagName, attrName) {
+      if (!value || value.startsWith('#') || value.startsWith('/') || value.startsWith('./') || value.startsWith('../')) {
+        return true;
+      }
+
+      let url;
+      try {
+        url = new URL(value, window.location.origin);
+      } catch (error) {
+        return false;
+      }
+
+      if (['http:', 'https:', 'mailto:', 'tel:'].includes(url.protocol)) return true;
+      return tagName === 'img' && attrName === 'src' && url.protocol === 'data:' && /^data:image\\/(?:png|jpe?g|gif|webp);/i.test(value);
     }
 
     function showPreviewError(message) {
@@ -8893,10 +9162,30 @@ const FIXED_INDEX_PAGE = `
       }, 3000);
     }
 
-    initializeBatchFolderSearch();
-    checkAuth();
-    startTaskMonitor();
-    loadFiles();
+    function installClientErrorHandlers() {
+      window.addEventListener('error', function (event) {
+        const message = event && event.message ? event.message : '页面脚本错误';
+        console.error('Client script error:', event.error || message);
+        showToast('页面脚本错误: ' + message, 'error');
+      });
+      window.addEventListener('unhandledrejection', function (event) {
+        const reason = event && event.reason;
+        const message = reason && reason.message ? reason.message : String(reason || '未处理的异步错误');
+        console.error('Unhandled promise rejection:', reason || message);
+        showToast('页面请求错误: ' + message, 'error');
+      });
+    }
+
+    installClientErrorHandlers();
+    async function initializeApp() {
+      initializeBatchFolderSearch();
+      const authenticated = await checkAuth();
+      if (!authenticated) return;
+      startTaskMonitor();
+      await loadFiles();
+    }
+
+    initializeApp();
   </script>
 </body>
 </html>
@@ -10096,6 +10385,10 @@ export default {
 
         if (path === '/api/admin/resources/list' && method === 'GET') {
           return await handleAdminListResources(request, env);
+        }
+
+        if (path === '/api/admin/debug/storage' && method === 'GET') {
+          return await handleAdminStorageDebug(request, env);
         }
 
         if (path.match(/^\/api\/admin\/users\/[^/]+\/permissions$/) && method === 'GET') {
