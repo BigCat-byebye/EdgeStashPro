@@ -1,0 +1,28 @@
+# Wrangler deployment config.
+#
+# Before deploying your own instance, replace the values below:
+# - name: your Worker name
+# - compatibility_date: keep this date or update after testing with a newer runtime
+# - kv_namespaces.id: your KV namespace ID
+# - r2_buckets.bucket_name: your R2 bucket name
+# - d1_databases.database_name/database_id: your D1 database name and ID
+#
+# keep_vars = true preserves Dashboard-defined variables such as ADMIN_PASSWORD
+# during `wrangler deploy`. Do not remove it unless you manage all vars in config.
+name = "edgestash"
+main = "worker.js"
+compatibility_date = "2026-05-15"
+keep_vars = true
+
+[[kv_namespaces]]
+binding = "KV_STORE"
+id = "xxxxxxxxxxxx"
+
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "xxxxxxxxxxxxxxxxx"
+
+[[d1_databases]]
+binding = "D1_DB"
+database_name = "xxxxxxxxxxxxxxxx"
+database_id = "xxxxxxxxxxxxxxxxx"
