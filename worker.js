@@ -2668,6 +2668,112 @@ async function handlePutReaderProgress(request, env) {
   }
 }
 
+function readerBookmarkToClient(row) {
+  return {
+    id: row.id,
+    path: row.path,
+    charOffset: Number(row.char_offset || 0),
+    progress: Number(row.progress || 0),
+    snippet: row.snippet || '',
+    createdAt: Number(row.created_at || 0)
+  };
+}
+
+async function validateReaderBookmarkPath(env, auth, rawPath) {
+  const filePath = normalizeItemPath(rawPath || '');
+  if (!filePath || filePath === '/' || !isTxtReaderPath(filePath)) {
+    return { error: jsonResponse({ success: false, message: '书签只支持 txt 文件' }, 400) };
+  }
+  const permissionError = await requirePathPermission(env, auth, 'preview', filePath);
+  return permissionError ? { error: permissionError } : { filePath };
+}
+
+async function handleReaderBookmarks(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    await ensureD1Schema(env);
+    const ownerKey = ownerKeyFromAuth(auth);
+
+    if (request.method === 'GET') {
+      const checked = await validateReaderBookmarkPath(
+        env,
+        auth,
+        new URL(request.url).searchParams.get('path')
+      );
+      if (checked.error) return checked.error;
+      const result = await env.D1_DB.prepare(`
+        SELECT id, path, char_offset, progress, snippet, created_at
+        FROM reader_bookmarks
+        WHERE owner_key = ? AND path = ?
+        ORDER BY created_at DESC
+        LIMIT 200
+      `).bind(ownerKey, checked.filePath).all();
+      return jsonResponse({
+        success: true,
+        bookmarks: (result.results || []).map(readerBookmarkToClient)
+      });
+    }
+
+    if (request.method === 'POST') {
+      const body = await request.json();
+      const checked = await validateReaderBookmarkPath(env, auth, body.path);
+      if (checked.error) return checked.error;
+      const charOffset = Math.floor(normalizeReaderNumber(body.charOffset, 0, 0, Number.MAX_SAFE_INTEGER));
+      const progress = normalizeReaderNumber(body.progress, 0, 0, 1);
+      const snippet = String(body.snippet || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+      const duplicate = await env.D1_DB.prepare(`
+        SELECT id FROM reader_bookmarks
+        WHERE owner_key = ? AND path = ? AND ABS(char_offset - ?) <= 2
+        LIMIT 1
+      `).bind(ownerKey, checked.filePath, charOffset).first();
+      if (duplicate) {
+        return jsonResponse({ success: false, message: '当前位置已经有书签' }, 409);
+      }
+      const bookmark = {
+        id: generateId(20),
+        path: checked.filePath,
+        charOffset,
+        progress,
+        snippet,
+        createdAt: Date.now()
+      };
+      await env.D1_DB.prepare(`
+        INSERT INTO reader_bookmarks (id, owner_key, path, char_offset, progress, snippet, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        bookmark.id,
+        ownerKey,
+        bookmark.path,
+        bookmark.charOffset,
+        bookmark.progress,
+        bookmark.snippet,
+        bookmark.createdAt
+      ).run();
+      return jsonResponse({ success: true, bookmark }, 201);
+    }
+
+    return jsonResponse({ success: false, message: '方法不支持' }, 405);
+  } catch (e) {
+    return jsonResponse({ success: false, message: '书签操作失败: ' + e.message }, 500);
+  }
+}
+
+async function handleDeleteReaderBookmark(request, env, bookmarkId) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    await ensureD1Schema(env);
+    await env.D1_DB.prepare('DELETE FROM reader_bookmarks WHERE id = ? AND owner_key = ?')
+      .bind(bookmarkId, ownerKeyFromAuth(auth)).run();
+    return jsonResponse({ success: true });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '删除书签失败: ' + e.message }, 500);
+  }
+}
+
 async function deleteReaderProgressForUser(env, email) {
   const prefix = `reader:user:${email}:`;
   let cursor;
@@ -2677,6 +2783,12 @@ async function deleteReaderProgressForUser(env, email) {
     await Promise.all(listed.keys.map(key => env.KV_STORE.delete(key.name)));
     cursor = listed.list_complete ? null : listed.cursor;
   } while (cursor);
+
+  if (env.D1_DB) {
+    await ensureD1Schema(env);
+    await env.D1_DB.prepare('DELETE FROM reader_bookmarks WHERE owner_key = ?')
+      .bind(`user:${email}`).run();
+  }
 }
 
 function shareRowToClient(row) {
@@ -3669,6 +3781,16 @@ async function ensureD1Schema(env) {
       value INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL
     )`,
+    `CREATE TABLE IF NOT EXISTS reader_bookmarks (
+      id TEXT PRIMARY KEY,
+      owner_key TEXT NOT NULL,
+      path TEXT NOT NULL,
+      char_offset INTEGER NOT NULL DEFAULT 0,
+      progress REAL NOT NULL DEFAULT 0,
+      snippet TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL
+    )`,
+    'CREATE INDEX IF NOT EXISTS idx_reader_bookmarks_owner_path_created ON reader_bookmarks(owner_key, path, created_at DESC)',
     ...USER_PERMISSIONS_DDL,
     ...FILE_TASKS_DDL
   ];
@@ -3711,12 +3833,6 @@ const USER_PERMISSIONS_DDL = [
   'CREATE INDEX IF NOT EXISTS idx_user_permissions_email_path ON user_permissions(email, path)',
   'CREATE INDEX IF NOT EXISTS idx_user_permissions_email_updated ON user_permissions(email, updated_at DESC)'
 ];
-
-async function ensureUserPermissionsSchema(env) {
-  for (const statement of USER_PERMISSIONS_DDL) {
-    await env.D1_DB.prepare(statement).run();
-  }
-}
 
 const FILE_TASKS_DDL = [
   `CREATE TABLE IF NOT EXISTS file_tasks (
@@ -4176,11 +4292,12 @@ async function cleanupD1ItemPath(env, path) {
     await ensureD1Schema(env);
     const normalized = normalizeItemPath(path);
     if (!normalized || normalized === '/') return;
-    const childPattern = normalized + '/%';
+    const childPattern = escapeLike(normalized) + '/%';
     const statements = [
-      env.D1_DB.prepare('DELETE FROM search_items WHERE path = ? OR path LIKE ?').bind(normalized, childPattern),
-      env.D1_DB.prepare('DELETE FROM favorites WHERE path = ? OR path LIKE ?').bind(normalized, childPattern),
-      env.D1_DB.prepare('DELETE FROM recent_items WHERE path = ? OR path LIKE ?').bind(normalized, childPattern)
+      env.D1_DB.prepare("DELETE FROM search_items WHERE path = ? OR path LIKE ? ESCAPE '\\'").bind(normalized, childPattern),
+      env.D1_DB.prepare("DELETE FROM favorites WHERE path = ? OR path LIKE ? ESCAPE '\\'").bind(normalized, childPattern),
+      env.D1_DB.prepare("DELETE FROM recent_items WHERE path = ? OR path LIKE ? ESCAPE '\\'").bind(normalized, childPattern),
+      env.D1_DB.prepare("DELETE FROM reader_bookmarks WHERE path = ? OR path LIKE ? ESCAPE '\\'").bind(normalized, childPattern)
     ];
     await env.D1_DB.batch(statements);
   } catch (e) {
@@ -4516,6 +4633,7 @@ const CSS_STYLES = `
   }
   
   :root {
+    color-scheme: dark;
     --primary: #6366f1;
     --primary-dark: #4f46e5;
     --primary-light: #818cf8;
@@ -4530,6 +4648,24 @@ const CSS_STYLES = `
     --warning: #f59e0b;
     --error: #ef4444;
     --gradient: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #06b6d4 100%);
+  }
+
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --primary: #4f46e5;
+    --primary-dark: #4338ca;
+    --primary-light: #6366f1;
+    --secondary: #7c3aed;
+    --accent: #0891b2;
+    --background: #f1f5f9;
+    --surface: #ffffff;
+    --surface-light: #e2e8f0;
+    --text: #0f172a;
+    --text-muted: #64748b;
+    --success: #059669;
+    --warning: #d97706;
+    --error: #dc2626;
+    --gradient: linear-gradient(135deg, #4f46e5 0%, #7c3aed 50%, #0891b2 100%);
   }
   
   body {
@@ -4611,6 +4747,21 @@ const CSS_STYLES = `
 
   .icon-btn.btn-danger:hover {
     transform: scale(1.1);
+  }
+
+  .theme-toggle {
+    width: 38px;
+    height: 38px;
+    padding: 0;
+    flex: 0 0 38px;
+    font-size: 18px;
+  }
+
+  .theme-toggle-floating {
+    position: fixed;
+    top: 18px;
+    right: 18px;
+    z-index: 50;
   }
 
   .action-icon {
@@ -4821,6 +4972,97 @@ const CSS_STYLES = `
     display: flex;
     gap: 12px;
     align-items: center;
+  }
+
+  .reader-tools {
+    display: none;
+    align-items: center;
+    gap: 6px;
+    position: relative;
+  }
+
+  .reader-tools.active {
+    display: flex;
+  }
+
+  .reader-font-size {
+    min-width: 30px;
+    color: var(--text-muted);
+    text-align: center;
+    font-size: 13px;
+  }
+
+  .reader-tool-btn {
+    padding: 7px 10px;
+  }
+
+  .bookmark-panel {
+    position: absolute;
+    top: calc(100% + 10px);
+    right: 0;
+    width: min(360px, calc(100vw - 24px));
+    max-height: min(460px, 65vh);
+    overflow: auto;
+    padding: 12px;
+    border: 1px solid var(--surface-light);
+    border-radius: 10px;
+    background: var(--surface);
+    box-shadow: 0 18px 45px rgba(0, 0, 0, 0.28);
+    z-index: 5;
+  }
+
+  .bookmark-panel[hidden] {
+    display: none;
+  }
+
+  .bookmark-add {
+    width: 100%;
+    margin-bottom: 10px;
+  }
+
+  .bookmark-empty {
+    padding: 20px 8px;
+    color: var(--text-muted);
+    text-align: center;
+  }
+
+  .bookmark-item {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    padding: 10px 0;
+    border-top: 1px solid var(--surface-light);
+  }
+
+  .bookmark-jump {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .bookmark-meta {
+    color: var(--primary-light);
+    font-size: 12px;
+  }
+
+  .bookmark-snippet {
+    margin-top: 3px;
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 1.45;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+
+  .bookmark-delete {
+    width: 30px;
+    height: 30px;
+    padding: 0;
   }
 
   .preview-icon-btn {
@@ -5708,6 +5950,21 @@ const CSS_STYLES = `
       display: none;
     }
 
+    .preview-actions .reader-tools .reader-tool-btn,
+    .preview-actions .reader-tools .bookmark-add,
+    .preview-actions .reader-tools .bookmark-delete {
+      display: inline-flex;
+    }
+
+    .reader-tools {
+      gap: 3px;
+    }
+
+    .reader-tool-btn {
+      padding: 6px 8px;
+      font-size: 12px;
+    }
+
     .preview-icon-btn {
       display: inline-flex;
     }
@@ -6201,6 +6458,39 @@ const CSS_STYLES = `
 </style>
 `;
 
+const THEME_BOOTSTRAP = `
+  <script>
+    (function () {
+      const key = 'edgestash:theme:v1';
+      let saved = null;
+      try { saved = localStorage.getItem(key); } catch (error) {}
+      const preferred = saved === 'light' || saved === 'dark'
+        ? saved
+        : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+      document.documentElement.dataset.theme = preferred;
+
+      window.toggleTheme = function () {
+        const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+        document.documentElement.dataset.theme = next;
+        try { localStorage.setItem(key, next); } catch (error) {}
+        updateThemeButtons();
+      };
+
+      function updateThemeButtons() {
+        const dark = document.documentElement.dataset.theme === 'dark';
+        document.querySelectorAll('[data-theme-toggle]').forEach(function (button) {
+          button.textContent = dark ? '☀️' : '🌙';
+          button.title = dark ? '切换到日间模式' : '切换到夜间模式';
+          button.setAttribute('aria-label', button.title);
+        });
+      }
+
+      document.addEventListener('DOMContentLoaded', updateThemeButtons);
+    })();
+  </script>`;
+
+const THEME_TOGGLE_BUTTON = `<button type="button" class="btn btn-secondary theme-toggle" data-theme-toggle onclick="toggleTheme()" aria-label="切换颜色主题"></button>`;
+
 const FIXED_LOGIN_PAGE = `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -6208,9 +6498,11 @@ const FIXED_LOGIN_PAGE = `
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>登录 - EdgeStashPro</title>
+  ${THEME_BOOTSTRAP}
   ${CSS_STYLES}
 </head>
 <body>
+  <div class="theme-toggle-floating">${THEME_TOGGLE_BUTTON}</div>
   <div class="login-container">
     <div class="login-card">
       <div class="login-header">
@@ -6514,15 +6806,17 @@ const FIXED_INDEX_PAGE = `
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>EdgeStashPro - 云盘</title>
+  ${THEME_BOOTSTRAP}
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
   ${CSS_STYLES}
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js" integrity="sha384-948ahk4ZmxYVYOc+rxN1H2gM1EJ2Duhp7uHtZ4WSLkV4Vtx5MUqnV+l7u9B+jFv+" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js" integrity="sha384-nFoSjZIoH3CCp8W639jJyQkuPHinJ2NHe7on1xvlUA7SuGfJAfvMldrsoAVm6ECz" crossorigin="anonymous"></script>
 </head>
 <body>
   <div class="header">
     <div class="logo">EdgeStashPro</div>
     <div class="header-actions">
+      ${THEME_TOGGLE_BUTTON}
       <button type="button" class="task-chip" id="taskChip" onclick="openTaskPanel()">
         <span class="task-chip-text" id="taskChipText"></span>
       </button>
@@ -6727,6 +7021,16 @@ const FIXED_INDEX_PAGE = `
     <div class="preview-header">
       <div class="preview-filename" id="previewFilename"></div>
       <div class="preview-actions">
+        <div class="reader-tools" id="readerTools">
+          <button type="button" class="btn btn-secondary reader-tool-btn" onclick="adjustReaderFontSize(-2)" aria-label="缩小字体">A−</button>
+          <span class="reader-font-size" id="readerFontSize">18</span>
+          <button type="button" class="btn btn-secondary reader-tool-btn" onclick="adjustReaderFontSize(2)" aria-label="放大字体">A+</button>
+          <button type="button" class="btn btn-secondary reader-tool-btn" id="bookmarkToggleBtn" onclick="toggleBookmarkPanel(event)">🔖 书签</button>
+          <div class="bookmark-panel" id="bookmarkPanel" hidden onclick="event.stopPropagation()">
+            <button type="button" class="btn btn-primary bookmark-add" onclick="addCurrentBookmark()">添加当前位置</button>
+            <div id="bookmarkList"></div>
+          </div>
+        </div>
         <button type="button" class="btn btn-primary" id="previewDownloadBtn">下载</button>
         <button type="button" class="btn btn-secondary" onclick="closePreview()">关闭</button>
         <button type="button" class="preview-icon-btn preview-download" onclick="document.getElementById('previewDownloadBtn').click()">⬇</button>
@@ -6745,6 +7049,8 @@ const FIXED_INDEX_PAGE = `
     let currentUserRole = null;
     let currentReader = null;
     let readerSaveTimer = null;
+    let readerBookmarks = [];
+    const READER_FONT_SIZE_KEY = 'edgestash:reader-font-size:v1';
     const selectedItems = new Map();
     const favoritePaths = new Set();
     let folderSearchTimer = null;
@@ -8012,9 +8318,12 @@ const FIXED_INDEX_PAGE = `
       const content = document.getElementById('previewContent');
       const filenameEl = document.getElementById('previewFilename');
       const downloadBtn = document.getElementById('previewDownloadBtn');
+      const readerTools = document.getElementById('readerTools');
 
       stopReaderProgressTracking();
       content.classList.remove('reader-mode');
+      readerTools.classList.remove('active');
+      document.getElementById('bookmarkPanel').hidden = true;
       filenameEl.textContent = filename;
       downloadBtn.onclick = function () {
         downloadFile(path);
@@ -8096,18 +8405,32 @@ const FIXED_INDEX_PAGE = `
 
     async function renderTxtReader(content, path, text) {
       content.classList.add('reader-mode');
+      document.getElementById('readerTools').classList.add('active');
 
       const reader = document.createElement('div');
       reader.className = 'preview-reader';
+      reader.style.fontSize = getReaderFontSize() + 'px';
       reader.tabIndex = 0;
       const textNode = document.createTextNode(text);
       reader.appendChild(textNode);
       content.replaceChildren(reader);
 
-      const state = { path, text, reader, textNode };
+      const state = {
+        path,
+        text,
+        reader,
+        textNode,
+        saveInFlight: null,
+        saveQueued: false,
+        lastSavedOffset: null,
+        lastSavedAt: 0,
+        retryTimer: null
+      };
       currentReader = state;
+      updateReaderFontSizeLabel();
 
       await restoreReaderProgress(state);
+      await loadReaderBookmarks(state);
       reader.addEventListener('scroll', function () {
         scheduleReaderProgressSave(state);
       }, { passive: true });
@@ -8179,7 +8502,7 @@ const FIXED_INDEX_PAGE = `
       readerSaveTimer = setTimeout(function () {
         readerSaveTimer = null;
         saveReaderProgress(state);
-      }, 500);
+      }, 1800);
     }
 
     function stopReaderProgressTracking() {
@@ -8196,25 +8519,178 @@ const FIXED_INDEX_PAGE = `
     }
 
     async function saveReaderProgress(state) {
+      const waitMs = 1100 - (Date.now() - state.lastSavedAt);
+      if (waitMs > 0) {
+        if (!state.retryTimer) {
+          state.retryTimer = window.setTimeout(function () {
+            state.retryTimer = null;
+            saveReaderProgress(state);
+          }, waitMs);
+        }
+        return;
+      }
+      if (state.saveInFlight) {
+        state.saveQueued = true;
+        return state.saveInFlight;
+      }
+
       try {
         const maxScrollTop = Math.max(0, state.reader.scrollHeight - state.reader.clientHeight);
         const progress = maxScrollTop > 0 ? state.reader.scrollTop / maxScrollTop : 0;
+        const charOffset = getReaderCharOffset(state);
+        if (charOffset === state.lastSavedOffset) return;
         const payload = {
           path: state.path,
-          charOffset: getReaderCharOffset(state),
+          charOffset,
           progress,
           scrollTop: state.reader.scrollTop,
           scrollHeight: state.reader.scrollHeight
         };
 
-        await fetch('/api/reader/progress', {
+        state.saveInFlight = fetch('/api/reader/progress', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
           keepalive: true
         });
+        const response = await state.saveInFlight;
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        state.lastSavedOffset = charOffset;
+        state.lastSavedAt = Date.now();
       } catch (error) {
         console.warn('Reader progress save failed:', error);
+      } finally {
+        state.saveInFlight = null;
+        if (state.saveQueued) {
+          state.saveQueued = false;
+          window.setTimeout(function () { saveReaderProgress(state); }, 1100);
+        }
+      }
+    }
+
+    function getReaderFontSize() {
+      try {
+        const saved = Number(localStorage.getItem(READER_FONT_SIZE_KEY));
+        if (Number.isFinite(saved)) return Math.max(12, Math.min(32, saved));
+      } catch (error) {}
+      return 18;
+    }
+
+    function updateReaderFontSizeLabel() {
+      document.getElementById('readerFontSize').textContent = String(getReaderFontSize());
+    }
+
+    async function adjustReaderFontSize(delta) {
+      if (!currentReader) return;
+      const state = currentReader;
+      const offset = getReaderCharOffset(state);
+      const next = Math.max(12, Math.min(32, getReaderFontSize() + delta));
+      try { localStorage.setItem(READER_FONT_SIZE_KEY, String(next)); } catch (error) {}
+      state.reader.style.fontSize = next + 'px';
+      updateReaderFontSizeLabel();
+      await waitForReaderLayout();
+      scrollReaderToCharOffset(state, offset);
+      scheduleReaderProgressSave(state);
+    }
+
+    function toggleBookmarkPanel(event) {
+      if (event) event.stopPropagation();
+      const panel = document.getElementById('bookmarkPanel');
+      panel.hidden = !panel.hidden;
+    }
+
+    async function loadReaderBookmarks(state) {
+      try {
+        const response = await fetch('/api/reader/bookmarks?path=' + encodeURIComponent(state.path));
+        const data = await response.json();
+        if (!response.ok || !data.success) throw new Error(data.message || '读取书签失败');
+        if (currentReader !== state) return;
+        readerBookmarks = data.bookmarks || [];
+        renderReaderBookmarks();
+      } catch (error) {
+        readerBookmarks = [];
+        renderReaderBookmarks('书签加载失败');
+      }
+    }
+
+    function renderReaderBookmarks(message) {
+      const list = document.getElementById('bookmarkList');
+      list.replaceChildren();
+      if (message || readerBookmarks.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'bookmark-empty';
+        empty.textContent = message || '还没有书签';
+        list.appendChild(empty);
+        return;
+      }
+
+      readerBookmarks.forEach(function (bookmark) {
+        const item = document.createElement('div');
+        item.className = 'bookmark-item';
+        const jump = document.createElement('button');
+        jump.type = 'button';
+        jump.className = 'bookmark-jump';
+        jump.addEventListener('click', function () { jumpToReaderBookmark(bookmark); });
+        const meta = document.createElement('div');
+        meta.className = 'bookmark-meta';
+        meta.textContent = Math.round((bookmark.progress || 0) * 100) + '% · ' + new Date(bookmark.createdAt).toLocaleString();
+        const snippet = document.createElement('div');
+        snippet.className = 'bookmark-snippet';
+        snippet.textContent = bookmark.snippet || '无文字摘要';
+        jump.append(meta, snippet);
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'btn btn-danger bookmark-delete';
+        remove.textContent = '×';
+        remove.setAttribute('aria-label', '删除书签');
+        remove.addEventListener('click', function () { deleteReaderBookmark(bookmark.id); });
+        item.append(jump, remove);
+        list.appendChild(item);
+      });
+    }
+
+    async function addCurrentBookmark() {
+      if (!currentReader) return;
+      const state = currentReader;
+      const charOffset = getReaderCharOffset(state);
+      const maxScrollTop = Math.max(0, state.reader.scrollHeight - state.reader.clientHeight);
+      const progress = maxScrollTop > 0 ? state.reader.scrollTop / maxScrollTop : 0;
+      const snippetStart = Math.max(0, charOffset - 30);
+      const snippet = state.text.slice(snippetStart, Math.min(state.text.length, charOffset + 100));
+      try {
+        const response = await fetch('/api/reader/bookmarks', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: state.path, charOffset, progress, snippet })
+        });
+        const data = await response.json();
+        if (!response.ok || !data.success) throw new Error(data.message || '添加书签失败');
+        readerBookmarks.unshift(data.bookmark);
+        renderReaderBookmarks();
+        showToast('书签已添加', 'success');
+      } catch (error) {
+        showToast(error.message, 'error');
+      }
+    }
+
+    function jumpToReaderBookmark(bookmark) {
+      if (!currentReader) return;
+      if (!scrollReaderToCharOffset(currentReader, bookmark.charOffset)) {
+        scrollReaderToProgress(currentReader, bookmark.progress);
+      }
+      document.getElementById('bookmarkPanel').hidden = true;
+      currentReader.reader.focus();
+    }
+
+    async function deleteReaderBookmark(bookmarkId) {
+      try {
+        const response = await fetch('/api/reader/bookmarks/' + encodeURIComponent(bookmarkId), { method: 'DELETE' });
+        const data = await response.json();
+        if (!response.ok || !data.success) throw new Error(data.message || '删除书签失败');
+        readerBookmarks = readerBookmarks.filter(function (bookmark) { return bookmark.id !== bookmarkId; });
+        renderReaderBookmarks();
+      } catch (error) {
+        showToast(error.message, 'error');
       }
     }
 
@@ -8358,13 +8834,26 @@ const FIXED_INDEX_PAGE = `
     function closePreview() {
       stopReaderProgressTracking();
       document.getElementById('previewOverlay').classList.remove('active');
+      document.getElementById('readerTools').classList.remove('active');
+      document.getElementById('bookmarkPanel').hidden = true;
       const content = document.getElementById('previewContent');
       content.classList.remove('reader-mode');
       content.replaceChildren();
+      readerBookmarks = [];
     }
 
     document.addEventListener('keydown', function (event) {
       if (event.key === 'Escape') closePreview();
+    });
+
+    document.addEventListener('click', function () {
+      document.getElementById('bookmarkPanel').hidden = true;
+    });
+
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'hidden' && currentReader) {
+        saveReaderProgress(currentReader);
+      }
     });
 
     async function handleFileUpload(event) {
@@ -9198,12 +9687,14 @@ const FIXED_ADMIN_PAGE = `
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>管理后台 - EdgeStashPro</title>
+  ${THEME_BOOTSTRAP}
   ${CSS_STYLES}
 </head>
 <body>
   <div class="header">
     <div class="logo">EdgeStashPro 管理后台</div>
     <div class="header-actions">
+      ${THEME_TOGGLE_BUTTON}
       <button type="button" class="btn btn-secondary" onclick="window.location.href='/'">返回云盘</button>
       <button type="button" class="btn btn-secondary" onclick="logout()">退出登录</button>
     </div>
@@ -9867,9 +10358,11 @@ const FIXED_SHARE_PAGE = `
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>文件分享 - EdgeStashPro</title>
+  ${THEME_BOOTSTRAP}
   ${CSS_STYLES}
 </head>
 <body>
+  <div class="theme-toggle-floating">${THEME_TOGGLE_BUTTON}</div>
   <div class="share-container">
     <div class="share-card">
       <div id="loadingState">
@@ -10288,6 +10781,14 @@ export default {
 
         if (path === '/api/reader/progress' && method === 'PUT') {
           return await handlePutReaderProgress(request, env);
+        }
+
+        if (path === '/api/reader/bookmarks' && ['GET', 'POST'].includes(method)) {
+          return await handleReaderBookmarks(request, env);
+        }
+
+        if (path.match(/^\/api\/reader\/bookmarks\/[^/]+$/) && method === 'DELETE') {
+          return await handleDeleteReaderBookmark(request, env, path.split('/').pop());
         }
 
         if (path === '/api/batch' && method === 'POST') {
