@@ -4952,6 +4952,8 @@ const CSS_STYLES = `
     display: flex;
     align-items: center;
     justify-content: space-between;
+    flex-wrap: nowrap;
+    gap: 16px;
     padding: 16px 24px;
     background: var(--surface);
     border-bottom: 1px solid var(--surface-light);
@@ -4972,6 +4974,7 @@ const CSS_STYLES = `
     display: flex;
     gap: 12px;
     align-items: center;
+    flex: 0 0 auto;
   }
 
   .reader-tools {
@@ -4986,10 +4989,17 @@ const CSS_STYLES = `
   }
 
   .reader-font-size {
-    min-width: 30px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 34px;
+    flex: 0 0 32px;
     color: var(--text-muted);
     text-align: center;
     font-size: 13px;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
   }
 
   .reader-tool-btn {
@@ -4997,10 +5007,12 @@ const CSS_STYLES = `
   }
 
   .bookmark-panel {
-    position: absolute;
-    top: calc(100% + 10px);
-    right: 0;
-    width: min(360px, calc(100vw - 24px));
+    position: fixed;
+    top: 76px;
+    left: 50%;
+    right: auto;
+    transform: translateX(-50%);
+    width: min(520px, calc(100vw - 24px));
     max-height: min(460px, 65vh);
     overflow: auto;
     padding: 12px;
@@ -5028,13 +5040,19 @@ const CSS_STYLES = `
 
   .bookmark-item {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 8px;
-    padding: 10px 0;
+    grid-template-columns: minmax(0, 1fr) 30px;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 0;
     border-top: 1px solid var(--surface-light);
   }
 
   .bookmark-jump {
+    display: grid;
+    grid-template-columns: 48px minmax(0, 1fr);
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
     padding: 0;
     border: 0;
     background: transparent;
@@ -5045,18 +5063,19 @@ const CSS_STYLES = `
 
   .bookmark-meta {
     color: var(--primary-light);
-    font-size: 12px;
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
   }
 
   .bookmark-snippet {
-    margin-top: 3px;
+    min-width: 0;
     color: var(--text-muted);
     font-size: 13px;
-    line-height: 1.45;
+    line-height: 30px;
+    white-space: nowrap;
     overflow: hidden;
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
+    text-overflow: ellipsis;
   }
 
   .bookmark-delete {
@@ -5942,8 +5961,13 @@ const CSS_STYLES = `
 
     .preview-header {
       flex-direction: row;
-      gap: 12px;
-      padding: 12px 16px;
+      gap: 6px;
+      padding: 10px 8px;
+    }
+
+    .preview-filename {
+      text-align: left;
+      font-size: 13px;
     }
 
     .preview-actions .btn {
@@ -5957,16 +5981,36 @@ const CSS_STYLES = `
     }
 
     .reader-tools {
-      gap: 3px;
+      gap: 2px;
     }
 
     .reader-tool-btn {
-      padding: 6px 8px;
+      min-width: 30px;
+      height: 30px;
+      padding: 0 6px;
       font-size: 12px;
+    }
+
+    .reader-font-size {
+      width: 26px;
+      height: 30px;
+      flex-basis: 26px;
+      font-size: 12px;
+    }
+
+    .bookmark-panel {
+      top: 58px;
     }
 
     .preview-icon-btn {
       display: inline-flex;
+      width: 30px;
+      height: 30px;
+      font-size: 13px;
+    }
+
+    .preview-actions {
+      gap: 3px;
     }
   }
   
@@ -7025,7 +7069,7 @@ const FIXED_INDEX_PAGE = `
           <button type="button" class="btn btn-secondary reader-tool-btn" onclick="adjustReaderFontSize(-2)" aria-label="缩小字体">A−</button>
           <span class="reader-font-size" id="readerFontSize">18</span>
           <button type="button" class="btn btn-secondary reader-tool-btn" onclick="adjustReaderFontSize(2)" aria-label="放大字体">A+</button>
-          <button type="button" class="btn btn-secondary reader-tool-btn" id="bookmarkToggleBtn" onclick="toggleBookmarkPanel(event)">🔖 书签</button>
+          <button type="button" class="btn btn-secondary reader-tool-btn" id="bookmarkToggleBtn" onclick="toggleBookmarkPanel(event)" title="书签" aria-label="打开书签">🔖</button>
           <div class="bookmark-panel" id="bookmarkPanel" hidden onclick="event.stopPropagation()">
             <button type="button" class="btn btn-primary bookmark-add" onclick="addCurrentBookmark()">添加当前位置</button>
             <div id="bookmarkList"></div>
@@ -8633,7 +8677,7 @@ const FIXED_INDEX_PAGE = `
         jump.addEventListener('click', function () { jumpToReaderBookmark(bookmark); });
         const meta = document.createElement('div');
         meta.className = 'bookmark-meta';
-        meta.textContent = Math.round((bookmark.progress || 0) * 100) + '% · ' + new Date(bookmark.createdAt).toLocaleString();
+        meta.textContent = Math.round((bookmark.progress || 0) * 100) + '%';
         const snippet = document.createElement('div');
         snippet.className = 'bookmark-snippet';
         snippet.textContent = bookmark.snippet || '无文字摘要';
