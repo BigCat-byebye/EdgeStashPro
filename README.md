@@ -8,14 +8,14 @@ EdgeStashPro 是一个单文件 Cloudflare Worker 网盘。核心代码在 `work
 ![预览图片](merged-images.png)
 
 ### 备注
-Fork来自 https://github.com/hhy-2021/EdgeStashPro , 做了一些自己需要用的增强
+Fork 来自 https://github.com/hhy-2021/EdgeStash，做了一些自己需要用的增强。
 
 ## 在线 Demo
 
 在线体验地址：
 
 ```txt
-https://s3.chenzhou.dev/
+https://s3.zxhf.dev/
 ```
 
 测试用户：
@@ -52,7 +52,8 @@ https://s3.chenzhou.dev/
 ```txt
 worker.js    # Cloudflare Worker 主文件，包含后端和内嵌页面
 README.md    # 部署和使用说明
-imgs/        # 文档展示图片
+merged-images.png       # README 预览图
+wrangler.toml.example    # Wrangler 部署配置示例
 ```
 
 ## Cloudflare 资源
@@ -101,9 +102,15 @@ wrangler d1 create YOUR_D1_DATABASE
 
 记下输出中的 KV namespace ID、D1 database name 和 D1 database ID。
 
-### 3. 修改 `wrangler.toml`
+### 3. 创建并修改 `wrangler.toml`
 
-仓库已包含 `wrangler.toml` 模板。部署自己的实例前需要替换：
+仓库已包含 `wrangler.toml.example` 模板。先复制为 `wrangler.toml`，再替换其中的占位值：
+
+```bash
+cp wrangler.toml.example wrangler.toml
+```
+
+配置格式如下：
 
 ```toml
 name = "your-worker-name"
@@ -424,6 +431,7 @@ recent_items
 share_links
 share_items
 app_stats
+reader_bookmarks
 user_permissions
 file_tasks
 file_task_items

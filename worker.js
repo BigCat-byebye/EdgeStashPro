@@ -210,7 +210,7 @@ async function verifyJWT(token, secret) {
     if (payload.exp && Date.now() > payload.exp) return null;
     
     return payload;
-  } catch (e) {
+  } catch {
     return null;
   }
 }
@@ -282,7 +282,7 @@ function getMimeType(filename) {
 function safeDecodePath(path) {
   try {
     return decodeURIComponent(path);
-  } catch (e) {
+  } catch {
     return path;
   }
 }
@@ -565,7 +565,7 @@ async function refreshDirectoryCache(env, dirPath) {
   }
 }
 
-async function syncFileCacheIfParentCached(env, key, metadata = {}) {
+async function syncFileCacheIfParentCached(env, key) {
   try {
     await deleteDirectoryCache(env, parentPathFromR2Key(key));
   } catch (e) {
@@ -922,11 +922,7 @@ async function handleUploadFile(request, env, path) {
       httpMetadata: { contentType: file.type || getMimeType(baseName) }
     });
 
-    await syncFileCacheIfParentCached(env, key, {
-      size: file.size || 0,
-      contentType: file.type || getMimeType(baseName),
-      lastModified: new Date().toISOString()
-    });
+    await syncFileCacheIfParentCached(env, key);
 
     return jsonResponse({ success: true, message: '文件上传成功', path: '/' + key });
   } catch (e) {
@@ -984,12 +980,7 @@ async function handleRenameFile(request, env, path) {
       await invalidateCachePath(env, r2KeyToPath(oldKey));
       await cleanupD1ItemPath(env, r2KeyToPath(oldKey));
 
-      const newObject = await env.R2_BUCKET.head(newKey);
-      await syncFileCacheIfParentCached(env, newKey, {
-        size: newObject?.size || oldObject.size || 0,
-        contentType: newObject?.httpMetadata?.contentType || oldObject.httpMetadata?.contentType || getMimeType(newName),
-        lastModified: isoDateString(newObject?.uploaded || new Date())
-      });
+      await syncFileCacheIfParentCached(env, newKey);
 
       return jsonResponse({ success: true, message: '重命名成功', newPath: '/' + newKey });
     }
@@ -1344,7 +1335,7 @@ function taskRowToClient(row) {
   if (row.result_json) {
     try {
       result = JSON.parse(row.result_json);
-    } catch (error) {
+    } catch {
       result = null;
     }
   }
@@ -1862,7 +1853,7 @@ async function handleTaskDownload(request, env, taskId) {
     let result = {};
     try {
       result = task.result_json ? JSON.parse(task.result_json) : {};
-    } catch (error) {
+    } catch {
       result = {};
     }
     const items = Array.isArray(result.items) ? result.items : [];
@@ -4106,7 +4097,7 @@ async function mergeSearchItemTags(env, items) {
       try {
         const tags = JSON.parse(row.tags || '[]');
         tagMap.set(row.path, Array.isArray(tags) ? tags.filter(tag => typeof tag === 'string') : []);
-      } catch (error) {
+      } catch {
         tagMap.set(row.path, []);
       }
     }
@@ -4168,7 +4159,7 @@ function d1RowToClientItem(row) {
   try {
     const parsed = JSON.parse(row.tags || '[]');
     if (Array.isArray(parsed)) tags = parsed.filter(tag => typeof tag === 'string');
-  } catch (error) {
+  } catch {
     tags = [];
   }
   return {
@@ -4224,7 +4215,7 @@ async function handleListTags(request, env) {
       try {
         const parsed = JSON.parse(row.tags || '[]');
         if (Array.isArray(parsed)) tags = parsed;
-      } catch (error) {
+      } catch {
         tags = [];
       }
       for (const tag of tags) {
@@ -6507,7 +6498,7 @@ const THEME_BOOTSTRAP = `
     (function () {
       const key = 'edgestash:theme:v1';
       let saved = null;
-      try { saved = localStorage.getItem(key); } catch (error) {}
+      try { saved = localStorage.getItem(key); } catch {}
       const preferred = saved === 'light' || saved === 'dark'
         ? saved
         : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
@@ -6516,7 +6507,7 @@ const THEME_BOOTSTRAP = `
       window.toggleTheme = function () {
         const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
         document.documentElement.dataset.theme = next;
-        try { localStorage.setItem(key, next); } catch (error) {}
+        try { localStorage.setItem(key, next); } catch {}
         updateThemeButtons();
       };
 
@@ -6666,7 +6657,7 @@ const FIXED_LOGIN_PAGE = `
             }
           }
         }
-      } catch (error) {
+      } catch {
         showToast('二维码生成失败，请手动输入 Secret', 'error');
       }
     }
@@ -7162,7 +7153,7 @@ const FIXED_INDEX_PAGE = `
     function getDoneTaskToastSet() {
       try {
         return new Set(JSON.parse(localStorage.getItem(TASK_DONE_TOAST_KEY) || '[]'));
-      } catch (error) {
+      } catch {
         return new Set();
       }
     }
@@ -7512,7 +7503,7 @@ const FIXED_INDEX_PAGE = `
         }
         await loadTagOptions();
         return true;
-      } catch (error) {
+      } catch {
         window.location.href = '/login.html';
         return false;
       }
@@ -8431,7 +8422,7 @@ const FIXED_INDEX_PAGE = `
             if (ext === 'json') {
               try {
                 pre.textContent = JSON.stringify(JSON.parse(text), null, 2);
-              } catch (error) {
+              } catch {
                 pre.textContent = text;
               }
             } else {
@@ -8616,7 +8607,7 @@ const FIXED_INDEX_PAGE = `
       try {
         const saved = Number(localStorage.getItem(READER_FONT_SIZE_KEY));
         if (Number.isFinite(saved)) return Math.max(12, Math.min(32, saved));
-      } catch (error) {}
+      } catch {}
       return 18;
     }
 
@@ -8629,7 +8620,7 @@ const FIXED_INDEX_PAGE = `
       const state = currentReader;
       const offset = getReaderCharOffset(state);
       const next = Math.max(12, Math.min(32, getReaderFontSize() + delta));
-      try { localStorage.setItem(READER_FONT_SIZE_KEY, String(next)); } catch (error) {}
+      try { localStorage.setItem(READER_FONT_SIZE_KEY, String(next)); } catch {}
       state.reader.style.fontSize = next + 'px';
       updateReaderFontSizeLabel();
       await waitForReaderLayout();
@@ -8651,7 +8642,7 @@ const FIXED_INDEX_PAGE = `
         if (currentReader !== state) return;
         readerBookmarks = data.bookmarks || [];
         renderReaderBookmarks();
-      } catch (error) {
+      } catch {
         readerBookmarks = [];
         renderReaderBookmarks('书签加载失败');
       }
@@ -8791,7 +8782,7 @@ const FIXED_INDEX_PAGE = `
     function tryDecodeBytes(bytes, label, options) {
       try {
         return new TextDecoder(label, options || {}).decode(bytes);
-      } catch (error) {
+      } catch {
         return null;
       }
     }
@@ -8859,7 +8850,7 @@ const FIXED_INDEX_PAGE = `
       let url;
       try {
         url = new URL(value, window.location.origin);
-      } catch (error) {
+      } catch {
         return false;
       }
 
@@ -9123,25 +9114,6 @@ const FIXED_INDEX_PAGE = `
         }
       } catch (error) {
         showToast('重命名失败: ' + error.message, 'error');
-      } finally {
-        showLoading(false);
-      }
-    }
-
-    async function deleteFile(path) {
-      if (!window.confirm('确定要删除吗？此操作不可恢复。')) return;
-      showLoading(true);
-      try {
-        const response = await fetch(apiFileUrl('/api/files', path), { method: 'DELETE' });
-        const data = await response.json();
-        if (data.success) {
-          showToast('删除成功', 'success');
-          loadFiles();
-        } else {
-          showToast('删除失败: ' + (data.message || '未知错误'), 'error');
-        }
-      } catch (error) {
-        showToast('删除失败: ' + error.message, 'error');
       } finally {
         showLoading(false);
       }
@@ -9412,7 +9384,7 @@ const FIXED_INDEX_PAGE = `
 
       try {
         items = shareItemsValue ? JSON.parse(shareItemsValue) : [];
-      } catch (error) {
+      } catch {
         items = [];
       }
 
@@ -9487,7 +9459,7 @@ const FIXED_INDEX_PAGE = `
             }
           }
         }
-      } catch (error) {
+      } catch {
         const ctx = canvas.getContext('2d');
         ctx.fillStyle = '#ffffff';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -9855,7 +9827,7 @@ const FIXED_ADMIN_PAGE = `
         if (!data.authenticated || data.role !== 'admin') {
           window.location.href = '/login.html';
         }
-      } catch (error) {
+      } catch {
         window.location.href = '/login.html';
       }
     }
@@ -10478,7 +10450,7 @@ const FIXED_SHARE_PAGE = `
         if (!requiresPassword) {
           await loadShareDirectory('/');
         }
-      } catch (error) {
+      } catch {
         showExpired();
       }
     }
@@ -10682,7 +10654,7 @@ const FIXED_SHARE_PAGE = `
       if (utf8Match) {
         try {
           return decodeURIComponent(utf8Match[1]);
-        } catch (error) {
+        } catch {
           return utf8Match[1];
         }
       }
@@ -10712,7 +10684,7 @@ const FIXED_SHARE_PAGE = `
 // ============================================================================
 
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
