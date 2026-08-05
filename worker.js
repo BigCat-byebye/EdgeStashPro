@@ -310,8 +310,6 @@ function createInlineDisposition(filename) {
   return `inline; filename="${fallback}"; filename*=UTF-8''${encodeRFC5987ValueChars(filename)}`;
 }
 
-const DIRECTORY_CACHE_PREFIX = 'cache:dir:';
-
 function normalizeDirectoryPath(path) {
   let normalized = path || '/';
   if (!normalized.startsWith('/')) normalized = '/' + normalized;
@@ -354,6 +352,15 @@ function nameFromItemPath(path) {
   return normalized.slice(normalized.lastIndexOf('/') + 1);
 }
 
+function isSafePathSegment(value) {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= 255
+    && value !== '.'
+    && value !== '..'
+    && !/[\\/\u0000-\u001f\u007f]/.test(value);
+}
+
 function parentPathFromR2Key(key) {
   return parentPathFromItemPath(r2KeyToPath(key));
 }
@@ -362,224 +369,6 @@ function isoDateString(value) {
   if (!value) return new Date().toISOString();
   if (typeof value.toISOString === 'function') return value.toISOString();
   return new Date(value).toISOString();
-}
-
-function cacheItemsToResponse(items, currentPath) {
-  const folders = [];
-  const files = [];
-
-  for (const item of items) {
-    if (item.itemType === 'folder') {
-      folders.push({
-        name: item.name,
-        path: item.path
-      });
-    } else {
-      files.push({
-        name: item.name,
-        path: item.path,
-        size: item.size || 0,
-        sizeFormatted: formatFileSize(item.size || 0),
-        lastModified: item.lastModified,
-        previewType: item.previewType || null
-      });
-    }
-  }
-
-  folders.sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
-  files.sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
-
-  return { success: true, files, folders, currentPath };
-}
-
-async function listDirectoryFromR2(env, dirPath) {
-  const currentPath = normalizeDirectoryPath(dirPath);
-  const prefix = directoryPathToR2Prefix(currentPath);
-  const slashPrefix = '/' + prefix;
-  const prefixes = slashPrefix === prefix ? [prefix] : [prefix, slashPrefix];
-  const folderMap = new Map();
-  const fileMap = new Map();
-
-  for (const listPrefix of prefixes) {
-    let cursor;
-    do {
-      const listed = await env.R2_BUCKET.list({ prefix: listPrefix, delimiter: '/', cursor });
-
-      if (listed.delimitedPrefixes) {
-        for (const folderPath of listed.delimitedPrefixes) {
-          const path = r2KeyToPath(folderPath.slice(0, -1));
-          const name = folderPath.slice(listPrefix.length, -1);
-          if (name) {
-            folderMap.set(path, {
-              itemType: 'folder',
-              name,
-              path,
-              parentPath: currentPath,
-              r2Key: folderPath.slice(0, -1),
-              size: 0,
-              contentType: null,
-              previewType: null,
-              lastModified: null
-            });
-          }
-        }
-      }
-
-      if (listed.objects) {
-        for (const obj of listed.objects) {
-          const name = obj.key.slice(listPrefix.length);
-          if (!name || name === '.folder' || name.includes('/')) continue;
-
-          const path = r2KeyToPath(obj.key);
-          fileMap.set(path, {
-            itemType: 'file',
-            name,
-            path,
-            parentPath: currentPath,
-            r2Key: obj.key,
-            size: obj.size || 0,
-            contentType: obj.httpMetadata?.contentType || getMimeType(name),
-            previewType: getPreviewType(name),
-            lastModified: isoDateString(obj.uploaded)
-          });
-        }
-      }
-
-      cursor = listed.truncated ? listed.cursor : null;
-    } while (cursor);
-  }
-
-  const items = [...folderMap.values(), ...fileMap.values()];
-  return {
-    ...cacheItemsToResponse(items, currentPath),
-    items
-  };
-}
-
-function directoryCacheKey(dirPath) {
-  return DIRECTORY_CACHE_PREFIX + normalizeDirectoryPath(dirPath);
-}
-
-async function readDirectoryCache(env, dirPath) {
-  const currentPath = normalizeDirectoryPath(dirPath);
-  const cachedValue = await env.KV_STORE.get(directoryCacheKey(currentPath), 'json');
-  let cached = cachedValue;
-
-  if (!cached) return null;
-  if (typeof cached === 'string') {
-    cached = JSON.parse(cached);
-  }
-  if (cached.currentPath !== currentPath) return null;
-
-  const files = Array.isArray(cached.files) ? cached.files : [];
-  const folders = Array.isArray(cached.folders) ? cached.folders : [];
-  return {
-    success: true,
-    files,
-    folders,
-    currentPath,
-    cached: true,
-    refreshedAt: cached.refreshedAt || null
-  };
-}
-
-async function writeDirectoryCache(env, dirPath, listing) {
-  const currentPath = normalizeDirectoryPath(dirPath);
-  const payload = {
-    success: true,
-    files: listing.files || [],
-    folders: listing.folders || [],
-    currentPath,
-    refreshedAt: Date.now()
-  };
-
-  await env.KV_STORE.put(directoryCacheKey(currentPath), JSON.stringify(payload));
-  return {
-    ...payload,
-    cached: false
-  };
-}
-
-async function deleteDirectoryCache(env, dirPath) {
-  await env.KV_STORE.delete(directoryCacheKey(dirPath));
-}
-
-async function deleteDirectoryCacheTree(env, dirPath) {
-  const currentPath = normalizeDirectoryPath(dirPath);
-  const exactKey = directoryCacheKey(currentPath);
-  const prefix = currentPath === '/'
-    ? DIRECTORY_CACHE_PREFIX
-    : exactKey + '/';
-
-  await env.KV_STORE.delete(exactKey);
-
-  let cursor;
-  do {
-    const listed = await env.KV_STORE.list({ prefix, cursor });
-    const keys = listed.keys || [];
-    for (const key of keys) {
-      await env.KV_STORE.delete(key.name);
-    }
-    cursor = listed.list_complete ? null : listed.cursor;
-  } while (cursor);
-}
-
-async function invalidateCachePath(env, path) {
-  try {
-    const itemPath = normalizeItemPath(path);
-    const parentPath = parentPathFromItemPath(itemPath);
-    await deleteDirectoryCache(env, parentPath);
-    await deleteDirectoryCacheTree(env, itemPath);
-  } catch (e) {
-    console.warn('KV directory cache invalidation failed:', e.message);
-  }
-}
-
-async function refreshDirectoryCache(env, dirPath) {
-  const currentPath = normalizeDirectoryPath(dirPath);
-  const listing = await listDirectoryFromR2(env, currentPath);
-
-  try {
-    const previous = await readDirectoryCache(env, currentPath).catch(() => null);
-    const newFolderPaths = new Set((listing.folders || []).map(folder => folder.path));
-
-    if (previous) {
-      for (const folder of previous.folders || []) {
-        if (!newFolderPaths.has(folder.path)) {
-          await deleteDirectoryCacheTree(env, folder.path);
-        }
-      }
-    }
-
-    return await writeDirectoryCache(env, currentPath, listing);
-  } catch (e) {
-    console.warn('KV directory cache refresh failed:', e.message);
-    return {
-      success: true,
-      files: listing.files,
-      folders: listing.folders,
-      currentPath,
-      cached: false,
-      cacheWarning: e.message
-    };
-  }
-}
-
-async function syncFileCacheIfParentCached(env, key) {
-  try {
-    await deleteDirectoryCache(env, parentPathFromR2Key(key));
-  } catch (e) {
-    console.warn('KV file cache sync failed:', e.message);
-  }
-}
-
-async function syncFolderCacheIfParentCached(env, key) {
-  try {
-    const path = r2KeyToPath(key);
-    await deleteDirectoryCache(env, parentPathFromItemPath(path));
-  } catch (e) {
-    console.warn('KV folder cache sync failed:', e.message);
-  }
 }
 
 /**
@@ -804,12 +593,19 @@ async function requireAdmin(request, env) {
 async function handleListFiles(request, env, path) {
   const auth = await requireAuth(request, env);
   if (auth instanceof Response) return auth;
-  
+
   try {
     requireRequiredConfig(env, ['KV_STORE', 'R2_BUCKET', 'D1_DB']);
     const url = new URL(request.url);
     const forceRefresh = url.searchParams.get('refresh') === '1';
     const currentPath = normalizeDirectoryPath(path);
+
+    // One-time migration: the virtual tree must exist before anything is served
+    // from it (including permission-restricted virtual listings below).
+    if ((await searchItemsCount(env)) === 0) {
+      await rebuildSearchIndex(env);
+    }
+
     const permissionError = await requirePathPermission(env, auth, 'view', currentPath);
     if (permissionError) {
       const virtualListing = await listVirtualPermissionDirectory(env, auth, currentPath);
@@ -826,32 +622,29 @@ async function handleListFiles(request, env, path) {
         previewType: ''
       });
     }
-    let cached = null;
-    if (!forceRefresh) {
-      try {
-        cached = await readDirectoryCache(env, currentPath);
-      } catch (cacheError) {
-        console.warn('KV directory cache read failed:', cacheError.message);
+
+    if (forceRefresh) {
+      await indexR2Subtree(env, currentPath);
+    }
+
+    let listing = await listDirectoryFromD1(env, currentPath);
+    if (listing.folders.length === 0 && listing.files.length === 0 && currentPath !== '/') {
+      // This folder may be missing from the index (created out-of-band).
+      // Known-but-empty folders are served as-is without any R2 scan.
+      const knownFolder = await env.D1_DB.prepare(
+        "SELECT path FROM search_items WHERE path = ? AND item_type = 'folder'"
+      ).bind(currentPath).first();
+      if (!knownFolder && await pathHasAnyR2Object(env, currentPath)) {
+        await indexR2Subtree(env, currentPath);
+        listing = await listDirectoryFromD1(env, currentPath);
       }
     }
 
-    if (cached) {
-      const folders = await mergeSearchItemTags(env, await filterItemsByPermission(env, auth, cached.folders || [], 'view'));
-      const files = await mergeSearchItemTags(env, await filterItemsByPermission(env, auth, cached.files || [], 'view'));
-      return jsonResponse({
-        ...cached,
-        folders,
-        files
-      });
-    }
-
-    const fresh = await refreshDirectoryCache(env, currentPath);
-    const folders = await mergeSearchItemTags(env, await filterItemsByPermission(env, auth, fresh.folders || [], 'view'));
-    const files = await mergeSearchItemTags(env, await filterItemsByPermission(env, auth, fresh.files || [], 'view'));
+    const filtered = await filterItemsByPermissionD1(env, auth, [...listing.folders, ...listing.files], 'view');
     return jsonResponse({
-      ...fresh,
-      folders,
-      files
+      ...listing,
+      folders: filtered.filter(item => item.itemType === 'folder'),
+      files: filtered.filter(item => item.itemType !== 'folder')
     });
   } catch (e) {
     return jsonResponse({ success: false, message: '获取文件列表失败: ' + e.message }, 500);
@@ -873,27 +666,32 @@ async function handleRefreshDirectoryCache(request, env) {
       return permissionError;
     }
 
-    const refreshed = await refreshDirectoryCache(env, currentPath);
-    const folders = await mergeSearchItemTags(env, await filterItemsByPermission(env, auth, refreshed.folders || [], 'view'));
-    const files = await mergeSearchItemTags(env, await filterItemsByPermission(env, auth, refreshed.files || [], 'view'));
+    // Reconcile the virtual directory tree against R2, then serve from D1.
+    await indexR2Subtree(env, currentPath);
+    const listing = await listDirectoryFromD1(env, currentPath);
+    const filtered = await filterItemsByPermissionD1(env, auth, [...listing.folders, ...listing.files], 'view');
     return jsonResponse({
-      ...refreshed,
-      folders,
-      files
+      ...listing,
+      folders: filtered.filter(item => item.itemType === 'folder'),
+      files: filtered.filter(item => item.itemType !== 'folder')
     });
   } catch (e) {
     return jsonResponse({ success: false, message: '刷新缓存失败: ' + e.message }, 500);
   }
 }
 
-async function handleUploadFile(request, env, path) {
+async function handleUploadFile(request, env, path, ctx) {
   const auth = await requireAuth(request, env);
   if (auth instanceof Response) return auth;
-  
+
   try {
     const destinationPath = normalizeDirectoryPath(path || '/');
     const permissionError = await requirePathPermission(env, auth, 'upload', destinationPath);
     if (permissionError) return permissionError;
+    const destination = await getCurrentResourceInfo(env, destinationPath);
+    if (!destination || destination.itemType !== 'folder') {
+      return jsonResponse({ success: false, message: '目标文件夹不存在' }, 404);
+    }
 
     const formData = await request.formData();
     const file = formData.get('file');
@@ -912,17 +710,28 @@ async function handleUploadFile(request, env, path) {
     // Always reduce it to a basename to avoid duplicating the parent prefix.
     const rawName = (file.name || '').replace(/\\/g, '/');
     const baseName = rawName.split('/').filter(Boolean).pop() || '';
-    if (!baseName) {
+    if (!isSafePathSegment(baseName)) {
       return jsonResponse({ success: false, message: '文件名无效' }, 400);
     }
 
     const key = filePath + baseName;
+    const itemPath = r2KeyToPath(key);
+    const previous = await getCurrentResourceInfo(env, itemPath);
+    if (previous?.itemType === 'folder' || (!previous && await pathHasAnyR2Object(env, itemPath))) {
+      return jsonResponse({ success: false, message: '目标名称已存在' }, 409);
+    }
 
     await env.R2_BUCKET.put(key, file.stream(), {
       httpMetadata: { contentType: file.type || getMimeType(baseName) }
     });
 
-    await syncFileCacheIfParentCached(env, key);
+    if (previous) await invalidatePathReferences(env, itemPath);
+
+    await upsertSearchFileFromR2Object(env, key, { size: file.size, uploaded: new Date() });
+
+    if (ctx && typeof ctx.waitUntil === 'function' && isTxtReaderPath(itemPath) && env.D1_DB) {
+      ctx.waitUntil(autoIndexTxtAfterUpload(env, key));
+    }
 
     return jsonResponse({ success: true, message: '文件上传成功', path: '/' + key });
   } catch (e) {
@@ -948,50 +757,59 @@ async function handleDeleteFile(request, env, path) {
 async function handleRenameFile(request, env, path) {
   const auth = await requireAuth(request, env);
   if (auth instanceof Response) return auth;
-  
+
   try {
-    const permissionError = await requirePathPermission(env, auth, 'modify', path);
+    const sourcePath = normalizeItemPath(path || '');
+    if (!sourcePath || sourcePath === '/') {
+      return jsonResponse({ success: false, message: '不能重命名根目录' }, 400);
+    }
+    const permissionError = await requirePathPermission(env, auth, 'modify', sourcePath);
     if (permissionError) return permissionError;
 
     const body = await request.json();
     const { newName } = body;
-    
-    if (!newName) {
+
+    if (!isSafePathSegment(newName)) {
       return jsonResponse({ success: false, message: '请提供新名称' }, 400);
     }
-    
-    let oldKey = path || '';
-    if (oldKey.startsWith('/')) oldKey = oldKey.slice(1);
-    
-    const parentPath = oldKey.includes('/') ? oldKey.substring(0, oldKey.lastIndexOf('/') + 1) : '';
-    const newKey = parentPath + newName;
-    
-    // Get the old file
-    const resolvedOld = await getR2Object(env, oldKey);
-    if (resolvedOld) {
-      const oldObject = resolvedOld.object;
-      // Copy to new location
-      await env.R2_BUCKET.put(newKey, oldObject.body, {
-        httpMetadata: oldObject.httpMetadata
-      });
 
-      // Delete old file
-      await env.R2_BUCKET.delete(resolvedOld.key);
-      await invalidateCachePath(env, r2KeyToPath(oldKey));
-      await cleanupD1ItemPath(env, r2KeyToPath(oldKey));
-
-      await syncFileCacheIfParentCached(env, newKey);
-
-      return jsonResponse({ success: true, message: '重命名成功', newPath: '/' + newKey });
+    const parentPath = parentPathFromItemPath(sourcePath);
+    const targetPermissionError = await requirePathPermission(env, auth, 'upload', parentPath);
+    if (targetPermissionError) return targetPermissionError;
+    const parent = await getCurrentResourceInfo(env, parentPath);
+    if (!parent || parent.itemType !== 'folder') {
+      return jsonResponse({ success: false, message: '目标文件夹不存在' }, 404);
     }
 
-    const oldPrefix = oldKey.endsWith('/') ? oldKey : oldKey + '/';
-    const folderCheck = await listR2Prefix(env, oldPrefix, { limit: 1 });
-    if (!folderCheck.objects || folderCheck.objects.length === 0) {
+    const targetPath = joinItemPath(parentPath, newName);
+    if (targetPath === sourcePath) {
+      return jsonResponse({ success: true, message: '重命名成功', newPath: sourcePath });
+    }
+
+    const source = await getCurrentResourceInfo(env, sourcePath);
+    if (!source) {
       return jsonResponse({ success: false, message: '文件不存在' }, 404);
     }
+    if (await pathHasAnyR2Object(env, targetPath)) {
+      return jsonResponse({ success: false, message: '目标名称已存在' }, 409);
+    }
 
-    const newPrefix = newKey.endsWith('/') ? newKey : newKey + '/';
+    const newKey = itemPathToR2Key(targetPath);
+    if (source.itemType === 'file') {
+      const oldObject = await env.R2_BUCKET.get(source.key);
+      if (!oldObject) return jsonResponse({ success: false, message: '文件不存在' }, 404);
+      await env.R2_BUCKET.put(newKey, oldObject.body, {
+        httpMetadata: oldObject.httpMetadata,
+        customMetadata: oldObject.customMetadata
+      });
+      await env.R2_BUCKET.delete(source.key);
+      await invalidatePathReferences(env, sourcePath);
+      await upsertSearchFileFromR2Object(env, newKey, oldObject);
+      return jsonResponse({ success: true, message: '重命名成功', newPath: targetPath });
+    }
+
+    const oldPrefix = source.key.replace(/^\/+/, '') + '/';
+    const newPrefix = newKey + '/';
     const batch = await listR2Prefix(env, oldPrefix);
     const oldKeys = [];
 
@@ -1013,11 +831,13 @@ async function handleRenameFile(request, env, path) {
       await env.R2_BUCKET.delete(oldKeys);
     }
 
-    await invalidateCachePath(env, r2KeyToPath(oldKey));
-    await cleanupD1ItemPath(env, r2KeyToPath(oldKey));
-    await syncFolderCacheIfParentCached(env, newKey);
+    if (oldKeys.length === 0) {
+      return jsonResponse({ success: false, message: '文件夹不存在' }, 404);
+    }
+    await invalidatePathReferences(env, sourcePath);
+    await indexR2Subtree(env, targetPath);
 
-    return jsonResponse({ success: true, message: '重命名成功', newPath: '/' + newKey });
+    return jsonResponse({ success: true, message: '重命名成功', newPath: targetPath });
   } catch (e) {
     return jsonResponse({ success: false, message: '重命名失败: ' + e.message }, 500);
   }
@@ -1048,6 +868,1129 @@ async function getR2Object(env, key, options) {
     if (object) return { key: candidate, object };
   }
   return null;
+}
+
+const TXT_CHUNK_DEFAULT_BYTES = 128 * 1024;
+const TXT_CHUNK_MAX_BYTES = 256 * 1024;
+const TXT_SEARCH_CHUNK_BYTES = 64 * 1024;
+const TXT_SEARCH_MAX_SCAN_BYTES = 1024 * 1024;
+const TXT_SEARCH_MAX_RESULTS = 50;
+const TXT_SEARCH_MAX_QUERY_LENGTH = 256;
+const TXT_CURSOR_TTL_MS = 15 * 60 * 1000;
+const TXT_INDEX_PAGE_BYTES = 64 * 1024;
+const TXT_INDEX_OVERLAP_CHARS = TXT_SEARCH_MAX_QUERY_LENGTH;
+const TXT_INDEX_CHUNK_PAGE_LIMIT = 100;
+
+function base64UrlEncodeBytes(bytes) {
+  let binary = '';
+  for (let index = 0; index < bytes.length; index++) {
+    binary += String.fromCharCode(bytes[index]);
+  }
+  return btoa(binary).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+function base64UrlDecodeBytes(value) {
+  const normalized = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+  const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+  return Uint8Array.from(atob(padded), char => char.charCodeAt(0));
+}
+
+async function signTxtCursor(payload, secret) {
+  const encodedPayload = base64UrlEncodeBytes(new TextEncoder().encode(JSON.stringify(payload)));
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret || ''),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(encodedPayload));
+  return encodedPayload + '.' + base64UrlEncodeBytes(new Uint8Array(signature));
+}
+
+async function verifyTxtCursor(token, secret) {
+  try {
+    const parts = String(token || '').split('.');
+    if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+    const key = await crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(secret || ''),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['verify']
+    );
+    const valid = await crypto.subtle.verify(
+      'HMAC',
+      key,
+      base64UrlDecodeBytes(parts[1]),
+      new TextEncoder().encode(parts[0])
+    );
+    if (!valid) return null;
+    const payload = JSON.parse(new TextDecoder().decode(base64UrlDecodeBytes(parts[0])));
+    if (!payload || payload.v !== 1 || !Number.isFinite(payload.issuedAt)) return null;
+    if (Date.now() - payload.issuedAt > TXT_CURSOR_TTL_MS || payload.issuedAt - Date.now() > 60 * 1000) {
+      return null;
+    }
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeTxtInteger(value, fallback = 0) {
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 0) return fallback;
+  return number;
+}
+
+function parseTxtRange(request, url, size) {
+  let offsetValue = url.searchParams.get('offset');
+  let lengthValue = url.searchParams.get('length');
+  const rangeHeader = request.headers.get('Range');
+
+  if (rangeHeader) {
+    const match = /^bytes=(\d+)-(\d*)$/.exec(rangeHeader.trim());
+    if (!match) return { error: 'invalid' };
+    offsetValue = match[1];
+    if (match[2]) {
+      const end = Number(match[2]);
+      const start = Number(match[1]);
+      if (!Number.isSafeInteger(end) || end < start) return { error: 'invalid' };
+      lengthValue = String(end - start + 1);
+    } else {
+      lengthValue = null;
+    }
+  }
+
+  const offset = offsetValue === null || offsetValue === ''
+    ? 0
+    : normalizeTxtInteger(offsetValue, -1);
+  const requestedLength = lengthValue === null || lengthValue === '' || lengthValue === undefined
+    ? TXT_CHUNK_DEFAULT_BYTES
+    : normalizeTxtInteger(lengthValue, -1);
+  if (offset < 0 || requestedLength <= 0 || offset >= size || size <= 0) {
+    return { error: 'unsatisfiable' };
+  }
+
+  return {
+    offset,
+    length: Math.min(requestedLength, TXT_CHUNK_MAX_BYTES, size - offset)
+  };
+}
+
+function txtRangeError(size, etag, status = 416) {
+  const headers = new Headers({
+    'Accept-Ranges': 'bytes',
+    'Content-Range': `bytes */${size}`,
+    'Content-Length': '0'
+  });
+  if (etag) headers.set('ETag', etag);
+  return new Response(null, { status, headers });
+}
+
+async function readR2Bytes(object, maxBytes) {
+  if (!object?.body) return new Uint8Array();
+  const reader = object.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      total += chunk.length;
+      if (total > maxBytes) {
+        await reader.cancel('bounded TXT read exceeded limit');
+        throw new Error('TXT 读取超过单次限制');
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return bytes;
+}
+
+async function getBoundedR2Bytes(env, key, offset, length) {
+  const object = await env.R2_BUCKET.get(key, { range: { offset, length } });
+  if (!object) return null;
+  const bytes = await readR2Bytes(object, Math.min(TXT_CHUNK_MAX_BYTES, length));
+  return { object, bytes };
+}
+
+function detectTxtEncoding(bytes) {
+  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    return { encoding: 'utf-8', byteOffset: 3 };
+  }
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) {
+    return { encoding: 'utf-16le', byteOffset: 2 };
+  }
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+    return { encoding: 'utf-16be', byteOffset: 2 };
+  }
+  // Legacy Chinese TXT files normally have no BOM. Keep the decoder open at the
+  // end of the bounded prefix so a valid UTF-8 character split by the prefix
+  // boundary is not mistaken for GB18030.
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(bytes, { stream: true });
+    return { encoding: 'utf-8', byteOffset: 0 };
+  } catch {
+    try {
+      new TextDecoder('gb18030', { fatal: true }).decode(bytes, { stream: true });
+      return { encoding: 'gb18030', byteOffset: 0 };
+    } catch {
+      return { encoding: 'utf-8', byteOffset: 0 };
+    }
+  }
+}
+
+function decodeUtf16BeBytes(bytes) {
+  let value = '';
+  for (let index = 0; index + 1 < bytes.length; index += 2) {
+    value += String.fromCharCode((bytes[index] << 8) | bytes[index + 1]);
+  }
+  return value;
+}
+
+function decodeTxtBytes(bytes, encoding) {
+  if (encoding === 'utf-16be') return decodeUtf16BeBytes(bytes);
+  try {
+    return new TextDecoder(encoding || 'utf-8').decode(bytes);
+  } catch {
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+}
+
+function decodeTxtBytesStrict(bytes, encoding) {
+  if (encoding === 'utf-16be') {
+    if (bytes.length % 2 !== 0) throw new Error('UTF-16BE 字节不完整');
+    return decodeUtf16BeBytes(bytes);
+  }
+  return new TextDecoder(encoding || 'utf-8', { fatal: true }).decode(bytes);
+}
+
+function decodeTxtPage(bytes, encoding) {
+  const maxTrim = encoding && encoding.startsWith('utf-16') ? 1 : 4;
+  for (let trim = 0; trim <= maxTrim && trim < bytes.length; trim++) {
+    const usableLength = bytes.length - trim;
+    try {
+      return {
+        text: decodeTxtBytesStrict(bytes.slice(0, usableLength), encoding),
+        bytesUsed: usableLength
+      };
+    } catch {
+      // A bounded R2 range can end in the middle of a multibyte character.
+    }
+  }
+
+  return {
+    text: decodeTxtBytes(bytes, encoding),
+    bytesUsed: bytes.length
+  };
+}
+
+function encodeTxtLiteral(value, encoding) {
+  if (encoding === 'utf-16le' || encoding === 'utf-16be') {
+    const bytes = new Uint8Array(value.length * 2);
+    for (let index = 0; index < value.length; index++) {
+      const code = value.charCodeAt(index);
+      if (encoding === 'utf-16le') {
+        bytes[index * 2] = code & 0xff;
+        bytes[index * 2 + 1] = code >>> 8;
+      } else {
+        bytes[index * 2] = code >>> 8;
+        bytes[index * 2 + 1] = code & 0xff;
+      }
+    }
+    return bytes;
+  }
+  return new TextEncoder().encode(value);
+}
+
+function concatTxtBytes(first, second) {
+  const result = new Uint8Array(first.length + second.length);
+  result.set(first, 0);
+  result.set(second, first.length);
+  return result;
+}
+
+function bytesToBinaryString(bytes) {
+  let value = '';
+  const partSize = 8192;
+  for (let index = 0; index < bytes.length; index += partSize) {
+    value += String.fromCharCode(...bytes.subarray(index, Math.min(bytes.length, index + partSize)));
+  }
+  return value;
+}
+
+function currentTxtEtag(object) {
+  return object?.httpEtag || (object?.etag ? `"${object.etag.replace(/^"|"$/g, '')}"` : '');
+}
+
+async function resolveTxtObject(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return { error: auth };
+  const url = new URL(request.url);
+  const filePath = normalizeItemPath(url.searchParams.get('path') || '');
+  if (!filePath || filePath === '/' || !isTxtReaderPath(filePath)) {
+    return { error: jsonResponse({ success: false, message: '只支持 txt 文件' }, 400) };
+  }
+
+  const permissionError = await requirePathPermission(env, auth, 'preview', filePath);
+  if (permissionError) return { error: permissionError };
+
+  const current = await getCurrentResourceInfo(env, filePath);
+  if (!current || current.itemType !== 'file' || !current.object || current.object.size === undefined) {
+    return { error: jsonResponse({ success: false, message: '文件不存在' }, 404) };
+  }
+  const resolved = { key: current.key, object: current.object };
+  return { auth, filePath, resolved, etag: currentTxtEtag(resolved.object) };
+}
+
+async function detectTxtObjectEncoding(env, resolved, size) {
+  const prefixLength = Math.min(4096, size);
+  const prefix = prefixLength > 0
+    ? await getBoundedR2Bytes(env, resolved.key, 0, prefixLength)
+    : null;
+  return detectTxtEncoding(prefix?.bytes || new Uint8Array());
+}
+
+function txtIndexRecordToClient(row, resolved, size, encoding) {
+  const sourceEtag = resolved.etag || '';
+  const sameSource = !!row
+    && row.source_etag === sourceEtag
+    && Number(row.size || 0) === Number(size || 0)
+    && (!encoding || row.encoding === encoding);
+  const status = sameSource ? (row.status || 'building') : 'stale';
+  const scannedBytes = sameSource ? Number(row.scanned_bytes || 0) : 0;
+  const totalSize = Number(size || 0);
+  return {
+    status,
+    sourceEtag,
+    size: totalSize,
+    encoding: encoding || row?.encoding || 'utf-8',
+    totalChars: sameSource ? Number(row.total_chars || 0) : 0,
+    scannedBytes,
+    progress: totalSize > 0 ? Math.max(0, Math.min(1, Number(row?.next_offset || 0) / totalSize)) : 1,
+    indexedAt: sameSource ? (row.indexed_at || null) : null,
+    updatedAt: sameSource ? (row.updated_at || null) : null,
+    errorMessage: sameSource ? (row.error_message || '') : ''
+  };
+}
+
+async function getTxtIndexRecord(env, path) {
+  if (!env.D1_DB) return null;
+  await ensureD1Schema(env);
+  return env.D1_DB.prepare('SELECT * FROM txt_index_files WHERE path = ?').bind(path).first();
+}
+
+async function prepareTxtIndexRecord(env, resolved, size, encoding, initialOffset = 0, force = false) {
+  const existing = await getTxtIndexRecord(env, resolved.filePath);
+  const sourceEtag = resolved.etag || '';
+  const sameSource = existing
+    && existing.source_etag === sourceEtag
+    && Number(existing.size || 0) === size
+    && existing.encoding === encoding;
+  if (!force && sameSource && existing.status !== 'error') return existing;
+
+  const safeInitialOffset = Math.max(0, Math.min(size, Number(initialOffset || 0)));
+  const now = Date.now();
+  const initialStatus = size === 0 ? 'ready' : 'building';
+  await env.D1_DB.batch([
+    env.D1_DB.prepare('DELETE FROM txt_index_chunks WHERE path = ?').bind(resolved.filePath),
+    env.D1_DB.prepare(`
+      INSERT INTO txt_index_files (
+        path, source_etag, size, encoding, total_chars, status, scanned_bytes,
+        next_offset, next_chunk_no, next_char_offset, tail_text, error_message,
+        indexed_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(path) DO UPDATE SET
+        source_etag = excluded.source_etag,
+        size = excluded.size,
+        encoding = excluded.encoding,
+        total_chars = excluded.total_chars,
+        status = excluded.status,
+        scanned_bytes = excluded.scanned_bytes,
+        next_offset = excluded.next_offset,
+        next_chunk_no = excluded.next_chunk_no,
+        next_char_offset = excluded.next_char_offset,
+        tail_text = excluded.tail_text,
+        error_message = excluded.error_message,
+        indexed_at = excluded.indexed_at,
+        updated_at = excluded.updated_at
+    `).bind(
+      resolved.filePath,
+      sourceEtag,
+      size,
+      encoding,
+      0,
+      initialStatus,
+      0,
+      safeInitialOffset,
+      0,
+      0,
+      '',
+      null,
+      size === 0 ? now : null,
+      now
+    )
+  ]);
+  return getTxtIndexRecord(env, resolved.filePath);
+}
+
+async function handleTxtIndexStatus(request, env) {
+  const resolved = await resolveTxtObject(request, env);
+  if (resolved.error) return resolved.error;
+  if (!env.D1_DB) {
+    return jsonResponse({
+      success: true,
+      index: { status: 'unavailable', sourceEtag: resolved.etag }
+    });
+  }
+
+  try {
+    const size = Number(resolved.resolved.object.size || 0);
+    const detected = await detectTxtObjectEncoding(env, resolved.resolved, size);
+    const row = await getTxtIndexRecord(env, resolved.filePath);
+    return jsonResponse({
+      success: true,
+      path: resolved.filePath,
+      index: txtIndexRecordToClient(row, resolved, size, detected.encoding)
+    }, 200, { 'Cache-Control': 'private, no-store', 'ETag': resolved.etag });
+  } catch (error) {
+    return jsonResponse({ success: false, message: '读取 TXT 索引状态失败: ' + error.message }, 500);
+  }
+}
+
+async function stepTxtIndexBuild(env, resolved, size, encoding, record, initialOffset = 0) {
+  const offset = Math.max(0, Math.min(size, Number(record.next_offset || 0)));
+  if (offset >= size) {
+    const now = Date.now();
+    await env.D1_DB.prepare(`
+      UPDATE txt_index_files
+      SET status = 'ready', indexed_at = ?, updated_at = ?, error_message = NULL
+      WHERE path = ? AND source_etag = ?
+    `).bind(now, now, resolved.filePath, resolved.etag || '').run();
+    return { done: true };
+  }
+
+  const requestLength = Math.min(TXT_INDEX_PAGE_BYTES, size - offset);
+  const bounded = await getBoundedR2Bytes(env, resolved.resolved.key, offset, requestLength);
+  if (!bounded || bounded.bytes.length === 0) throw new Error('TXT 索引读取为空');
+  const decoded = decodeTxtPage(bounded.bytes, encoding);
+  const consumedBytes = Math.max(1, Math.min(bounded.bytes.length, decoded.bytesUsed || bounded.bytes.length));
+  const pageText = decoded.text || '';
+  const pageCharStart = Number(record.next_char_offset || 0);
+  const previousTail = String(record.tail_text || '');
+  const contentStart = Math.max(0, pageCharStart - previousTail.length);
+  const content = previousTail + pageText;
+  const pageCharEnd = pageCharStart + pageText.length;
+  const nextOffset = Math.min(size, offset + consumedBytes);
+  const nextCharOffset = pageCharEnd;
+  const nextChunkNo = Number(record.next_chunk_no || 0) + 1;
+  const nextTail = pageText.slice(Math.max(0, pageText.length - TXT_INDEX_OVERLAP_CHARS));
+  const done = nextOffset >= size;
+  const now = Date.now();
+
+  await env.D1_DB.batch([
+    env.D1_DB.prepare(`
+      INSERT INTO txt_index_chunks (
+        path, source_etag, chunk_no, byte_start, byte_end, char_start,
+        char_end, content_start, content
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(path, chunk_no) DO UPDATE SET
+        source_etag = excluded.source_etag,
+        byte_start = excluded.byte_start,
+        byte_end = excluded.byte_end,
+        char_start = excluded.char_start,
+        char_end = excluded.char_end,
+        content_start = excluded.content_start,
+        content = excluded.content
+    `).bind(
+      resolved.filePath,
+      resolved.etag || '',
+      Number(record.next_chunk_no || 0),
+      offset,
+      nextOffset,
+      pageCharStart,
+      pageCharEnd,
+      contentStart,
+      content
+    ),
+    env.D1_DB.prepare(`
+      UPDATE txt_index_files
+      SET status = ?, scanned_bytes = ?, next_offset = ?, next_chunk_no = ?,
+          next_char_offset = ?, total_chars = ?, tail_text = ?,
+          error_message = NULL, indexed_at = ?, updated_at = ?
+      WHERE path = ? AND source_etag = ?
+    `).bind(
+      done ? 'ready' : 'building',
+      Math.max(0, nextOffset - Math.min(Number(initialOffset || 0), size)),
+      nextOffset,
+      nextChunkNo,
+      nextCharOffset,
+      done ? nextCharOffset : 0,
+      nextTail,
+      done ? now : null,
+      now,
+      resolved.filePath,
+      resolved.etag || ''
+    )
+  ]);
+
+  return { done };
+}
+
+async function markTxtIndexError(env, filePath, etag, error) {
+  if (!env.D1_DB) return;
+  await env.D1_DB.prepare(`
+    UPDATE txt_index_files
+    SET status = 'error', error_message = ?, updated_at = ?
+    WHERE path = ? AND source_etag = ?
+  `).bind(
+    String(error?.message || 'TXT 索引构建失败').slice(0, 500),
+    Date.now(),
+    filePath,
+    etag || ''
+  ).run().catch(() => {});
+}
+
+/**
+ * Background hook (ctx.waitUntil): after a .txt upload completes, build the
+ * full content index so global full-text search works without user action.
+ * Never throws — failures only leave the index for on-demand building.
+ */
+async function autoIndexTxtAfterUpload(env, key) {
+  try {
+    if (!env.D1_DB || !env.R2_BUCKET) return;
+    const filePath = r2KeyToPath(key);
+    if (!isTxtReaderPath(filePath)) return;
+    const head = await headR2Object(env, key);
+    if (!head || !head.object) return;
+    const resolved = {
+      filePath,
+      resolved: { key: head.key, object: head.object },
+      etag: currentTxtEtag(head.object)
+    };
+    await buildTxtIndexToEnd(env, resolved);
+  } catch (error) {
+    console.warn('TXT auto index failed:', error.message);
+  }
+}
+
+/**
+ * Build the full content index for one txt file, looping over pages until the
+ * record reaches status 'ready'. Used by background indexing (upload hook and
+ * the admin bulk rebuild). The build is resumable: if a previous run was
+ * interrupted, it continues from next_offset.
+ */
+async function buildTxtIndexToEnd(env, resolved, options = {}) {
+  if (!env.D1_DB) throw new Error('D1 未配置，无法建立 TXT 索引');
+  const size = Number(resolved.resolved.object.size || 0);
+  const detected = await detectTxtObjectEncoding(env, resolved.resolved, size);
+  let record = await prepareTxtIndexRecord(
+    env,
+    resolved,
+    size,
+    detected.encoding,
+    detected.byteOffset,
+    !!options.force
+  );
+  if (!record) throw new Error('TXT 索引记录创建失败');
+
+  const maxPages = Math.max(1, Math.ceil(size / TXT_INDEX_PAGE_BYTES)) + 4;
+  let pages = 0;
+  try {
+    while (record && record.status !== 'ready' && pages < maxPages) {
+      const step = await stepTxtIndexBuild(env, resolved, size, detected.encoding, record, detected.byteOffset);
+      pages++;
+      record = await getTxtIndexRecord(env, resolved.filePath);
+      if (step.done) break;
+    }
+  } catch (error) {
+    await markTxtIndexError(env, resolved.filePath, resolved.etag, error);
+    throw error;
+  }
+  return record;
+}
+
+async function handleTxtIndexBuild(request, env) {
+  const resolved = await resolveTxtObject(request, env);
+  if (resolved.error) return resolved.error;
+  if (!env.D1_DB) {
+    return jsonResponse({ success: false, code: 'TXT_INDEX_UNAVAILABLE', message: 'D1 未配置，无法建立 TXT 索引' }, 503);
+  }
+
+  let record = null;
+  try {
+    const url = new URL(request.url);
+    const size = Number(resolved.resolved.object.size || 0);
+    const detected = await detectTxtObjectEncoding(env, resolved.resolved, size);
+    const force = ['1', 'true', 'yes'].includes((url.searchParams.get('force') || '').toLowerCase());
+    record = await prepareTxtIndexRecord(
+      env,
+      resolved,
+      size,
+      detected.encoding,
+      detected.byteOffset,
+      force
+    );
+    if (!record) throw new Error('TXT 索引记录创建失败');
+
+    if (record.status !== 'ready') {
+      await stepTxtIndexBuild(env, resolved, size, detected.encoding, record, detected.byteOffset);
+      record = await getTxtIndexRecord(env, resolved.filePath);
+    }
+    return jsonResponse({
+      success: true,
+      path: resolved.filePath,
+      done: record.status === 'ready',
+      index: txtIndexRecordToClient(record, resolved, size, detected.encoding)
+    }, 200, { 'Cache-Control': 'private, no-store', 'ETag': resolved.etag });
+  } catch (error) {
+    if (record) await markTxtIndexError(env, resolved.filePath, resolved.etag, error);
+    return jsonResponse({ success: false, message: '建立 TXT 索引失败: ' + error.message }, 500);
+  }
+}
+
+async function handleTxtMeta(request, env) {
+  const resolved = await resolveTxtObject(request, env);
+  if (resolved.error) return resolved.error;
+
+  try {
+    const size = Number(resolved.resolved.object.size || 0);
+    const detected = await detectTxtObjectEncoding(env, resolved.resolved, size);
+    const index = env.D1_DB
+      ? txtIndexRecordToClient(await getTxtIndexRecord(env, resolved.filePath), resolved, size, detected.encoding)
+      : { status: 'unavailable', sourceEtag: resolved.etag };
+    return jsonResponse({
+      success: true,
+      path: resolved.filePath,
+      size,
+      etag: resolved.etag,
+      sourceEtag: resolved.etag,
+      byteOffset: Math.min(detected.byteOffset, size),
+      encoding: detected.encoding,
+      chunkSize: TXT_CHUNK_DEFAULT_BYTES,
+      index
+    }, 200, {
+      'Cache-Control': 'private, no-store',
+      'ETag': resolved.etag
+    });
+  } catch (error) {
+    return jsonResponse({ success: false, message: '读取 TXT 元数据失败: ' + error.message }, 500);
+  }
+}
+
+async function handleTxtChunk(request, env) {
+  const resolved = await resolveTxtObject(request, env);
+  if (resolved.error) return resolved.error;
+
+  try {
+    const size = Number(resolved.resolved.object.size || 0);
+    const requestedEtag = request.headers.get('If-Match') || new URL(request.url).searchParams.get('etag');
+    if (requestedEtag && requestedEtag !== resolved.etag) {
+      return jsonResponse({ success: false, message: '文件已变化，请重新加载' }, 412, { ETag: resolved.etag });
+    }
+    const range = parseTxtRange(request, new URL(request.url), size);
+    if (range.error) return txtRangeError(size, resolved.etag);
+
+    const bounded = await getBoundedR2Bytes(env, resolved.resolved.key, range.offset, range.length);
+    if (!bounded) {
+      return jsonResponse({ success: false, message: '文件不存在' }, 404);
+    }
+    const actualLength = bounded.bytes.length;
+    if (actualLength === 0) return txtRangeError(size, resolved.etag);
+    const end = range.offset + actualLength - 1;
+    const headers = new Headers({
+      'Content-Type': resolved.resolved.object.httpMetadata?.contentType || 'text/plain; charset=utf-8',
+      'Content-Disposition': createInlineDisposition(nameFromItemPath(resolved.filePath)),
+      'Accept-Ranges': 'bytes',
+      'Content-Range': `bytes ${range.offset}-${end}/${size}`,
+      'Content-Length': String(actualLength),
+      'Cache-Control': 'private, no-store'
+    });
+    if (resolved.etag) headers.set('ETag', resolved.etag);
+    return new Response(bounded.bytes, { status: 206, headers });
+  } catch (error) {
+    return jsonResponse({ success: false, message: '读取 TXT 分片失败: ' + error.message }, 500);
+  }
+}
+
+async function handleTxtSearchRaw(request, env, resolved) {
+  try {
+    const url = new URL(request.url);
+    const query = url.searchParams.get('q') || '';
+    if (!query || query.length > TXT_SEARCH_MAX_QUERY_LENGTH) {
+      return jsonResponse({ success: false, message: '搜索词不能为空且不能超过 256 个字符' }, 400);
+    }
+
+    const size = Number(resolved.resolved.object.size || 0);
+    const detected = await detectTxtObjectEncoding(env, resolved.resolved, size);
+    const patternBytes = encodeTxtLiteral(query, detected.encoding);
+    if (patternBytes.length === 0 || patternBytes.length > TXT_SEARCH_MAX_SCAN_BYTES) {
+      return jsonResponse({ success: false, message: '搜索词无效' }, 400);
+    }
+
+    const requestedOffset = url.searchParams.get('offset') ?? url.searchParams.get('byteOffset');
+    let offset = requestedOffset === null || requestedOffset === ''
+      ? 0
+      : normalizeTxtInteger(requestedOffset, -1);
+    if (offset < 0) {
+      return jsonResponse({ success: false, message: '搜索偏移无效' }, 416, { 'Content-Range': `bytes */${size}` });
+    }
+    const cursorToken = url.searchParams.get('cursor');
+    if (cursorToken) {
+      const cursor = await verifyTxtCursor(cursorToken, env.ADMIN_PASSWORD);
+      if (!cursor || cursor.path !== resolved.filePath || cursor.query !== query || cursor.etag !== resolved.etag) {
+        return jsonResponse({ success: false, message: '搜索游标已失效，请重新搜索' }, 400);
+      }
+      if (requestedOffset !== null && requestedOffset !== '' && offset !== cursor.offset) {
+        return jsonResponse({ success: false, message: '搜索游标与偏移不匹配' }, 400);
+      }
+      offset = normalizeTxtInteger(cursor.offset, -1);
+      if (offset < 0) return jsonResponse({ success: false, message: '搜索游标无效' }, 400);
+    }
+    if (offset > size) return jsonResponse({ success: false, message: '搜索偏移无效' }, 416, { 'Content-Range': `bytes */${size}` });
+
+    const requestedLimit = Number(url.searchParams.get('limit') || TXT_SEARCH_MAX_RESULTS);
+    const limit = Number.isSafeInteger(requestedLimit)
+      ? Math.min(TXT_SEARCH_MAX_RESULTS, Math.max(1, requestedLimit))
+      : TXT_SEARCH_MAX_RESULTS;
+    const pattern = bytesToBinaryString(patternBytes);
+    const overlapLength = Math.max(0, patternBytes.length - 1);
+    const results = [];
+    const emittedOffsets = new Set();
+    let carry = new Uint8Array();
+    let position = offset;
+    let scannedBytes = 0;
+    let reachedResultLimit = false;
+
+    while (position < size && scannedBytes < TXT_SEARCH_MAX_SCAN_BYTES) {
+      const requestLength = Math.min(TXT_SEARCH_CHUNK_BYTES, size - position, TXT_SEARCH_MAX_SCAN_BYTES - scannedBytes);
+      const bounded = await getBoundedR2Bytes(env, resolved.resolved.key, position, requestLength);
+      if (!bounded || bounded.bytes.length === 0) break;
+
+      const combined = concatTxtBytes(carry, bounded.bytes);
+      const baseOffset = position - carry.length;
+      const binary = bytesToBinaryString(combined);
+      let searchFrom = 0;
+      while (true) {
+        const matchIndex = binary.indexOf(pattern, searchFrom);
+        if (matchIndex < 0) break;
+        const byteOffset = baseOffset + matchIndex;
+        const startsOnTextBoundary = byteOffset >= detected.byteOffset
+          && (!detected.encoding.startsWith('utf-16')
+            || (byteOffset - detected.byteOffset) % 2 === 0);
+        if (startsOnTextBoundary && byteOffset >= offset && byteOffset < size && !emittedOffsets.has(byteOffset)) {
+          emittedOffsets.add(byteOffset);
+          const beforeStart = Math.max(0, matchIndex - 96);
+          const afterEnd = Math.min(combined.length, matchIndex + patternBytes.length + 160);
+          results.push({
+            byteOffset,
+            etag: resolved.etag,
+            snippetBefore: decodeTxtBytes(combined.slice(beforeStart, matchIndex), detected.encoding),
+            match: decodeTxtBytes(combined.slice(matchIndex, matchIndex + patternBytes.length), detected.encoding),
+            snippetAfter: decodeTxtBytes(combined.slice(matchIndex + patternBytes.length, afterEnd), detected.encoding)
+          });
+          if (results.length >= limit) {
+            reachedResultLimit = true;
+            break;
+          }
+        }
+        searchFrom = matchIndex + 1;
+      }
+      scannedBytes += bounded.bytes.length;
+      position += bounded.bytes.length;
+      if (reachedResultLimit) break;
+      carry = overlapLength > 0
+        ? combined.slice(Math.max(0, combined.length - overlapLength))
+        : new Uint8Array();
+      if (bounded.bytes.length < requestLength) break;
+    }
+
+    let nextOffset = null;
+    if (reachedResultLimit && results.length > 0) {
+      nextOffset = results[results.length - 1].byteOffset + 1;
+    } else if (position < size) {
+      nextOffset = Math.max(offset + 1, position - overlapLength);
+    }
+
+    const response = {
+      success: true,
+      path: resolved.filePath,
+      query,
+      etag: resolved.etag,
+      results,
+      limit,
+      offset,
+      scannedBytes,
+      hasMore: Number.isSafeInteger(nextOffset) && nextOffset < size
+    };
+    if (response.hasMore) {
+      response.nextCursor = await signTxtCursor({
+        v: 1,
+        path: resolved.filePath,
+        query,
+        etag: resolved.etag,
+        offset: nextOffset,
+        issuedAt: Date.now()
+      }, env.ADMIN_PASSWORD);
+    } else {
+      response.nextCursor = null;
+    }
+    return jsonResponse(response, 200, { 'Cache-Control': 'private, no-store', 'ETag': resolved.etag });
+  } catch (error) {
+    return jsonResponse({ success: false, message: 'TXT 搜索失败: ' + error.message }, 500);
+  }
+}
+
+/**
+ * Search the content index of a single txt file. Scans at most one page of
+ * TXT_INDEX_CHUNK_PAGE_LIMIT chunk rows; when the page is full a
+ * nextCursorPayload is returned so callers can continue from the next chunk.
+ */
+async function searchTxtIndexForPath(env, filePath, sourceEtag, query, limit, startChunk = 0, minimumCharOffset = 0, totalChars = 0) {
+  const likePattern = '%' + escapeLike(query) + '%';
+  const rows = await env.D1_DB.prepare(`
+    SELECT * FROM txt_index_chunks
+    WHERE path = ? AND source_etag = ? AND chunk_no >= ?
+      AND content LIKE ? ESCAPE '\\'
+    ORDER BY chunk_no ASC
+    LIMIT ?
+  `).bind(
+    filePath,
+    sourceEtag,
+    startChunk,
+    likePattern,
+    TXT_INDEX_CHUNK_PAGE_LIMIT
+  ).all();
+
+  const results = [];
+  const emittedOffsets = new Set();
+  let lastChunkNo = null;
+  let nextCursorPayload = null;
+
+  for (const row of rows.results || []) {
+    lastChunkNo = Number(row.chunk_no || 0);
+    const content = String(row.content || '');
+    const contentStart = Number(row.content_start || 0);
+    const pageStart = Number(row.char_start || 0);
+    const pageEnd = Number(row.char_end || pageStart);
+    let matchIndex = 0;
+    while (matchIndex <= content.length - query.length) {
+      const foundAt = content.indexOf(query, matchIndex);
+      if (foundAt < 0) break;
+      const charOffset = contentStart + foundAt;
+      const crossesPageStart = charOffset < pageStart && charOffset + query.length > pageStart;
+      const isOwnedByPage = charOffset >= pageStart;
+      const isWithinPage = charOffset < pageEnd;
+      if ((isOwnedByPage || crossesPageStart)
+        && isWithinPage
+        && charOffset >= minimumCharOffset
+        && !emittedOffsets.has(charOffset)) {
+        emittedOffsets.add(charOffset);
+        const beforeStart = Math.max(0, foundAt - 96);
+        const afterEnd = Math.min(content.length, foundAt + query.length + 160);
+        const progress = totalChars > 0 ? Math.max(0, Math.min(1, charOffset / totalChars)) : 0;
+        results.push({
+          charOffset,
+          matchLength: query.length,
+          byteOffset: Number(row.byte_start || 0),
+          byteOffsetApproximate: true,
+          progress,
+          progressPercent: Number((progress * 100).toFixed(2)),
+          etag: sourceEtag,
+          snippetBefore: content.slice(beforeStart, foundAt),
+          match: content.slice(foundAt, foundAt + query.length),
+          snippetAfter: content.slice(foundAt + query.length, afterEnd)
+        });
+        if (results.length >= limit) {
+          nextCursorPayload = {
+            chunkNo: lastChunkNo,
+            charOffset: charOffset + 1
+          };
+          break;
+        }
+      }
+      matchIndex = foundAt + 1;
+    }
+    if (nextCursorPayload) break;
+  }
+
+  if (!nextCursorPayload && rows.results && rows.results.length >= TXT_INDEX_CHUNK_PAGE_LIMIT && lastChunkNo !== null) {
+    nextCursorPayload = {
+      chunkNo: lastChunkNo + 1,
+      charOffset: minimumCharOffset
+    };
+  }
+
+  return { results, nextCursorPayload, scannedChunks: (rows.results || []).length };
+}
+
+async function handleTxtIndexedSearch(request, env, resolved, record) {
+  try {
+    const url = new URL(request.url);
+    const query = url.searchParams.get('q') || '';
+    if (!query || query.length > TXT_SEARCH_MAX_QUERY_LENGTH) {
+      return jsonResponse({ success: false, message: '搜索词不能为空且不能超过 256 个字符' }, 400);
+    }
+
+    const sourceEtag = resolved.etag || '';
+    const totalChars = Number(record.total_chars || 0);
+    const requestedLimit = Number(url.searchParams.get('limit') || TXT_SEARCH_MAX_RESULTS);
+    const limit = Number.isSafeInteger(requestedLimit)
+      ? Math.min(TXT_SEARCH_MAX_RESULTS, Math.max(1, requestedLimit))
+      : TXT_SEARCH_MAX_RESULTS;
+    let startChunk = 0;
+    let minimumCharOffset = 0;
+    const cursorToken = url.searchParams.get('cursor');
+    if (cursorToken) {
+      const cursor = await verifyTxtCursor(cursorToken, env.ADMIN_PASSWORD);
+      if (!cursor
+        || cursor.kind !== 'txt-index-search'
+        || cursor.path !== resolved.filePath
+        || cursor.query !== query
+        || cursor.etag !== resolved.etag) {
+        return jsonResponse({ success: false, message: '搜索游标已失效，请重新搜索' }, 400);
+      }
+      startChunk = normalizeTxtInteger(cursor.chunkNo, -1);
+      minimumCharOffset = normalizeTxtInteger(cursor.charOffset, -1);
+      if (startChunk < 0 || minimumCharOffset < 0) {
+        return jsonResponse({ success: false, message: '搜索游标无效' }, 400);
+      }
+    }
+
+    const { results, nextCursorPayload } = await searchTxtIndexForPath(
+      env,
+      resolved.filePath,
+      sourceEtag,
+      query,
+      limit,
+      startChunk,
+      minimumCharOffset,
+      totalChars
+    );
+
+    const response = {
+      success: true,
+      indexed: true,
+      path: resolved.filePath,
+      query,
+      etag: resolved.etag,
+      totalChars,
+      results,
+      limit,
+      hasMore: !!nextCursorPayload,
+      nextCursor: null
+    };
+    if (nextCursorPayload) {
+      response.nextCursor = await signTxtCursor({
+        v: 1,
+        kind: 'txt-index-search',
+        path: resolved.filePath,
+        query,
+        etag: resolved.etag,
+        chunkNo: nextCursorPayload.chunkNo,
+        charOffset: nextCursorPayload.charOffset,
+        issuedAt: Date.now()
+      }, env.ADMIN_PASSWORD);
+    }
+    return jsonResponse(response, 200, { 'Cache-Control': 'private, no-store', 'ETag': resolved.etag });
+  } catch (error) {
+    return jsonResponse({ success: false, message: 'TXT 索引搜索失败: ' + error.message }, 500);
+  }
+}
+
+async function handleTxtSearch(request, env) {
+  const resolved = await resolveTxtObject(request, env);
+  if (resolved.error) return resolved.error;
+
+  if (!env.D1_DB) return handleTxtSearchRaw(request, env, resolved);
+
+  try {
+    const size = Number(resolved.resolved.object.size || 0);
+    const record = await getTxtIndexRecord(env, resolved.filePath);
+    const sameStoredSource = record
+      && record.source_etag === (resolved.etag || '')
+      && Number(record.size || 0) === size;
+    const detected = sameStoredSource
+      ? { encoding: record.encoding, byteOffset: 0 }
+      : await detectTxtObjectEncoding(env, resolved.resolved, size);
+    const sameSource = record
+      && record.source_etag === (resolved.etag || '')
+      && Number(record.size || 0) === size
+      && record.encoding === detected.encoding;
+    if (sameSource && record.status === 'ready') {
+      return handleTxtIndexedSearch(request, env, resolved, record);
+    }
+    return jsonResponse({
+      success: false,
+      code: 'TXT_INDEX_NOT_READY',
+      message: '请先建立 TXT 正文索引',
+      index: txtIndexRecordToClient(record, resolved, size, detected.encoding)
+    }, 409, { 'Cache-Control': 'private, no-store', 'ETag': resolved.etag });
+  } catch (error) {
+    return jsonResponse({ success: false, message: 'TXT 搜索失败: ' + error.message }, 500);
+  }
+}
+
+const TXT_GLOBAL_SEARCH_MAX_RESULTS = 50;
+const TXT_GLOBAL_SEARCH_MAX_BOOKS_PER_REQUEST = 60;
+const TXT_GLOBAL_SEARCH_MAX_CHUNKS_PER_REQUEST = 4000;
+const TXT_GLOBAL_SEARCH_MAX_CANDIDATE_BOOKS = 500;
+
+/**
+ * Global full-text search across every indexed .txt book. Books are searched
+ * one at a time (in path order) with early termination, bounded by a scan
+ * budget so a query that matches nothing cannot run away. The HMAC cursor
+ * resumes at the exact book/chunk where the previous page stopped.
+ */
+async function handleTxtGlobalSearch(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+  if (!env.D1_DB) {
+    return jsonResponse({ success: false, code: 'TXT_INDEX_UNAVAILABLE', message: 'D1 未配置，无法搜索 TXT 正文' }, 503);
+  }
+
+  try {
+    await ensureD1Schema(env);
+    const url = new URL(request.url);
+    const query = url.searchParams.get('q') || '';
+    if (!query || query.length > TXT_SEARCH_MAX_QUERY_LENGTH) {
+      return jsonResponse({ success: false, message: '搜索词不能为空且不能超过 256 个字符' }, 400);
+    }
+    const requestedLimit = Number(url.searchParams.get('limit') || 20);
+    const limit = Number.isSafeInteger(requestedLimit)
+      ? Math.min(TXT_GLOBAL_SEARCH_MAX_RESULTS, Math.max(1, requestedLimit))
+      : 20;
+
+    let startPath = '';
+    let startChunk = 0;
+    let startCharOffset = 0;
+    const cursorToken = url.searchParams.get('cursor');
+    if (cursorToken) {
+      const cursor = await verifyTxtCursor(cursorToken, env.ADMIN_PASSWORD);
+      if (!cursor || cursor.kind !== 'txt-global-search' || cursor.query !== query) {
+        return jsonResponse({ success: false, message: '搜索游标已失效，请重新搜索' }, 400);
+      }
+      startPath = typeof cursor.lastPath === 'string' ? cursor.lastPath : '';
+      // chunkNo === -1 marks the resume book as already fully scanned.
+      startChunk = Number.isSafeInteger(Number(cursor.chunkNo)) ? Number(cursor.chunkNo) : 0;
+      startCharOffset = normalizeTxtInteger(cursor.charOffset, 0);
+    }
+
+    const booksResult = await env.D1_DB.prepare(`
+      SELECT path, source_etag, total_chars
+      FROM txt_index_files
+      WHERE status = 'ready' AND path >= ?
+      ORDER BY path ASC
+      LIMIT ?
+    `).bind(startPath, TXT_GLOBAL_SEARCH_MAX_CANDIDATE_BOOKS).all();
+
+    const bookRows = booksResult.results || [];
+    const allowedBooks = await filterItemsByPermissionD1(
+      env,
+      auth,
+      bookRows.map(row => ({ path: row.path, itemType: 'file' })),
+      'preview'
+    );
+    const allowedPaths = new Set(allowedBooks.map(item => item.path));
+    const candidates = bookRows.filter(row => allowedPaths.has(row.path));
+
+    const results = [];
+    let scannedBooks = 0;
+    let scannedChunks = 0;
+    let nextCursorPayload = null;
+
+    for (const book of candidates) {
+      if (scannedBooks >= TXT_GLOBAL_SEARCH_MAX_BOOKS_PER_REQUEST
+        || scannedChunks >= TXT_GLOBAL_SEARCH_MAX_CHUNKS_PER_REQUEST) {
+        nextCursorPayload = { lastPath: book.path, chunkNo: 0, charOffset: 0 };
+        break;
+      }
+
+      const isResumeBook = !!cursorToken && book.path === startPath;
+      if (isResumeBook && startChunk < 0) continue; // book fully scanned on the previous page
+
+      scannedBooks++;
+      let chunkCursor = isResumeBook ? startChunk : 0;
+      let minCharOffset = isResumeBook ? startCharOffset : 0;
+
+      for (;;) {
+        const page = await searchTxtIndexForPath(
+          env,
+          book.path,
+          book.source_etag,
+          query,
+          limit - results.length,
+          chunkCursor,
+          minCharOffset,
+          Number(book.total_chars || 0)
+        );
+        scannedChunks += page.scannedChunks;
+        for (const match of page.results) {
+          results.push({
+            ...match,
+            path: book.path,
+            name: nameFromItemPath(book.path)
+          });
+        }
+
+        if (results.length >= limit && page.nextCursorPayload) {
+          nextCursorPayload = { lastPath: book.path, ...page.nextCursorPayload };
+          break;
+        }
+        if (!page.nextCursorPayload) break;
+
+        chunkCursor = page.nextCursorPayload.chunkNo;
+        minCharOffset = page.nextCursorPayload.charOffset;
+        if (scannedChunks >= TXT_GLOBAL_SEARCH_MAX_CHUNKS_PER_REQUEST) {
+          nextCursorPayload = { lastPath: book.path, chunkNo: chunkCursor, charOffset: minCharOffset };
+          break;
+        }
+      }
+
+      if (nextCursorPayload) break;
+    }
+
+    // Candidate window was full but fully scanned: continue past the last book
+    // (a follow-up page simply comes back empty if no books remain).
+    if (!nextCursorPayload && bookRows.length >= TXT_GLOBAL_SEARCH_MAX_CANDIDATE_BOOKS) {
+      nextCursorPayload = { lastPath: bookRows[bookRows.length - 1].path, chunkNo: -1, charOffset: 0 };
+    }
+
+    const response = {
+      success: true,
+      query,
+      results,
+      limit,
+      scannedBooks,
+      scannedChunks,
+      hasMore: !!nextCursorPayload,
+      nextCursor: null
+    };
+    if (nextCursorPayload) {
+      response.nextCursor = await signTxtCursor({
+        v: 1,
+        kind: 'txt-global-search',
+        query,
+        lastPath: nextCursorPayload.lastPath,
+        chunkNo: nextCursorPayload.chunkNo,
+        charOffset: nextCursorPayload.charOffset,
+        issuedAt: Date.now()
+      }, env.ADMIN_PASSWORD);
+    }
+    return jsonResponse(response, 200, { 'Cache-Control': 'private, no-store' });
+  } catch (error) {
+    return jsonResponse({ success: false, message: 'TXT 全文搜索失败: ' + error.message }, 500);
+  }
 }
 
 async function listR2Prefix(env, prefix, options = {}) {
@@ -1082,20 +2025,84 @@ function joinItemPath(parentPath, name) {
 }
 
 async function folderExists(env, folderPath) {
-  const normalized = normalizeDirectoryPath(folderPath);
-  if (normalized === '/') return true;
+  const info = await getCurrentResourceInfo(env, folderPath);
+  return !!(info && info.itemType === 'folder');
+}
 
-  const prefix = directoryPathToR2Prefix(normalized);
-  const listed = await listR2Prefix(env, prefix, { limit: 1 });
-  return !!(listed.objects && listed.objects.length > 0);
+async function getCurrentResourceInfo(env, rawPath) {
+  const path = normalizeItemPath(rawPath || '');
+  if (!path) return null;
+  if (path === '/') {
+    return {
+      path,
+      itemType: 'folder',
+      key: '',
+      resourceKey: '/',
+      resourceVersion: 'root',
+      resourceEtag: '"root"'
+    };
+  }
+
+  const key = itemPathToR2Key(path);
+  const exact = await headR2Object(env, key);
+  const folderPrefix = key + '/';
+  const folderListing = await listR2Prefix(env, folderPrefix, { limit: 1 });
+  const hasFolder = !!(folderListing.objects && folderListing.objects.length > 0);
+  if (exact && hasFolder) {
+    return null;
+  }
+  if (exact) {
+    const object = exact.object;
+    return {
+      path,
+      itemType: 'file',
+      key: exact.key,
+      object,
+      size: Number(object.size || 0),
+      resourceKey: exact.key,
+      resourceVersion: object.version || null,
+      resourceEtag: currentTxtEtag(object)
+    };
+  }
+  if (!hasFolder) return null;
+
+  const marker = await headR2Object(env, folderPrefix + '.folder');
+  const firstObject = folderListing.objects[0];
+  return {
+    path,
+    itemType: 'folder',
+    key,
+    resourceKey: marker?.key || folderPrefix,
+    resourceVersion: marker?.object?.version || firstObject.version || null,
+    resourceEtag: currentTxtEtag(marker?.object) || (firstObject.etag ? `"${String(firstObject.etag).replace(/^"|"$/g, '')}"` : null)
+  };
+}
+
+async function pathHasAnyR2Object(env, rawPath) {
+  const path = normalizeItemPath(rawPath || '');
+  if (!path || path === '/') return path === '/';
+  const key = itemPathToR2Key(path);
+  if (await headR2Object(env, key)) return true;
+  const listing = await listR2Prefix(env, key + '/', { limit: 1 });
+  return !!(listing.objects && listing.objects.length > 0);
+}
+
+function resourceBindingMatches(info, row) {
+  if (!info || !row) return false;
+  const itemType = row.item_type || row.itemType;
+  const resourceKey = row.resource_key ?? row.resourceKey;
+  const resourceVersion = row.resource_version ?? row.resourceVersion;
+  const resourceEtag = row.resource_etag ?? row.resourceEtag;
+  if (itemType && itemType !== info.itemType) return false;
+  if (!resourceKey && !resourceVersion && !resourceEtag) return null;
+  if (resourceKey && resourceKey !== info.resourceKey) return false;
+  if (resourceVersion && resourceVersion !== info.resourceVersion) return false;
+  if (resourceEtag && resourceEtag !== info.resourceEtag) return false;
+  return true;
 }
 
 async function destinationExists(env, key, isFolder) {
-  if (isFolder) {
-    const listed = await listR2Prefix(env, key + '/', { limit: 1 });
-    return !!(listed.objects && listed.objects.length > 0);
-  }
-  return !!(await headR2Object(env, key));
+  return pathHasAnyR2Object(env, r2KeyToPath(key));
 }
 
 function copyNameCandidate(name, index) {
@@ -1162,8 +2169,7 @@ async function deleteItemAtPath(env, path) {
 
   const resolved = await headR2Object(env, key);
   if (resolved) await env.R2_BUCKET.delete(resolved.key);
-  await invalidateCachePath(env, r2KeyToPath(key));
-  await cleanupD1ItemPath(env, r2KeyToPath(key));
+  await invalidatePathReferences(env, r2KeyToPath(key));
 }
 
 async function deleteR2Keys(env, keys) {
@@ -1194,14 +2200,13 @@ async function copyOrMoveItem(env, sourcePath, destinationPath, shouldMove) {
     throw new Error('目标文件夹不存在: ' + normalizedDestinationPath);
   }
 
-  const resolvedSource = await headR2Object(env, sourceKey);
-  const sourceObject = resolvedSource?.object || null;
-  const actualSourceKey = resolvedSource?.key || sourceKey;
+  const sourceInfo = await getCurrentResourceInfo(env, normalizedSourcePath);
+  const sourceObject = sourceInfo?.itemType === 'file' ? sourceInfo.object : null;
+  const actualSourceKey = sourceInfo?.key || sourceKey;
   const sourcePrefix = sourceKey + '/';
-  const folderCheck = sourceObject ? null : await listR2Prefix(env, sourcePrefix, { limit: 1 });
-  const isFolder = !sourceObject && !!(folderCheck.objects && folderCheck.objects.length > 0);
+  const isFolder = sourceInfo?.itemType === 'folder';
 
-  if (!sourceObject && !isFolder) {
+  if (!sourceInfo) {
     throw new Error('项目不存在: ' + normalizedSourcePath);
   }
 
@@ -1244,10 +2249,13 @@ async function copyOrMoveItem(env, sourcePath, destinationPath, shouldMove) {
   }
 
   if (shouldMove) {
-    await invalidateCachePath(env, normalizedSourcePath);
-    await cleanupD1ItemPath(env, normalizedSourcePath);
+    await invalidatePathReferences(env, normalizedSourcePath);
   }
-  await invalidateCachePath(env, targetPath);
+  if (isFolder) {
+    await indexR2Subtree(env, targetPath);
+  } else {
+    await upsertSearchFileFromR2Object(env, targetKey, sourceObject || {});
+  }
 
   return { sourcePath: normalizedSourcePath, targetPath };
 }
@@ -1470,13 +2478,12 @@ async function buildCopyMoveTaskItems(env, auth, operation, selectedItems, desti
       }
 
       const sourceKey = itemPathToR2Key(itemPath);
-      const resolvedSource = await headR2Object(env, sourceKey);
-      const sourceObject = resolvedSource?.object || null;
-      const actualSourceKey = resolvedSource?.key || sourceKey;
+      const sourceInfo = await getCurrentResourceInfo(env, itemPath);
+      const sourceObject = sourceInfo?.itemType === 'file' ? sourceInfo.object : null;
+      const actualSourceKey = sourceInfo?.key || sourceKey;
       const sourcePrefix = sourceKey + '/';
-      const folderCheck = sourceObject ? null : await listR2Prefix(env, sourcePrefix, { limit: 1 });
-      const isFolder = !sourceObject && !!(folderCheck.objects && folderCheck.objects.length > 0);
-      if (!sourceObject && !isFolder) throw new Error('项目不存在: ' + itemPath);
+      const isFolder = sourceInfo?.itemType === 'folder';
+      if (!sourceInfo) throw new Error('项目不存在: ' + itemPath);
 
       const desiredPath = joinItemPath(destinationPath, nameFromItemPath(itemPath));
       let targetKey = itemPathToR2Key(desiredPath);
@@ -1502,7 +2509,9 @@ async function buildCopyMoveTaskItems(env, auth, operation, selectedItems, desti
               sourceKey: obj.key,
               targetPath: r2KeyToPath(targetPrefix + relativeKey),
               targetKey: targetPrefix + relativeKey,
-              size: obj.size || 0
+              size: obj.size || 0,
+              sourceVersion: obj.version || null,
+              sourceEtag: currentTxtEtag(obj)
             });
           }
           cursor = null;
@@ -1513,7 +2522,9 @@ async function buildCopyMoveTaskItems(env, auth, operation, selectedItems, desti
           sourceKey: actualSourceKey,
           targetPath,
           targetKey,
-          size: sourceObject.size || 0
+          size: sourceObject.size || 0,
+          sourceVersion: sourceInfo.resourceVersion,
+          sourceEtag: sourceInfo.resourceEtag
         });
       }
     } catch (error) {
@@ -1545,13 +2556,12 @@ async function buildDeleteTaskItems(env, auth, selectedItems) {
       }
 
       const sourceKey = itemPathToR2Key(itemPath);
-      const resolvedSource = await headR2Object(env, sourceKey);
-      const sourceObject = resolvedSource?.object || null;
-      const actualSourceKey = resolvedSource?.key || sourceKey;
+      const sourceInfo = await getCurrentResourceInfo(env, itemPath);
+      const sourceObject = sourceInfo?.itemType === 'file' ? sourceInfo.object : null;
+      const actualSourceKey = sourceInfo?.key || sourceKey;
       const sourcePrefix = sourceKey + '/';
-      const folderCheck = await listR2Prefix(env, sourcePrefix, { limit: 1 });
-      const isFolder = !!(folderCheck.objects && folderCheck.objects.length > 0);
-      if (!sourceObject && !isFolder) throw new Error('项目不存在: ' + itemPath);
+      const isFolder = sourceInfo?.itemType === 'folder';
+      if (!sourceInfo) throw new Error('项目不存在: ' + itemPath);
 
       if (sourceObject && !reservedKeys.has(actualSourceKey)) {
         reservedKeys.add(actualSourceKey);
@@ -1560,7 +2570,9 @@ async function buildDeleteTaskItems(env, auth, selectedItems) {
           sourceKey: actualSourceKey,
           targetPath: itemPath,
           targetKey: actualSourceKey,
-          size: sourceObject.size || 0
+          size: sourceObject.size || 0,
+          sourceVersion: sourceInfo.resourceVersion,
+          sourceEtag: sourceInfo.resourceEtag
         });
       }
 
@@ -1577,7 +2589,9 @@ async function buildDeleteTaskItems(env, auth, selectedItems) {
               sourceKey: obj.key,
               targetPath: objectPath,
               targetKey: obj.key,
-              size: obj.size || 0
+              size: obj.size || 0,
+              sourceVersion: obj.version || null,
+              sourceEtag: currentTxtEtag(obj)
             });
           }
           cursor = null;
@@ -1600,8 +2614,8 @@ async function insertTaskItems(env, taskId, taskItems) {
   const now = Date.now();
   const insert = env.D1_DB.prepare(`
     INSERT INTO file_task_items (
-      task_id, source_path, source_key, target_path, target_key, size, status, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+      task_id, source_path, source_key, target_path, target_key, size, source_version, source_etag, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
   `);
 
   for (let index = 0; index < taskItems.length; index += 50) {
@@ -1612,6 +2626,8 @@ async function insertTaskItems(env, taskId, taskItems) {
       item.targetPath,
       item.targetKey,
       item.size || 0,
+      item.sourceVersion || null,
+      item.sourceEtag || null,
       now,
       now
     )));
@@ -1634,6 +2650,10 @@ async function handleCreateTask(request, env) {
       const destinationPath = normalizeDirectoryPath(body.destinationPath || body.path || '/');
       const permissionError = await requirePathPermission(env, auth, 'upload', destinationPath);
       if (permissionError) return permissionError;
+      const destination = await getCurrentResourceInfo(env, destinationPath);
+      if (!destination || destination.itemType !== 'folder') {
+        return jsonResponse({ success: false, message: '目标文件夹不存在' }, 404);
+      }
       taskId = await insertFileTask(env, auth, {
         type,
         status: 'running',
@@ -1645,9 +2665,11 @@ async function handleCreateTask(request, env) {
       const filePath = normalizeItemPath(body.path || body.sourcePath || '');
       const permissionError = await requirePathPermission(env, auth, 'download', filePath);
       if (permissionError) return permissionError;
-      const resolved = await headR2Object(env, itemPathToR2Key(filePath));
-      if (!resolved) return jsonResponse({ success: false, message: '文件不存在' }, 404);
-      const object = resolved.object;
+      const current = await getCurrentResourceInfo(env, filePath);
+      if (!current || current.itemType !== 'file' || !current.object) {
+        return jsonResponse({ success: false, message: '文件不存在' }, 404);
+      }
+      const object = current.object;
       taskId = await insertFileTask(env, auth, {
         type,
         status: 'running',
@@ -1899,22 +2921,42 @@ async function handleRunTask(request, env, taskId) {
 
     const errors = [];
     for (const item of rows.results || []) {
+      let sourceInvalid = false;
       try {
+        const currentSource = await headR2Object(env, item.source_key);
+        if (!currentSource) {
+          sourceInvalid = true;
+          throw new Error('源对象不存在或已被替换');
+        }
+        if (item.source_version && currentSource.object.version !== item.source_version) {
+          sourceInvalid = true;
+          throw new Error('源对象已变化，请重新创建任务');
+        }
+        if (item.source_etag && currentTxtEtag(currentSource.object) !== item.source_etag) {
+          sourceInvalid = true;
+          throw new Error('源对象已变化，请重新创建任务');
+        }
+        let sourceRemoved = false;
         if (task.task_type === 'delete') {
           await env.R2_BUCKET.delete(item.source_key);
+          sourceRemoved = true;
         } else {
           const copied = await copyR2Object(env, item.source_key, item.target_key);
           if (!copied) throw new Error('源对象不存在');
+          await upsertSearchFileFromR2Object(env, item.target_key, currentSource.object);
           if (task.task_type === 'move') {
             await env.R2_BUCKET.delete(item.source_key);
+            sourceRemoved = true;
           }
         }
+        if (sourceRemoved) await invalidatePathReferences(env, item.source_path);
         await env.D1_DB.prepare(`
           UPDATE file_task_items
           SET status = 'succeeded', error_message = NULL, updated_at = ?
           WHERE id = ?
         `).bind(Date.now(), item.id).run();
       } catch (error) {
+        if (sourceInvalid) await invalidatePathReferences(env, item.source_path);
         await env.D1_DB.prepare(`
           UPDATE file_task_items
           SET status = 'failed', error_message = ?, updated_at = ?
@@ -1946,7 +2988,7 @@ async function handleRunTask(request, env, taskId) {
       if (task.task_type === 'delete') {
         await cleanupDeletedTaskSources(env, task);
       } else {
-        await invalidateCachePath(env, targetPath);
+        await indexR2Subtree(env, targetPath);
       }
       if (task.task_type === 'move') {
         await cleanupMovedTaskD1(env, taskId);
@@ -1980,8 +3022,7 @@ async function cleanupDeletedTaskSources(env, task) {
     .filter(path => path && path !== '/');
 
   for (const path of sourceRoots) {
-    await invalidateCachePath(env, path);
-    await cleanupD1ItemPath(env, path);
+    await invalidatePathReferences(env, path);
   }
 }
 
@@ -2006,8 +3047,8 @@ async function cleanupMovedTaskSources(env, taskId) {
     const listed = await listR2Prefix(env, key + '/', { limit: 1 });
     if (!listed.objects || listed.objects.length === 0) {
       await env.R2_BUCKET.delete(key + '/.folder').catch(() => null);
+      await cleanupD1ItemPath(env, folder);
     }
-    await invalidateCachePath(env, folder);
   }
 }
 
@@ -2032,7 +3073,7 @@ async function cleanupMovedTaskD1(env, taskId) {
   }
 
   for (const path of roots) {
-    await cleanupD1ItemPath(env, path);
+    await invalidatePathReferences(env, path);
   }
 }
 
@@ -2208,10 +3249,10 @@ async function collectBatchDownloadEntries(env, items) {
     const key = itemPathToR2Key(itemPath);
     if (!key) throw new Error('不能打包根目录');
 
-    const resolvedFile = await headR2Object(env, key);
-    if (resolvedFile) {
-      const actualKey = resolvedFile.key;
-      const fileObject = resolvedFile.object;
+    const current = await getCurrentResourceInfo(env, itemPath);
+    if (current?.itemType === 'file' && current.object) {
+      const actualKey = current.key;
+      const fileObject = current.object;
       if (usedKeys.has(actualKey)) continue;
       usedKeys.add(actualKey);
       addZipEntry(entries, usedNames, {
@@ -2224,6 +3265,9 @@ async function collectBatchDownloadEntries(env, items) {
       continue;
     }
 
+    if (!current || current.itemType !== 'folder') {
+      throw new Error('项目不存在: ' + itemPath);
+    }
     const prefix = key + '/';
     let cursor;
     let foundFolderObject = false;
@@ -2389,15 +3433,6 @@ async function createBatchDownloadResponse(env, auth, items) {
   });
 }
 
-function addFolderPathsFromR2Key(folderPaths, key) {
-  const parts = (key || '').split('/').filter(Boolean);
-  const folderParts = parts.slice(0, -1);
-
-  for (let index = 0; index < folderParts.length; index++) {
-    folderPaths.add('/' + folderParts.slice(0, index + 1).join('/'));
-  }
-}
-
 async function handleSearchFolders(request, env) {
   const auth = await requireAuth(request, env);
   if (auth instanceof Response) return auth;
@@ -2412,20 +3447,19 @@ async function handleSearchFolders(request, env) {
     const limit = Number.isFinite(requestedLimit)
       ? Math.min(100, Math.max(1, requestedLimit))
       : 50;
-    const folderPaths = new Set(['/']);
-    let cursor;
-    let scanned = 0;
-    const maxScannedObjects = 20000;
+    // Serve folder candidates from the virtual directory tree (D1) instead of
+    // scanning the whole R2 bucket on every keystroke.
+    await ensureD1Schema(env);
+    const rows = await env.D1_DB.prepare(`
+      SELECT path FROM search_items
+      WHERE item_type = 'folder'
+    `).all();
 
-    do {
-      const listed = await env.R2_BUCKET.list({ cursor, limit: 1000 });
-      const objects = listed.objects || [];
-      for (const obj of objects) {
-        addFolderPathsFromR2Key(folderPaths, obj.key);
-      }
-      scanned += objects.length;
-      cursor = listed.truncated ? listed.cursor : null;
-    } while (cursor && scanned < maxScannedObjects);
+    const folderPaths = new Set(['/']);
+    for (const row of rows.results || []) {
+      const path = normalizeItemPath(row.path);
+      if (path && path !== '/') folderPaths.add(path);
+    }
 
     let folders = Array.from(folderPaths)
       .filter(path => {
@@ -2438,12 +3472,13 @@ async function handleSearchFolders(request, env) {
         name: path === '/' ? '根目录' : nameFromItemPath(path)
       }));
 
-    folders = (await filterItemsByPermission(env, auth, folders, permissionAction)).slice(0, limit);
+    const scanned = folders.length;
+    folders = (await filterItemsByPermissionD1(env, auth, folders, permissionAction)).slice(0, limit);
 
     return jsonResponse({
       success: true,
       folders,
-      truncated: !!cursor,
+      truncated: false,
       scanned
     });
   } catch (e) {
@@ -2467,15 +3502,23 @@ async function handleCreateFolder(request, env) {
     const parentPath = parentPathFromItemPath(normalizedFolderPath);
     const permissionError = await requirePathPermission(env, auth, 'upload', parentPath);
     if (permissionError) return permissionError;
+    const parent = await getCurrentResourceInfo(env, parentPath);
+    if (!parent || parent.itemType !== 'folder') {
+      return jsonResponse({ success: false, message: '父文件夹不存在' }, 404);
+    }
 
     folderPath = normalizedFolderPath;
     if (folderPath.startsWith('/')) folderPath = folderPath.slice(1);
     if (!folderPath.endsWith('/')) folderPath += '/';
+    const folderItemPath = r2KeyToPath(folderPath.slice(0, -1));
+    if (await pathHasAnyR2Object(env, folderItemPath)) {
+      return jsonResponse({ success: false, message: '文件夹已存在' }, 409);
+    }
     
     // Create an empty placeholder file to represent the folder
     await env.R2_BUCKET.put(folderPath + '.folder', new Uint8Array(0));
-    await syncFolderCacheIfParentCached(env, folderPath.slice(0, -1));
-    
+    await upsertSearchFolderRow(env, folderItemPath);
+
     return jsonResponse({ success: true, message: '文件夹创建成功', path: '/' + folderPath.slice(0, -1) });
   } catch (e) {
     return jsonResponse({ success: false, message: '创建文件夹失败: ' + e.message }, 500);
@@ -2495,11 +3538,12 @@ async function handleDownloadFile(request, env, path) {
     const permissionError = await requirePathPermission(env, auth, 'download', itemPath);
     if (permissionError) return permissionError;
     
-    const resolved = await getR2Object(env, key);
-    if (!resolved) {
+    const current = await getCurrentResourceInfo(env, itemPath);
+    if (!current || current.itemType !== 'file' || !current.object) {
       return jsonResponse({ success: false, message: '文件不存在' }, 404);
     }
-    const object = resolved.object;
+    const object = await env.R2_BUCKET.get(current.key);
+    if (!object) return jsonResponse({ success: false, message: '文件不存在' }, 404);
     
     const filename = nameFromItemPath(itemPath);
     await recordRecentVisit(env, auth, {
@@ -2536,12 +3580,12 @@ async function handlePreviewFile(request, env, path) {
     const permissionError = await requirePathPermission(env, auth, 'preview', itemPath);
     if (permissionError) return permissionError;
     
-    const resolved = await getR2Object(env, key, {
-      range: request.headers
-    });
-    if (!resolved) {
+    const current = await getCurrentResourceInfo(env, itemPath);
+    if (!current || current.itemType !== 'file' || !current.object) {
       return jsonResponse({ success: false, message: '文件不存在' }, 404);
     }
+    const resolved = await getR2Object(env, current.key, { range: request.headers });
+    if (!resolved) return jsonResponse({ success: false, message: '文件不存在' }, 404);
     const object = resolved.object;
     
     const filename = nameFromItemPath(itemPath);
@@ -2565,7 +3609,10 @@ async function handlePreviewFile(request, env, path) {
     }
 
     if (object.range && typeof object.range.offset === 'number') {
-      const end = object.range.end ?? object.size - 1;
+      const rangeLength = typeof object.range.length === 'number' ? object.range.length : null;
+      const end = object.range.end ?? (rangeLength === null
+        ? object.size - 1
+        : object.range.offset + rangeLength - 1);
       headers.set('Content-Range', `bytes ${object.range.offset}-${end}/${object.size}`);
       headers.set('Content-Length', String(end - object.range.offset + 1));
       return new Response(object.body, {
@@ -2618,9 +3665,18 @@ async function handleGetReaderProgress(request, env) {
     const permissionError = await requirePathPermission(env, auth, 'preview', filePath);
     if (permissionError) return permissionError;
 
+    const resolved = await headR2Object(env, itemPathToR2Key(filePath));
+    if (!resolved || !resolved.object) {
+      return jsonResponse({ success: false, message: '文件不存在' }, 404);
+    }
+    const sourceEtag = currentTxtEtag(resolved.object);
+
     const key = await readerProgressKey(auth, filePath);
     const progress = await env.KV_STORE.get(key, 'json');
-    return jsonResponse({ success: true, progress: progress || null });
+    if (progress && progress.sourceEtag && progress.sourceEtag !== sourceEtag) {
+      return jsonResponse({ success: true, progress: null, stale: true, sourceEtag });
+    }
+    return jsonResponse({ success: true, progress: progress || null, sourceEtag });
   } catch (e) {
     return jsonResponse({ success: false, message: '读取阅读进度失败: ' + e.message }, 500);
   }
@@ -2641,9 +3697,20 @@ async function handlePutReaderProgress(request, env) {
     const permissionError = await requirePathPermission(env, auth, 'preview', filePath);
     if (permissionError) return permissionError;
 
+    const resolved = await headR2Object(env, itemPathToR2Key(filePath));
+    if (!resolved || !resolved.object) {
+      return jsonResponse({ success: false, message: '文件不存在' }, 404);
+    }
+    const sourceEtag = currentTxtEtag(resolved.object);
+    if (body.sourceEtag && body.sourceEtag !== sourceEtag) {
+      return jsonResponse({ success: false, message: '文件已变化，请重新加载' }, 412, { ETag: sourceEtag });
+    }
+
     const value = {
       path: filePath,
       charOffset: Math.floor(normalizeReaderNumber(body.charOffset, 0, 0, Number.MAX_SAFE_INTEGER)),
+      byteOffset: Math.floor(normalizeReaderNumber(body.byteOffset, 0, 0, Number(resolved.object.size || 0))),
+      sourceEtag,
       progress: normalizeReaderNumber(body.progress, 0, 0, 1),
       scrollTop: normalizeReaderNumber(body.scrollTop, 0, 0, Number.MAX_SAFE_INTEGER),
       scrollHeight: normalizeReaderNumber(body.scrollHeight, 0, 0, Number.MAX_SAFE_INTEGER),
@@ -2664,6 +3731,8 @@ function readerBookmarkToClient(row) {
     id: row.id,
     path: row.path,
     charOffset: Number(row.char_offset || 0),
+    byteOffset: row.source_etag ? Number(row.byte_offset || 0) : null,
+    sourceEtag: row.source_etag || null,
     progress: Number(row.progress || 0),
     snippet: row.snippet || '',
     createdAt: Number(row.created_at || 0)
@@ -2676,7 +3745,17 @@ async function validateReaderBookmarkPath(env, auth, rawPath) {
     return { error: jsonResponse({ success: false, message: '书签只支持 txt 文件' }, 400) };
   }
   const permissionError = await requirePathPermission(env, auth, 'preview', filePath);
-  return permissionError ? { error: permissionError } : { filePath };
+  if (permissionError) return { error: permissionError };
+  const resolved = await headR2Object(env, itemPathToR2Key(filePath));
+  if (!resolved || !resolved.object) {
+    return { error: jsonResponse({ success: false, message: '文件不存在' }, 404) };
+  }
+  return {
+    filePath,
+    resolved,
+    sourceEtag: currentTxtEtag(resolved.object),
+    size: Number(resolved.object.size || 0)
+  };
 }
 
 async function handleReaderBookmarks(request, env) {
@@ -2695,12 +3774,13 @@ async function handleReaderBookmarks(request, env) {
       );
       if (checked.error) return checked.error;
       const result = await env.D1_DB.prepare(`
-        SELECT id, path, char_offset, progress, snippet, created_at
+        SELECT id, path, char_offset, byte_offset, source_etag, progress, snippet, created_at
         FROM reader_bookmarks
         WHERE owner_key = ? AND path = ?
+          AND (source_etag IS NULL OR source_etag = ?)
         ORDER BY created_at DESC
         LIMIT 200
-      `).bind(ownerKey, checked.filePath).all();
+      `).bind(ownerKey, checked.filePath, checked.sourceEtag).all();
       return jsonResponse({
         success: true,
         bookmarks: (result.results || []).map(readerBookmarkToClient)
@@ -2712,6 +3792,10 @@ async function handleReaderBookmarks(request, env) {
       const checked = await validateReaderBookmarkPath(env, auth, body.path);
       if (checked.error) return checked.error;
       const charOffset = Math.floor(normalizeReaderNumber(body.charOffset, 0, 0, Number.MAX_SAFE_INTEGER));
+      const byteOffset = Math.floor(normalizeReaderNumber(body.byteOffset, 0, 0, checked.size));
+      if (body.sourceEtag && body.sourceEtag !== checked.sourceEtag) {
+        return jsonResponse({ success: false, message: '文件已变化，请重新加载' }, 412, { ETag: checked.sourceEtag });
+      }
       const progress = normalizeReaderNumber(body.progress, 0, 0, 1);
       const snippet = String(body.snippet || '').replace(/\s+/g, ' ').trim().slice(0, 160);
       const duplicate = await env.D1_DB.prepare(`
@@ -2726,18 +3810,22 @@ async function handleReaderBookmarks(request, env) {
         id: generateId(20),
         path: checked.filePath,
         charOffset,
+        byteOffset,
+        sourceEtag: checked.sourceEtag,
         progress,
         snippet,
         createdAt: Date.now()
       };
       await env.D1_DB.prepare(`
-        INSERT INTO reader_bookmarks (id, owner_key, path, char_offset, progress, snippet, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO reader_bookmarks (id, owner_key, path, char_offset, byte_offset, source_etag, progress, snippet, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).bind(
         bookmark.id,
         ownerKey,
         bookmark.path,
         bookmark.charOffset,
+        bookmark.byteOffset,
+        bookmark.sourceEtag,
         bookmark.progress,
         bookmark.snippet,
         bookmark.createdAt
@@ -2792,6 +3880,7 @@ function shareRowToClient(row) {
     expiresAt: row.expires_at ?? null,
     viewCount: row.view_count || 0,
     downloadCount: row.download_count || 0,
+    itemsInitialized: Number(row.items_initialized || 0),
     createdAt: row.created_at || 0
   };
 }
@@ -2801,7 +3890,10 @@ function shareItemRowToClient(row) {
     path: normalizeItemPath(row.item_path),
     name: row.item_name || nameFromItemPath(row.item_path),
     itemType: row.item_type === 'folder' ? 'folder' : 'file',
-    sortOrder: row.sort_order || 0
+    sortOrder: row.sort_order || 0,
+    resourceKey: row.resource_key || null,
+    resourceVersion: row.resource_version || null,
+    resourceEtag: row.resource_etag || null
   };
 }
 
@@ -2814,30 +3906,32 @@ function isPathWithinFolder(folderPath, targetPath) {
 async function describeShareItem(env, rawPath) {
   const path = normalizeItemPath(rawPath);
   if (!path || path === '/') throw new Error('不能分享根目录');
-
-  const key = itemPathToR2Key(path);
-  const resolved = await headR2Object(env, key);
-  if (resolved) {
-    const object = resolved.object;
+  const current = await getCurrentResourceInfo(env, path);
+  if (current?.itemType === 'file') {
+    const object = current.object;
     return {
       path,
       name: nameFromItemPath(path),
       itemType: 'file',
       size: object.size || 0,
       lastModified: isoDateString(object.uploaded),
-      previewType: getPreviewType(nameFromItemPath(path))
+      previewType: getPreviewType(nameFromItemPath(path)),
+      resourceKey: current.resourceKey,
+      resourceVersion: current.resourceVersion,
+      resourceEtag: current.resourceEtag
     };
   }
-
-  const folderCheck = await listR2Prefix(env, key + '/', { limit: 1 });
-  if (folderCheck.objects && folderCheck.objects.length > 0) {
+  if (current?.itemType === 'folder') {
     return {
       path,
       name: nameFromItemPath(path),
       itemType: 'folder',
       size: 0,
       lastModified: null,
-      previewType: null
+      previewType: null,
+      resourceKey: current.resourceKey,
+      resourceVersion: current.resourceVersion,
+      resourceEtag: current.resourceEtag
     };
   }
 
@@ -2848,8 +3942,8 @@ async function upsertD1Share(env, share) {
   await ensureD1Schema(env);
   await env.D1_DB.prepare(`
     INSERT INTO share_links (
-      share_id, file_path, file_name, file_size, password_hash, expires_at, view_count, download_count, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      share_id, file_path, file_name, file_size, password_hash, expires_at, view_count, download_count, items_initialized, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(share_id) DO NOTHING
   `).bind(
     share.shareId,
@@ -2860,14 +3954,15 @@ async function upsertD1Share(env, share) {
     share.expiresAt ?? null,
     share.viewCount || 0,
     share.downloadCount || 0,
+    1,
     share.createdAt || Date.now()
   ).run();
 
   if (Array.isArray(share.items) && share.items.length > 0) {
     const insertItem = env.D1_DB.prepare(`
       INSERT OR IGNORE INTO share_items (
-        share_id, item_path, item_name, item_type, sort_order, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?)
+        share_id, item_path, item_name, item_type, sort_order, resource_key, resource_version, resource_etag, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     await env.D1_DB.batch(share.items.map((item, index) => insertItem.bind(
       share.shareId,
@@ -2875,6 +3970,9 @@ async function upsertD1Share(env, share) {
       item.name || nameFromItemPath(item.path),
       item.itemType === 'folder' ? 'folder' : 'file',
       Number.isFinite(item.sortOrder) ? item.sortOrder : index,
+      item.resourceKey || null,
+      item.resourceVersion || null,
+      item.resourceEtag || null,
       share.createdAt || Date.now()
     )));
   }
@@ -2890,27 +3988,47 @@ async function getD1ShareItems(env, share) {
   const items = (rows.results || []).map(shareItemRowToClient);
   if (items.length > 0) return items;
 
+  if (share.itemsInitialized === 1) return [];
+
   const fallbackPath = r2KeyToPath(share.filePath || '');
   if (!fallbackPath || fallbackPath === '/') return [];
   const fallbackItem = {
     path: fallbackPath,
     name: share.fileName || nameFromItemPath(fallbackPath),
     itemType: 'file',
-    sortOrder: 0
+    sortOrder: 0,
+    resourceKey: null,
+    resourceVersion: null,
+    resourceEtag: null
   };
+
+  const current = await getCurrentResourceInfo(env, fallbackItem.path);
+  if (!current || current.itemType !== 'file') {
+    await env.D1_DB.prepare('UPDATE share_links SET items_initialized = 1 WHERE share_id = ?')
+      .bind(share.shareId).run();
+    return [];
+  }
+  fallbackItem.resourceKey = current.resourceKey;
+  fallbackItem.resourceVersion = current.resourceVersion;
+  fallbackItem.resourceEtag = current.resourceEtag;
 
   await env.D1_DB.prepare(`
     INSERT OR IGNORE INTO share_items (
-      share_id, item_path, item_name, item_type, sort_order, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?)
+      share_id, item_path, item_name, item_type, sort_order, resource_key, resource_version, resource_etag, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).bind(
     share.shareId,
     fallbackItem.path,
     fallbackItem.name,
     fallbackItem.itemType,
     0,
+    fallbackItem.resourceKey,
+    fallbackItem.resourceVersion,
+    fallbackItem.resourceEtag,
     share.createdAt || Date.now()
   ).run();
+  await env.D1_DB.prepare('UPDATE share_links SET items_initialized = 1 WHERE share_id = ?')
+    .bind(share.shareId).run();
 
   return [fallbackItem];
 }
@@ -2936,6 +4054,57 @@ async function getD1Share(env, shareId) {
   await upsertD1Share(env, legacyShare);
   legacyShare.items = await getD1ShareItems(env, legacyShare);
   return legacyShare;
+}
+
+async function getShareState(env, share) {
+  const validItems = [];
+  const invalidItems = [];
+  const items = Array.isArray(share?.items) ? share.items : [];
+
+  for (const item of items) {
+    const current = await getCurrentResourceInfo(env, item.path);
+    if (!current || current.itemType !== item.itemType) {
+      invalidItems.push(item);
+      continue;
+    }
+    const binding = resourceBindingMatches(current, item);
+    if (binding === false) {
+      invalidItems.push(item);
+      continue;
+    }
+    if (binding === null && env.D1_DB) {
+      await env.D1_DB.prepare(`
+        UPDATE share_items
+        SET resource_key = ?, resource_version = ?, resource_etag = ?
+        WHERE share_id = ? AND item_path = ?
+      `).bind(
+        current.resourceKey,
+        current.resourceVersion,
+        current.resourceEtag,
+        share.shareId,
+        item.path
+      ).run();
+      item.resourceKey = current.resourceKey;
+      item.resourceVersion = current.resourceVersion;
+      item.resourceEtag = current.resourceEtag;
+    }
+    validItems.push({ ...item, current });
+  }
+
+  const state = validItems.length === 0
+    ? 'orphaned'
+    : invalidItems.length > 0
+      ? 'partial'
+      : 'active';
+  return { state, validItems, invalidItems, allItems: items };
+}
+
+function shareStateGoneResponse(state) {
+  return jsonResponse({
+    success: false,
+    state: state.state,
+    message: '分享链接对应的文件已不存在'
+  }, 410);
 }
 
 async function migrateLegacySharesToD1(env) {
@@ -3179,13 +4348,13 @@ function isDownloadPathAllowedByShare(share, path) {
   });
 }
 
-async function buildShareRootListing(env, share) {
+async function buildShareRootListing(env, share, state) {
   const files = [];
   const folders = [];
 
-  for (const item of share.items || []) {
+  for (const item of state.validItems || []) {
     if (item.itemType === 'folder') {
-      if (await folderExists(env, item.path)) {
+      if (item.current && item.current.itemType === 'folder') {
         folders.push({
           name: item.name,
           path: normalizeItemPath(item.path)
@@ -3194,9 +4363,8 @@ async function buildShareRootListing(env, share) {
       continue;
     }
 
-    const resolved = await headR2Object(env, itemPathToR2Key(item.path));
-    if (!resolved) continue;
-    const object = resolved.object;
+    const object = item.current?.object;
+    if (!object) continue;
     files.push({
       name: item.name,
       path: normalizeItemPath(item.path),
@@ -3229,6 +4397,8 @@ async function handleGetShareInfo(request, env, shareId) {
     if (share.expiresAt && Date.now() > share.expiresAt) {
       return jsonResponse({ success: false, message: '分享链接已过期' }, 410);
     }
+    const state = await getShareState(env, share);
+    if (state.state === 'orphaned') return shareStateGoneResponse(state);
     
     await env.D1_DB.prepare(`
       UPDATE share_links
@@ -3237,15 +4407,21 @@ async function handleGetShareInfo(request, env, shareId) {
     `).bind(shareId).run();
     await changeD1Stat(env, 'totalViews', 1);
 
-    const itemCount = (share.items || []).length || 1;
-    const firstItem = (share.items || [])[0] || null;
+    const visibleItems = state.validItems || [];
+    const itemCount = visibleItems.length || 1;
+    const firstItem = visibleItems[0] || null;
     
     return jsonResponse({
       success: true,
       fileName: share.fileName,
-      fileSize: share.fileSize,
-      fileSizeFormatted: itemCount === 1 && firstItem?.itemType === 'folder' ? '文件夹' : formatFileSize(share.fileSize),
+      fileSize: firstItem?.current?.size ?? share.fileSize,
+      fileSizeFormatted: itemCount === 1 && firstItem?.itemType === 'folder'
+        ? '文件夹'
+        : formatFileSize(firstItem?.current?.size ?? share.fileSize),
       itemCount,
+      state: state.state,
+      validItemCount: state.validItems.length,
+      invalidItemCount: state.invalidItems.length,
       requiresPassword: !!share.passwordHash,
       expiresAt: share.expiresAt
     });
@@ -3264,6 +4440,8 @@ async function handleShareList(request, env, shareId) {
     if (share.expiresAt && Date.now() > share.expiresAt) {
       return jsonResponse({ success: false, message: '分享链接已过期' }, 410);
     }
+    const state = await getShareState(env, share);
+    if (state.state === 'orphaned') return shareStateGoneResponse(state);
 
     const body = await readShareRequestBody(request);
     const passwordError = await validateSharePassword(share, body);
@@ -3271,22 +4449,33 @@ async function handleShareList(request, env, shareId) {
 
     const currentPath = normalizeDirectoryPath(body.path || '/');
     if (currentPath === '/') {
-      return jsonResponse(await buildShareRootListing(env, share));
+      const listing = await buildShareRootListing(env, share, state);
+      return jsonResponse({ ...listing, state: state.state });
     }
 
-    const sharedFolder = findSharedFolderForPath(share, currentPath);
+    const sharedFolder = findSharedFolderForPath({ items: state.validItems }, currentPath);
     if (!sharedFolder) {
       return jsonResponse({ success: false, message: '无权访问该路径' }, 403);
     }
 
-    if (!(await folderExists(env, currentPath))) {
-      return jsonResponse({ success: false, message: '文件夹不存在' }, 404);
+    let listing = await listDirectoryFromD1(env, currentPath);
+    if (listing.folders.length === 0 && listing.files.length === 0) {
+      const knownFolder = await env.D1_DB.prepare(
+        "SELECT path FROM search_items WHERE path = ? AND item_type = 'folder'"
+      ).bind(currentPath).first();
+      if (!knownFolder) {
+        if (!(await pathHasAnyR2Object(env, currentPath))) {
+          return jsonResponse({ success: false, message: '文件夹不存在' }, 404);
+        }
+        // Index is missing this subtree — reconcile from R2 and retry.
+        await indexR2Subtree(env, currentPath);
+        listing = await listDirectoryFromD1(env, currentPath);
+      }
     }
-
-    const listing = await listDirectoryFromR2(env, currentPath);
     return jsonResponse({
       success: true,
       currentPath,
+      state: state.state,
       files: listing.files,
       folders: listing.folders
     });
@@ -3306,6 +4495,8 @@ async function handleShareDownload(request, env, shareId) {
     if (share.expiresAt && Date.now() > share.expiresAt) {
       return jsonResponse({ success: false, message: '分享链接已过期' }, 410);
     }
+    const state = await getShareState(env, share);
+    if (state.state === 'orphaned') return shareStateGoneResponse(state);
     
     const body = await readShareRequestBody(request);
     const passwordError = await validateSharePassword(share, body);
@@ -3321,14 +4512,22 @@ async function handleShareDownload(request, env, shareId) {
       return jsonResponse({ success: false, message: '请选择要下载的文件' }, 400);
     }
 
-    if (!isDownloadPathAllowedByShare(share, targetPath)) {
+    if (!isDownloadPathAllowedByShare({ items: state.validItems }, targetPath)) {
       return jsonResponse({ success: false, message: '无权下载该文件' }, 403);
     }
     
     // Get file from R2
     const filename = nameFromItemPath(targetPath);
-    const resolved = await getR2Object(env, itemPathToR2Key(targetPath));
-    if (!resolved) {
+    const current = await getCurrentResourceInfo(env, targetPath);
+    if (!current || current.itemType !== 'file' || !current.object) {
+      return jsonResponse({ success: false, message: '文件不存在' }, 404);
+    }
+    const directRoot = (state.validItems || []).find(item => item.itemType === 'file' && normalizeItemPath(item.path) === targetPath);
+    if (directRoot && resourceBindingMatches(current, directRoot) !== true) {
+      return jsonResponse({ success: false, state: 'orphaned', message: '分享文件已变化' }, 410);
+    }
+    const resolved = await getR2Object(env, current.key);
+    if (!resolved || !resolved.object) {
       return jsonResponse({ success: false, message: '文件不存在' }, 404);
     }
     const object = resolved.object;
@@ -3580,7 +4779,7 @@ async function handleAdminSearchResources(request, env) {
       LIMIT ?
     `).bind(...params, limit).all();
 
-    const items = (rows.results || []).map(d1RowToClientItem);
+    const items = await filterItemsByPermissionD1(env, auth, (rows.results || []).map(d1RowToClientItem), 'view');
     if ((!query || '/'.includes(query)) && type !== 'file' && !items.some(item => item.path === '/')) {
       items.unshift({
         path: '/',
@@ -3606,15 +4805,15 @@ async function handleAdminListResources(request, env) {
   try {
     const url = new URL(request.url);
     const currentPath = normalizeDirectoryPath(url.searchParams.get('path') || '/');
-    let listing = await readDirectoryCache(env, currentPath).catch(() => null);
-    if (!listing) listing = await refreshDirectoryCache(env, currentPath);
+    const listing = await listDirectoryFromD1(env, currentPath);
+    const items = await filterItemsByPermissionD1(env, auth, [
+      ...(listing.folders || []),
+      ...(listing.files || [])
+    ], 'view');
     return jsonResponse({
       success: true,
       currentPath,
-      items: [
-        ...(listing.folders || []).map(folder => ({ ...folder, itemType: 'folder', isFolder: true })),
-        ...(listing.files || []).map(file => ({ ...file, itemType: 'file', isFolder: false }))
-      ]
+      items
     });
   } catch (e) {
     return jsonResponse({ success: false, message: '读取资源列表失败: ' + e.message }, 500);
@@ -3631,8 +4830,10 @@ async function handleAdminStorageDebug(request, env) {
     const currentPath = normalizeDirectoryPath(url.searchParams.get('path') || '/');
     const prefix = directoryPathToR2Prefix(currentPath);
     const slashPrefix = '/' + prefix;
-    const cached = await readDirectoryCache(env, currentPath).catch(error => ({
-      error: error.message
+    const indexListing = await listDirectoryFromD1(env, currentPath).catch(error => ({
+      error: error.message,
+      files: [],
+      folders: []
     }));
     const directoryListing = await env.R2_BUCKET.list({ prefix, delimiter: '/', limit: 20 });
     const slashDirectoryListing = slashPrefix === prefix
@@ -3648,13 +4849,11 @@ async function handleAdminStorageDebug(request, env) {
       path: currentPath,
       prefix,
       slashPrefix,
-      cache: cached
+      index: indexListing
         ? {
-            error: cached.error || null,
-            cached: cached.cached === true,
-            files: Array.isArray(cached.files) ? cached.files.length : 0,
-            folders: Array.isArray(cached.folders) ? cached.folders.length : 0,
-            refreshedAt: cached.refreshedAt || null
+            error: indexListing.error || null,
+            files: Array.isArray(indexListing.files) ? indexListing.files.length : 0,
+            folders: Array.isArray(indexListing.folders) ? indexListing.folders.length : 0
           }
         : null,
       r2Directory: {
@@ -3692,19 +4891,103 @@ async function handleAdminStorageDebug(request, env) {
   }
 }
 
+/**
+ * Admin bulk rebuild of the txt full-text index. Processes one batch of books
+ * per request (the admin page loops with the returned cursor), skipping books
+ * whose index is already up to date unless force=1. Resumable and safe to
+ * re-run at any time.
+ */
+async function handleAdminTxtRebuild(request, env) {
+  const auth = await requireAdmin(request, env);
+  if (auth instanceof Response) return auth;
+  if (!env.D1_DB) {
+    return jsonResponse({ success: false, code: 'TXT_INDEX_UNAVAILABLE', message: 'D1 未配置，无法建立 TXT 索引' }, 503);
+  }
+
+  try {
+    await ensureD1Schema(env);
+    const body = await request.json().catch(() => ({}));
+    const force = ['1', 'true', 'yes', true].includes(body.force);
+    const batchSize = Math.min(20, Math.max(1, Number(body.batch || 5) || 5));
+    const afterPath = typeof body.cursor === 'string' ? body.cursor : '';
+
+    const totalRow = await env.D1_DB.prepare(`
+      SELECT COUNT(*) AS count FROM search_items
+      WHERE item_type = 'file' AND lower(path) LIKE '%.txt'
+    `).first();
+
+    const rows = await env.D1_DB.prepare(`
+      SELECT path FROM search_items
+      WHERE item_type = 'file' AND lower(path) LIKE '%.txt' AND path > ?
+      ORDER BY path ASC
+      LIMIT ?
+    `).bind(afterPath, batchSize).all();
+
+    const books = rows.results || [];
+    const details = [];
+    let indexed = 0;
+    let skipped = 0;
+    let missing = 0;
+
+    for (const book of books) {
+      const filePath = normalizeItemPath(book.path);
+      try {
+        const head = await headR2Object(env, itemPathToR2Key(filePath));
+        if (!head || !head.object) {
+          missing++;
+          details.push({ path: filePath, status: 'missing' });
+          continue;
+        }
+        const etag = currentTxtEtag(head.object);
+        const size = Number(head.object.size || 0);
+        const existing = await getTxtIndexRecord(env, filePath);
+        const upToDate = existing
+          && existing.status === 'ready'
+          && existing.source_etag === etag
+          && Number(existing.size || 0) === size;
+        if (!force && upToDate) {
+          skipped++;
+          details.push({ path: filePath, status: 'skipped' });
+          continue;
+        }
+        const resolved = {
+          filePath,
+          resolved: { key: head.key, object: head.object },
+          etag
+        };
+        const record = await buildTxtIndexToEnd(env, resolved, { force });
+        indexed++;
+        details.push({ path: filePath, status: record?.status || 'building' });
+      } catch (error) {
+        details.push({ path: filePath, status: 'error', message: String(error.message || '').slice(0, 200) });
+      }
+    }
+
+    return jsonResponse({
+      success: true,
+      total: Number(totalRow?.count || 0),
+      batch: books.length,
+      indexed,
+      skipped,
+      missing,
+      cursor: books.length > 0 ? books[books.length - 1].path : afterPath,
+      done: books.length < batchSize,
+      details
+    });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '重建 TXT 索引失败: ' + e.message }, 500);
+  }
+}
+
 // ============================================================================
 // D1 SEARCH, FAVORITES, AND RECENT VISITS
 // ============================================================================
 
-let d1SchemaReady = false;
-const D1_SCHEMA_KV_KEY = 'd1:schema:v1';
+const D1_SCHEMA_KV_KEY = 'd1:schema:v3-path-bindings';
 const D1_SCHEMA_TAGS_KV_KEY = 'd1:schema:v2-tags';
 
 async function ensureD1Schema(env) {
   if (!env.D1_DB) throw new Error('D1_DB binding 未配置');
-  if (d1SchemaReady) return;
-
-  const kvReady = env.KV_STORE ? await env.KV_STORE.get(D1_SCHEMA_KV_KEY) : null;
   const ddlStatements = [
     `CREATE TABLE IF NOT EXISTS search_items (
       path TEXT PRIMARY KEY,
@@ -3753,6 +5036,7 @@ async function ensureD1Schema(env) {
       expires_at INTEGER,
       view_count INTEGER NOT NULL DEFAULT 0,
       download_count INTEGER NOT NULL DEFAULT 0,
+      items_initialized INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL
     )`,
     'CREATE INDEX IF NOT EXISTS idx_share_links_created ON share_links(created_at DESC)',
@@ -3763,6 +5047,9 @@ async function ensureD1Schema(env) {
       item_name TEXT NOT NULL,
       item_type TEXT NOT NULL,
       sort_order INTEGER NOT NULL DEFAULT 0,
+      resource_key TEXT,
+      resource_version TEXT,
+      resource_etag TEXT,
       created_at INTEGER NOT NULL,
       PRIMARY KEY (share_id, item_path)
     )`,
@@ -3777,11 +5064,43 @@ async function ensureD1Schema(env) {
       owner_key TEXT NOT NULL,
       path TEXT NOT NULL,
       char_offset INTEGER NOT NULL DEFAULT 0,
+      byte_offset INTEGER NOT NULL DEFAULT 0,
+      source_etag TEXT,
       progress REAL NOT NULL DEFAULT 0,
       snippet TEXT NOT NULL DEFAULT '',
       created_at INTEGER NOT NULL
     )`,
     'CREATE INDEX IF NOT EXISTS idx_reader_bookmarks_owner_path_created ON reader_bookmarks(owner_key, path, created_at DESC)',
+    `CREATE TABLE IF NOT EXISTS txt_index_files (
+      path TEXT PRIMARY KEY,
+      source_etag TEXT NOT NULL,
+      size INTEGER NOT NULL DEFAULT 0,
+      encoding TEXT NOT NULL DEFAULT 'utf-8',
+      total_chars INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'building',
+      scanned_bytes INTEGER NOT NULL DEFAULT 0,
+      next_offset INTEGER NOT NULL DEFAULT 0,
+      next_chunk_no INTEGER NOT NULL DEFAULT 0,
+      next_char_offset INTEGER NOT NULL DEFAULT 0,
+      tail_text TEXT NOT NULL DEFAULT '',
+      error_message TEXT,
+      indexed_at INTEGER,
+      updated_at INTEGER NOT NULL
+    )`,
+    'CREATE INDEX IF NOT EXISTS idx_txt_index_files_status ON txt_index_files(status)',
+    `CREATE TABLE IF NOT EXISTS txt_index_chunks (
+      path TEXT NOT NULL,
+      source_etag TEXT NOT NULL,
+      chunk_no INTEGER NOT NULL,
+      byte_start INTEGER NOT NULL,
+      byte_end INTEGER NOT NULL,
+      char_start INTEGER NOT NULL,
+      char_end INTEGER NOT NULL,
+      content_start INTEGER NOT NULL,
+      content TEXT NOT NULL,
+      PRIMARY KEY (path, chunk_no)
+    )`,
+    'CREATE INDEX IF NOT EXISTS idx_txt_index_chunks_path_order ON txt_index_chunks(path, source_etag, chunk_no)',
     ...USER_PERMISSIONS_DDL,
     ...FILE_TASKS_DDL
   ];
@@ -3790,18 +5109,30 @@ async function ensureD1Schema(env) {
     await env.D1_DB.prepare(statement).run();
   }
 
-  const tagsReady = env.KV_STORE ? await env.KV_STORE.get(D1_SCHEMA_TAGS_KV_KEY) : null;
-  if (!tagsReady) {
-    const tableInfo = await env.D1_DB.prepare('PRAGMA table_info(search_items)').all();
-    const hasTags = (tableInfo.results || []).some(row => row.name === 'tags');
-    if (!hasTags) {
-      await env.D1_DB.prepare("ALTER TABLE search_items ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'").run();
-    }
-    if (env.KV_STORE) await env.KV_STORE.put(D1_SCHEMA_TAGS_KV_KEY, '1');
+  const migrations = [
+    ['search_items', 'tags', "ALTER TABLE search_items ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'"],
+    ['share_links', 'items_initialized', 'ALTER TABLE share_links ADD COLUMN items_initialized INTEGER NOT NULL DEFAULT 0'],
+    ['share_items', 'resource_key', 'ALTER TABLE share_items ADD COLUMN resource_key TEXT'],
+    ['share_items', 'resource_version', 'ALTER TABLE share_items ADD COLUMN resource_version TEXT'],
+    ['share_items', 'resource_etag', 'ALTER TABLE share_items ADD COLUMN resource_etag TEXT'],
+    ['reader_bookmarks', 'byte_offset', 'ALTER TABLE reader_bookmarks ADD COLUMN byte_offset INTEGER NOT NULL DEFAULT 0'],
+    ['reader_bookmarks', 'source_etag', 'ALTER TABLE reader_bookmarks ADD COLUMN source_etag TEXT'],
+    ['user_permissions', 'resource_key', 'ALTER TABLE user_permissions ADD COLUMN resource_key TEXT'],
+    ['user_permissions', 'resource_version', 'ALTER TABLE user_permissions ADD COLUMN resource_version TEXT'],
+    ['user_permissions', 'resource_etag', 'ALTER TABLE user_permissions ADD COLUMN resource_etag TEXT'],
+    ['file_task_items', 'source_version', 'ALTER TABLE file_task_items ADD COLUMN source_version TEXT'],
+    ['file_task_items', 'source_etag', 'ALTER TABLE file_task_items ADD COLUMN source_etag TEXT']
+  ];
+  for (const [table, column, statement] of migrations) {
+    const tableInfo = await env.D1_DB.prepare(`PRAGMA table_info(${table})`).all();
+    const hasColumn = (tableInfo.results || []).some(row => row.name === column);
+    if (!hasColumn) await env.D1_DB.prepare(statement).run();
   }
 
-  if (!kvReady && env.KV_STORE) await env.KV_STORE.put(D1_SCHEMA_KV_KEY, '1');
-  d1SchemaReady = true;
+  if (env.KV_STORE) {
+    await env.KV_STORE.put(D1_SCHEMA_KV_KEY, '1');
+    await env.KV_STORE.put(D1_SCHEMA_TAGS_KV_KEY, '1');
+  }
 }
 
 const USER_PERMISSIONS_DDL = [
@@ -3817,6 +5148,9 @@ const USER_PERMISSIONS_DDL = [
     can_modify INTEGER NOT NULL DEFAULT 0,
     can_delete INTEGER NOT NULL DEFAULT 0,
     can_share INTEGER NOT NULL DEFAULT 0,
+    resource_key TEXT,
+    resource_version TEXT,
+    resource_etag TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     UNIQUE(email, path, item_type)
@@ -3854,6 +5188,8 @@ const FILE_TASKS_DDL = [
     target_path TEXT NOT NULL,
     target_key TEXT NOT NULL,
     size INTEGER NOT NULL DEFAULT 0,
+    source_version TEXT,
+    source_etag TEXT,
     status TEXT NOT NULL DEFAULT 'queued',
     error_message TEXT,
     created_at INTEGER NOT NULL,
@@ -3994,14 +5330,28 @@ function summarizePermissionFlags(row) {
 async function replaceUserPermissions(env, email, permissions) {
   await ensureD1Schema(env);
   const normalized = Array.isArray(permissions) ? permissions.map(normalizeUserPermissionEntry) : [];
+  const bound = [];
+  for (const item of normalized) {
+    const current = await getCurrentResourceInfo(env, item.path);
+    if (!current || current.itemType !== item.itemType) {
+      throw new Error('授权资源不存在或类型已变化: ' + item.path);
+    }
+    bound.push({
+      ...item,
+      resourceKey: current.resourceKey,
+      resourceVersion: current.resourceVersion,
+      resourceEtag: current.resourceEtag
+    });
+  }
   await env.D1_DB.prepare('DELETE FROM user_permissions WHERE email = ?').bind(email).run();
-  if (normalized.length === 0) return;
+  if (bound.length === 0) return;
 
   const now = Date.now();
   const insert = env.D1_DB.prepare(`
     INSERT INTO user_permissions (
-      email, path, item_type, can_view, can_preview, can_download, can_upload, can_modify, can_delete, can_share, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      email, path, item_type, can_view, can_preview, can_download, can_upload, can_modify, can_delete, can_share,
+      resource_key, resource_version, resource_etag, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(email, path, item_type) DO UPDATE SET
       can_view = excluded.can_view,
       can_preview = excluded.can_preview,
@@ -4010,11 +5360,14 @@ async function replaceUserPermissions(env, email, permissions) {
       can_modify = excluded.can_modify,
       can_delete = excluded.can_delete,
       can_share = excluded.can_share,
+      resource_key = excluded.resource_key,
+      resource_version = excluded.resource_version,
+      resource_etag = excluded.resource_etag,
       updated_at = excluded.updated_at
   `);
 
-  for (let index = 0; index < normalized.length; index += 50) {
-    const batch = normalized.slice(index, index + 50).map(item => insert.bind(
+  for (let index = 0; index < bound.length; index += 50) {
+    const batch = bound.slice(index, index + 50).map(item => insert.bind(
       email,
       item.path,
       item.itemType,
@@ -4025,6 +5378,9 @@ async function replaceUserPermissions(env, email, permissions) {
       item.permissions.modify ? 1 : 0,
       item.permissions.delete ? 1 : 0,
       item.permissions.share ? 1 : 0,
+      item.resourceKey,
+      item.resourceVersion,
+      item.resourceEtag,
       now,
       now
     ));
@@ -4034,18 +5390,39 @@ async function replaceUserPermissions(env, email, permissions) {
 
 async function getUserPermissionRows(env, email) {
   await ensureD1Schema(env);
-  const rows = await env.D1_DB.prepare(`
+  const result = await env.D1_DB.prepare(`
     SELECT * FROM user_permissions
     WHERE email = ?
     ORDER BY path = '/' DESC, length(path) ASC, path COLLATE NOCASE ASC
   `).bind(email).all();
-  return rows.results || [];
+  const valid = [];
+  for (const row of result.results || []) {
+    const current = await getCurrentResourceInfo(env, row.path);
+    const binding = current && current.itemType === row.item_type
+      ? resourceBindingMatches(current, row)
+      : false;
+    if (!current || binding === false) {
+      if (row.id) await env.D1_DB.prepare('DELETE FROM user_permissions WHERE id = ?').bind(row.id).run();
+      continue;
+    }
+    if (binding === null && row.id) {
+      await env.D1_DB.prepare(`
+        UPDATE user_permissions
+        SET resource_key = ?, resource_version = ?, resource_etag = ?, updated_at = ?
+        WHERE id = ?
+      `).bind(current.resourceKey, current.resourceVersion, current.resourceEtag, Date.now(), row.id).run();
+      valid.push({ ...row, resource_key: current.resourceKey, resource_version: current.resourceVersion, resource_etag: current.resourceEtag });
+    } else {
+      valid.push(row);
+    }
+  }
+  return valid;
 }
 
 async function findUserPermissionForPath(env, email, path) {
   await ensureD1Schema(env);
   const normalized = normalizeItemPath(path);
-  return await env.D1_DB.prepare(`
+  const result = await env.D1_DB.prepare(`
     SELECT * FROM user_permissions
     WHERE email = ?
       AND (
@@ -4054,8 +5431,8 @@ async function findUserPermissionForPath(env, email, path) {
         OR (item_type = 'folder' AND ? LIKE path || '/%')
       )
     ORDER BY length(path) DESC
-    LIMIT 1
-  `).bind(email, normalized, normalized).first();
+  `).bind(email, normalized, normalized).all();
+  return result.results || [];
 }
 
 async function hasPathPermission(env, auth, action, path) {
@@ -4063,8 +5440,43 @@ async function hasPathPermission(env, auth, action, path) {
   if (!auth || !auth.email) return false;
   const column = PERMISSION_COLUMNS[action];
   if (!column) throw new Error('未知权限类型: ' + action);
-  const row = await findUserPermissionForPath(env, auth.email, path);
-  return !!(row && row[column]);
+  const normalized = normalizeItemPath(path);
+  const currentTarget = await getCurrentResourceInfo(env, normalized);
+  if (!currentTarget) {
+    await getUserPermissionRows(env, auth.email);
+    return false;
+  }
+  const rows = await findUserPermissionForPath(env, auth.email, normalized);
+  for (const row of rows) {
+    if (!row[column]) continue;
+    if (row.item_type === 'file' && row.path !== normalized) continue;
+    if (row.item_type === 'folder' && !isPathWithinFolder(row.path, normalized)) continue;
+    const permissionRoot = await getCurrentResourceInfo(env, row.path);
+    if (!permissionRoot || permissionRoot.itemType !== row.item_type) {
+      if (row.id) await env.D1_DB.prepare('DELETE FROM user_permissions WHERE id = ?').bind(row.id).run();
+      continue;
+    }
+    const binding = resourceBindingMatches(permissionRoot, row);
+    if (binding === false) {
+      if (row.id) await env.D1_DB.prepare('DELETE FROM user_permissions WHERE id = ?').bind(row.id).run();
+      continue;
+    }
+    if (binding === null && row.id) {
+      await env.D1_DB.prepare(`
+        UPDATE user_permissions
+        SET resource_key = ?, resource_version = ?, resource_etag = ?, updated_at = ?
+        WHERE id = ?
+      `).bind(
+        permissionRoot.resourceKey,
+        permissionRoot.resourceVersion,
+        permissionRoot.resourceEtag,
+        Date.now(),
+        row.id
+      ).run();
+    }
+    return true;
+  }
+  return false;
 }
 
 async function requirePathPermission(env, auth, action, path) {
@@ -4075,41 +5487,43 @@ async function requirePathPermission(env, auth, action, path) {
   }, 403);
 }
 
-async function filterItemsByPermission(env, auth, items, action = 'view') {
-  if (!Array.isArray(items) || auth?.role === 'admin') return items || [];
-  const allowed = [];
-  for (const item of items) {
-    if (await hasPathPermission(env, auth, action, item.path)) allowed.push(item);
-  }
-  return allowed;
-}
+/**
+ * Pure-D1 permission filter: loads the user's permission grants once (cost is
+ * bounded by the number of grants, not by the listing size) and filters items
+ * in memory. Zero R2 calls — replaces the old per-item HEAD+LIST filter.
+ */
+async function filterItemsByPermissionD1(env, auth, items, action = 'view') {
+  if (!Array.isArray(items) || items.length === 0) return [];
+  if (auth?.role === 'admin') return items;
+  if (!auth?.email) return [];
+  const column = PERMISSION_COLUMNS[action];
+  if (!column) throw new Error('未知权限类型: ' + action);
 
-async function mergeSearchItemTags(env, items) {
-  if (!env.D1_DB || !Array.isArray(items) || items.length === 0) return items || [];
-  await ensureD1Schema(env);
-  const tagMap = new Map();
-  const paths = items.map(item => normalizeItemPath(item.path || '')).filter(path => path && path !== '/');
-  for (let index = 0; index < paths.length; index += 50) {
-    const chunk = paths.slice(index, index + 50);
-    const placeholders = chunk.map(() => '?').join(',');
-    const rows = await env.D1_DB.prepare(`SELECT path, tags FROM search_items WHERE path IN (${placeholders})`).bind(...chunk).all();
-    for (const row of rows.results || []) {
-      try {
-        const tags = JSON.parse(row.tags || '[]');
-        tagMap.set(row.path, Array.isArray(tags) ? tags.filter(tag => typeof tag === 'string') : []);
-      } catch {
-        tagMap.set(row.path, []);
-      }
-    }
+  const rows = await getUserPermissionRows(env, auth.email);
+  const folderGrants = [];
+  const fileGrants = new Set();
+  for (const row of rows) {
+    if (!row[column]) continue;
+    const grantPath = normalizeItemPath(row.path);
+    if (row.item_type === 'folder') folderGrants.push(grantPath);
+    else fileGrants.add(grantPath);
   }
-  return items.map(item => ({ ...item, tags: tagMap.get(item.path) || [] }));
+  if (folderGrants.length === 0 && fileGrants.size === 0) return [];
+
+  return items.filter(item => {
+    const itemPath = normalizeItemPath(item.path || '');
+    if (!itemPath || itemPath === '/') return false;
+    const itemType = item.itemType || item.item_type;
+    if (itemType === 'file' && fileGrants.has(itemPath)) return true;
+    return folderGrants.some(grantPath => grantPath === '/' || isPathWithinFolder(grantPath, itemPath));
+  });
 }
 
 async function listVirtualPermissionDirectory(env, auth, dirPath) {
   if (!auth || auth.role === 'admin' || !auth.email) return null;
   const currentPath = normalizeDirectoryPath(dirPath);
   const rows = await getUserPermissionRows(env, auth.email);
-  const itemMap = new Map();
+  const candidateMap = new Map(); // childPath -> { itemType, exact }
 
   for (const row of rows) {
     const permissionPath = normalizeItemPath(row.path);
@@ -4127,16 +5541,52 @@ async function listVirtualPermissionDirectory(env, auth, dirPath) {
     const childPath = currentPath === '/' ? '/' + parts[0] : currentPath + '/' + parts[0];
     const isExactPermission = parts.length === 1;
     const itemType = isExactPermission ? row.item_type : 'folder';
-    const existing = itemMap.get(childPath);
+    const existing = candidateMap.get(childPath);
     if (existing && existing.itemType === 'folder') continue;
 
+    candidateMap.set(childPath, { itemType, exact: isExactPermission });
+  }
+
+  if (candidateMap.size === 0) return null;
+
+  // Batch existence check against the virtual directory tree (no R2 calls).
+  await ensureD1Schema(env);
+  const candidatePaths = [...candidateMap.keys()];
+  const rowMap = new Map();
+  for (let index = 0; index < candidatePaths.length; index += 50) {
+    const chunk = candidatePaths.slice(index, index + 50);
+    const placeholders = chunk.map(() => '?').join(',');
+    const found = await env.D1_DB.prepare(
+      `SELECT * FROM search_items WHERE path IN (${placeholders})`
+    ).bind(...chunk).all();
+    for (const row of found.results || []) rowMap.set(row.path, row);
+  }
+
+  const itemMap = new Map();
+  for (const [childPath, candidate] of candidateMap) {
+    const existingRow = rowMap.get(childPath);
+    if (existingRow) {
+      if (candidate.exact && existingRow.item_type !== candidate.itemType) continue;
+      if (!candidate.exact && existingRow.item_type !== 'folder') continue;
+      itemMap.set(childPath, d1RowToClientItem(existingRow));
+      continue;
+    }
+
+    // Not present in the virtual tree (stale index). Grants are few, so verify
+    // against R2 directly — same semantics as before the virtual directory.
+    const currentChild = await getCurrentResourceInfo(env, childPath);
+    if (!currentChild) continue;
+    if (candidate.exact && currentChild.itemType !== candidate.itemType) continue;
+    if (!candidate.exact && currentChild.itemType !== 'folder') continue;
     itemMap.set(childPath, {
       path: childPath,
       name: nameFromItemPath(childPath),
-      itemType,
-      isFolder: itemType === 'folder',
-      sizeFormatted: '',
-      previewType: ''
+      itemType: currentChild.itemType,
+      isFolder: currentChild.itemType === 'folder',
+      size: currentChild.size || 0,
+      sizeFormatted: currentChild.size ? formatFileSize(currentChild.size) : '',
+      previewType: currentChild.itemType === 'file' ? (getPreviewType(nameFromItemPath(childPath)) || '') : '',
+      tags: []
     });
   }
 
@@ -4288,12 +5738,249 @@ async function cleanupD1ItemPath(env, path) {
       env.D1_DB.prepare("DELETE FROM search_items WHERE path = ? OR path LIKE ? ESCAPE '\\'").bind(normalized, childPattern),
       env.D1_DB.prepare("DELETE FROM favorites WHERE path = ? OR path LIKE ? ESCAPE '\\'").bind(normalized, childPattern),
       env.D1_DB.prepare("DELETE FROM recent_items WHERE path = ? OR path LIKE ? ESCAPE '\\'").bind(normalized, childPattern),
-      env.D1_DB.prepare("DELETE FROM reader_bookmarks WHERE path = ? OR path LIKE ? ESCAPE '\\'").bind(normalized, childPattern)
+      env.D1_DB.prepare("DELETE FROM reader_bookmarks WHERE path = ? OR path LIKE ? ESCAPE '\\'").bind(normalized, childPattern),
+      env.D1_DB.prepare("DELETE FROM txt_index_chunks WHERE path = ? OR path LIKE ? ESCAPE '\\'").bind(normalized, childPattern),
+      env.D1_DB.prepare("DELETE FROM txt_index_files WHERE path = ? OR path LIKE ? ESCAPE '\\'").bind(normalized, childPattern)
     ];
     await env.D1_DB.batch(statements);
   } catch (e) {
     console.warn('D1 item reference cleanup failed:', e.message);
   }
+}
+
+async function deleteReaderProgressForPath(env, rawPath) {
+  if (!env.KV_STORE) return;
+  const normalized = normalizeItemPath(rawPath);
+  const pathHash = await sha256Hex(normalized);
+  let cursor;
+  do {
+    const listed = await env.KV_STORE.list({ prefix: 'reader:', cursor });
+    const keys = [];
+    for (const key of listed.keys || []) {
+      if (key.name.endsWith(':' + pathHash)) {
+        keys.push(key.name);
+        continue;
+      }
+      try {
+        const value = await env.KV_STORE.get(key.name, 'json');
+        if (value?.path && isPathWithinFolder(normalized, value.path)) keys.push(key.name);
+      } catch {
+        // Legacy reader values may not be JSON; the exact hashed key was still checked above.
+      }
+    }
+    if (keys.length > 0) await Promise.all(keys.map(key => env.KV_STORE.delete(key)));
+    cursor = listed.list_complete ? null : listed.cursor;
+  } while (cursor);
+}
+
+async function invalidatePathReferences(env, rawPath) {
+  const normalized = normalizeItemPath(rawPath);
+  if (!normalized || normalized === '/') return;
+  await cleanupD1ItemPath(env, normalized);
+  await deleteReaderProgressForPath(env, normalized);
+  if (!env.D1_DB) return;
+
+  try {
+    await ensureD1Schema(env);
+    const childPattern = escapeLike(normalized) + '/%';
+    const affected = await env.D1_DB.prepare(`
+      SELECT DISTINCT share_id FROM share_items
+      WHERE item_path = ? OR item_path LIKE ? ESCAPE '\\'
+    `).bind(normalized, childPattern).all();
+    const statements = [
+      env.D1_DB.prepare("DELETE FROM user_permissions WHERE path = ? OR path LIKE ? ESCAPE '\\'").bind(normalized, childPattern),
+      env.D1_DB.prepare('UPDATE share_links SET items_initialized = 1 WHERE file_path = ?').bind(itemPathToR2Key(normalized))
+    ];
+    for (const row of affected.results || []) {
+      statements.push(env.D1_DB.prepare('UPDATE share_links SET items_initialized = 1 WHERE share_id = ?').bind(row.share_id));
+    }
+    await env.D1_DB.batch(statements);
+  } catch (error) {
+    console.warn('Path reference invalidation failed:', error.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Virtual directory helpers — `search_items` (D1) is the authoritative tree.
+// Listings are served from D1; R2 is only scanned by the manual reconcile
+// (refresh) flow and the incremental upserts performed on every mutation.
+// ---------------------------------------------------------------------------
+
+function searchItemsUpsertStatement(db) {
+  return db.prepare(`
+    INSERT INTO search_items (
+      path, name, item_type, parent_path, size, size_formatted, preview_type, last_modified, indexed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(path) DO UPDATE SET
+      name = excluded.name,
+      item_type = excluded.item_type,
+      parent_path = excluded.parent_path,
+      size = excluded.size,
+      size_formatted = excluded.size_formatted,
+      preview_type = excluded.preview_type,
+      last_modified = excluded.last_modified,
+      indexed_at = excluded.indexed_at
+  `);
+}
+
+function bindSearchItemRow(statement, item) {
+  return statement.bind(
+    item.path,
+    item.name,
+    item.item_type,
+    item.parent_path,
+    item.size || 0,
+    item.size_formatted || '',
+    item.preview_type || '',
+    item.last_modified || null,
+    item.indexed_at
+  );
+}
+
+async function upsertSearchItemRows(env, rows) {
+  if (!env.D1_DB || !Array.isArray(rows) || rows.length === 0) return;
+  await ensureD1Schema(env);
+  for (let index = 0; index < rows.length; index += 50) {
+    const batch = rows.slice(index, index + 50)
+      .map(item => bindSearchItemRow(searchItemsUpsertStatement(env.D1_DB), item));
+    if (batch.length > 0) {
+      await env.D1_DB.batch(batch);
+    }
+  }
+}
+
+function buildSearchFileRowFromObject(key, obj, indexedAt) {
+  const path = r2KeyToPath(key);
+  const name = nameFromItemPath(path);
+  const size = Number(obj?.size || 0);
+  return {
+    path,
+    name,
+    item_type: 'file',
+    parent_path: parentPathFromItemPath(path),
+    size,
+    size_formatted: formatFileSize(size),
+    preview_type: getPreviewType(name) || '',
+    last_modified: isoDateString(obj?.uploaded),
+    indexed_at: indexedAt
+  };
+}
+
+function collectFolderRowsForItem(folderRows, itemPath, indexedAt, includeSelf) {
+  const normalized = normalizeItemPath(itemPath);
+  if (!normalized || normalized === '/') return;
+  const parts = normalized.split('/').filter(Boolean);
+  const depth = includeSelf ? parts.length : parts.length - 1;
+  for (let index = 0; index < depth; index++) {
+    addFolderSearchRows(folderRows, '/' + parts.slice(0, index + 1).join('/'), indexedAt);
+  }
+}
+
+async function upsertSearchFileFromR2Object(env, key, obj, indexedAt = Date.now()) {
+  if (!env.D1_DB) return;
+  const filePath = r2KeyToPath(key);
+  if (!nameFromItemPath(filePath)) return;
+  const rows = [];
+  const folderRows = new Map();
+  collectFolderRowsForItem(folderRows, filePath, indexedAt, false);
+  rows.push(...folderRows.values());
+  rows.push(buildSearchFileRowFromObject(key, obj, indexedAt));
+  await upsertSearchItemRows(env, rows);
+}
+
+async function upsertSearchFolderRow(env, folderPath, indexedAt = Date.now()) {
+  if (!env.D1_DB) return;
+  const normalized = normalizeItemPath(folderPath);
+  if (!normalized || normalized === '/') return;
+  const folderRows = new Map();
+  collectFolderRowsForItem(folderRows, normalized, indexedAt, true);
+  await upsertSearchItemRows(env, [...folderRows.values()]);
+}
+
+async function listDirectoryFromD1(env, dirPath) {
+  const currentPath = normalizeDirectoryPath(dirPath);
+  await ensureD1Schema(env);
+  const result = await env.D1_DB.prepare(`
+    SELECT * FROM search_items
+    WHERE parent_path = ?
+    ORDER BY item_type DESC, name COLLATE NOCASE ASC, path COLLATE NOCASE ASC
+  `).bind(currentPath).all();
+
+  const folders = [];
+  const files = [];
+  for (const row of result.results || []) {
+    const item = d1RowToClientItem(row);
+    if (row.item_type === 'folder') folders.push(item);
+    else files.push(item);
+  }
+  return {
+    success: true,
+    files,
+    folders,
+    currentPath,
+    fromIndex: true
+  };
+}
+
+async function searchItemsCount(env) {
+  const result = await env.D1_DB.prepare('SELECT COUNT(*) AS count FROM search_items').first();
+  return Number(result?.count || 0);
+}
+
+async function indexR2Subtree(env, dirPath = '/', options = {}) {
+  requireRequiredConfig(env, ['R2_BUCKET', 'D1_DB']);
+  await ensureD1Schema(env);
+
+  const indexedAt = options.indexedAt || Date.now();
+  const currentPath = normalizeDirectoryPath(dirPath);
+  const prefix = directoryPathToR2Prefix(currentPath);
+  // Legacy data may carry keys with a leading slash, so non-root subtrees are
+  // scanned under both prefix variants (same as the old listing logic).
+  const slashPrefix = '/' + prefix;
+  const prefixes = prefix === '' ? [''] : (slashPrefix === prefix ? [prefix] : [prefix, slashPrefix]);
+  const folderRows = new Map();
+  const fileRows = new Map();
+  let scanned = 0;
+
+  for (const listPrefix of prefixes) {
+    let cursor;
+    do {
+      const listOptions = { cursor, limit: 1000 };
+      if (listPrefix) listOptions.prefix = listPrefix;
+      const listed = await env.R2_BUCKET.list(listOptions);
+      for (const obj of listed.objects || []) {
+        scanned++;
+        addFolderSearchRowsFromR2Key(folderRows, obj.key, indexedAt);
+        if (obj.key.endsWith('/.folder') || obj.key === '.folder') continue;
+
+        const path = r2KeyToPath(obj.key);
+        const name = nameFromItemPath(path);
+        if (!name) continue;
+
+        fileRows.set(path, buildSearchFileRowFromObject(obj.key, obj, indexedAt));
+      }
+      cursor = listed.truncated ? listed.cursor : null;
+    } while (cursor);
+  }
+
+  const rows = [...folderRows.values(), ...fileRows.values()];
+  await upsertSearchItemRows(env, rows);
+
+  if (currentPath === '/') {
+    await env.D1_DB.prepare('DELETE FROM search_items WHERE indexed_at != ?').bind(indexedAt).run();
+  } else {
+    const childPattern = escapeLike(currentPath) + '/%';
+    await env.D1_DB.prepare(`
+      DELETE FROM search_items
+      WHERE (path = ? OR path LIKE ? ESCAPE '\\') AND indexed_at != ?
+    `).bind(currentPath, childPattern, indexedAt).run();
+  }
+
+  return { indexedAt, scanned, count: rows.length, path: currentPath };
+}
+
+async function rebuildSearchIndex(env) {
+  return indexR2Subtree(env, '/');
 }
 
 function normalizeD1ItemFromBody(body) {
@@ -4347,80 +6034,6 @@ function addFolderSearchRowsFromR2Key(folderRows, key, indexedAt) {
   }
 }
 
-async function rebuildSearchIndex(env) {
-  requireRequiredConfig(env, ['R2_BUCKET', 'D1_DB']);
-  await ensureD1Schema(env);
-
-  const indexedAt = Date.now();
-  const folderRows = new Map();
-  const fileRows = new Map();
-  let cursor;
-  let scanned = 0;
-
-  do {
-    const listed = await env.R2_BUCKET.list({ cursor, limit: 1000 });
-    for (const obj of listed.objects || []) {
-      scanned++;
-      addFolderSearchRowsFromR2Key(folderRows, obj.key, indexedAt);
-      if (obj.key.endsWith('/.folder') || obj.key === '.folder') continue;
-
-      const path = r2KeyToPath(obj.key);
-      const name = nameFromItemPath(path);
-      if (!name) continue;
-
-      fileRows.set(path, {
-        path,
-        name,
-        item_type: 'file',
-        parent_path: parentPathFromItemPath(path),
-        size: obj.size || 0,
-        size_formatted: formatFileSize(obj.size || 0),
-        preview_type: getPreviewType(name) || '',
-        last_modified: isoDateString(obj.uploaded),
-        indexed_at: indexedAt
-      });
-    }
-    cursor = listed.truncated ? listed.cursor : null;
-  } while (cursor);
-
-  const rows = [...folderRows.values(), ...fileRows.values()];
-  const upsert = env.D1_DB.prepare(`
-    INSERT INTO search_items (
-      path, name, item_type, parent_path, size, size_formatted, preview_type, last_modified, indexed_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(path) DO UPDATE SET
-      name = excluded.name,
-      item_type = excluded.item_type,
-      parent_path = excluded.parent_path,
-      size = excluded.size,
-      size_formatted = excluded.size_formatted,
-      preview_type = excluded.preview_type,
-      last_modified = excluded.last_modified,
-      indexed_at = excluded.indexed_at
-  `);
-
-  for (let index = 0; index < rows.length; index += 50) {
-    const batch = rows.slice(index, index + 50).map(item => upsert.bind(
-      item.path,
-      item.name,
-      item.item_type,
-      item.parent_path,
-      item.size,
-      item.size_formatted,
-      item.preview_type,
-      item.last_modified,
-      item.indexed_at
-    ));
-    if (batch.length > 0) {
-      await env.D1_DB.batch(batch);
-    }
-  }
-
-  await env.D1_DB.prepare('DELETE FROM search_items WHERE indexed_at != ?').bind(indexedAt).run();
-
-  return { indexedAt, scanned, count: rows.length };
-}
-
 async function handleSearch(request, env) {
   const auth = await requireAuth(request, env);
   if (auth instanceof Response) return auth;
@@ -4462,7 +6075,7 @@ async function handleSearch(request, env) {
 
     return jsonResponse({
       success: true,
-      items: await filterItemsByPermission(env, auth, (results.results || []).map(d1RowToClientItem), 'view'),
+      items: await filterItemsByPermissionD1(env, auth, (results.results || []).map(d1RowToClientItem), 'view'),
       refresh: refreshResult
     });
   } catch (e) {
@@ -4491,7 +6104,7 @@ async function handleFavorites(request, env) {
       `).bind(ownerKey, limit).all();
       return jsonResponse({
         success: true,
-        favorites: await filterItemsByPermission(env, auth, (results.results || []).map(d1RowToClientItem), 'view')
+        favorites: await filterItemsByPermissionD1(env, auth, (results.results || []).map(d1RowToClientItem), 'view')
       });
     }
 
@@ -4593,7 +6206,7 @@ async function handleRecent(request, env) {
       `).bind(ownerKey, limit).all();
       return jsonResponse({
         success: true,
-        recent: await filterItemsByPermission(env, auth, (results.results || []).map(d1RowToClientItem), 'view')
+        recent: await filterItemsByPermissionD1(env, auth, (results.results || []).map(d1RowToClientItem), 'view')
       });
     }
 
@@ -5016,6 +6629,180 @@ const CSS_STYLES = `
 
   .bookmark-panel[hidden] {
     display: none;
+  }
+
+  .txt-search-panel {
+    position: fixed;
+    top: 76px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: min(560px, calc(100vw - 24px));
+    max-height: min(520px, 72vh);
+    overflow: auto;
+    padding: 12px;
+    border: 1px solid var(--surface-light);
+    border-radius: 10px;
+    background: var(--surface);
+    box-shadow: 0 18px 45px rgba(0, 0, 0, 0.28);
+    z-index: 6;
+  }
+
+  .txt-search-panel[hidden] {
+    display: none;
+  }
+
+  .txt-search-row {
+    display: flex;
+    gap: 8px;
+  }
+
+  .txt-search-row .form-input {
+    min-width: 0;
+    flex: 1;
+    margin: 0;
+  }
+
+  .txt-search-status {
+    min-height: 22px;
+    padding: 8px 0 4px;
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+
+  .txt-search-result {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px;
+    align-items: center;
+    padding: 9px 8px;
+    border-top: 1px solid var(--surface-light);
+    line-height: 1.55;
+  }
+
+  .txt-search-snippet {
+    min-width: 0;
+    color: var(--text);
+    overflow-wrap: anywhere;
+  }
+
+  .txt-search-result:hover {
+    background: var(--surface-light);
+  }
+
+  .txt-search-result mark {
+    padding: 0 2px;
+    border-radius: 3px;
+    background: color-mix(in srgb, var(--warning) 40%, transparent);
+    color: inherit;
+  }
+
+  .txt-search-meta {
+    margin-top: 3px;
+    color: var(--text-muted);
+    font-size: 11px;
+  }
+
+  .txt-search-highlight {
+    padding: 0 2px;
+    border-radius: 3px;
+    background: color-mix(in srgb, var(--warning) 70%, #fff 10%);
+    color: inherit;
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--warning) 24%, transparent);
+  }
+
+  .txt-search-jump {
+    min-width: 56px;
+  }
+
+  .txt-reader-loading {
+    position: sticky;
+    top: 10px;
+    z-index: 2;
+    width: fit-content;
+    margin: 0 auto 12px;
+    padding: 7px 12px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--primary) 88%, #000);
+    color: #fff;
+    font-size: 13px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
+    animation: txt-reader-loading-pulse 1.1s ease-in-out infinite;
+  }
+
+  @keyframes txt-reader-loading-pulse {
+    50% { opacity: 0.6; transform: scale(0.98); }
+  }
+
+  .txt-search-more {
+    width: 100%;
+    margin-top: 10px;
+  }
+
+  .txt-global-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: var(--text);
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .txt-global-toggle input {
+    width: auto;
+    margin: 0;
+  }
+
+  .txt-global-result {
+    display: block;
+    padding: 12px 14px;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .txt-global-result-title {
+    font-weight: 600;
+    margin-bottom: 6px;
+    overflow-wrap: anywhere;
+  }
+
+  .txt-global-result-pos {
+    color: var(--text-muted);
+    font-weight: 400;
+    font-size: 12px;
+  }
+
+  .txt-global-result-snippet {
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 1.6;
+    margin-bottom: 10px;
+    overflow-wrap: anywhere;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .txt-global-result-snippet mark {
+    padding: 0 2px;
+    border-radius: 3px;
+    background: color-mix(in srgb, var(--warning) 55%, transparent);
+    color: inherit;
+  }
+
+  .txt-reader-chunk {
+    display: block;
+    min-height: 1.85em;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .txt-reader-chunk.search-target {
+    outline: 2px solid var(--accent);
+    outline-offset: 4px;
+    border-radius: 4px;
   }
 
   .bookmark-add {
@@ -5855,6 +7642,15 @@ const CSS_STYLES = `
     font-size: 14px;
   }
 
+  .share-state-notice {
+    margin: 0 0 16px;
+    padding: 10px 12px;
+    border: 1px solid color-mix(in srgb, var(--warning) 55%, transparent);
+    border-radius: 8px;
+    color: var(--warning);
+    font-size: 13px;
+  }
+
   .share-browser {
     display: none;
   }
@@ -5990,6 +7786,10 @@ const CSS_STYLES = `
     }
 
     .bookmark-panel {
+      top: 58px;
+    }
+
+    .txt-search-panel {
       top: 58px;
     }
 
@@ -6844,8 +8644,6 @@ const FIXED_INDEX_PAGE = `
   ${THEME_BOOTSTRAP}
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
   ${CSS_STYLES}
-  <script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js" integrity="sha384-948ahk4ZmxYVYOc+rxN1H2gM1EJ2Duhp7uHtZ4WSLkV4Vtx5MUqnV+l7u9B+jFv+" crossorigin="anonymous"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js" integrity="sha384-nFoSjZIoH3CCp8W639jJyQkuPHinJ2NHe7on1xvlUA7SuGfJAfvMldrsoAVm6ECz" crossorigin="anonymous"></script>
 </head>
 <body>
   <div class="header">
@@ -6885,6 +8683,9 @@ const FIXED_INDEX_PAGE = `
           <option value="files">文件</option>
           <option value="folders">文件夹</option>
         </select>
+        <label class="txt-global-toggle" title="在 .txt 小说正文中搜索并跳转到匹配位置">
+          <input type="checkbox" id="globalTxtSearchToggle" onchange="handleSearchTypeChange()"> 全文(.txt)
+        </label>
         <div class="tag-filter" id="tagFilterWrap">
           <button type="button" id="tagFilterTrigger" class="form-select tag-filter-trigger" onclick="toggleTagFilterMenu(event)" title="按标签筛选" aria-haspopup="listbox" aria-expanded="false">
             <span id="tagFilterLabel">标签</span>
@@ -7061,9 +8862,19 @@ const FIXED_INDEX_PAGE = `
           <span class="reader-font-size" id="readerFontSize">18</span>
           <button type="button" class="btn btn-secondary reader-tool-btn" onclick="adjustReaderFontSize(2)" aria-label="放大字体">A+</button>
           <button type="button" class="btn btn-secondary reader-tool-btn" id="bookmarkToggleBtn" onclick="toggleBookmarkPanel(event)" title="书签" aria-label="打开书签">🔖</button>
+          <button type="button" class="btn btn-secondary reader-tool-btn" id="txtSearchToggleBtn" onclick="toggleTxtSearchPanel(event)" title="在本文件中搜索" aria-label="在本文件中搜索">🔎</button>
           <div class="bookmark-panel" id="bookmarkPanel" hidden onclick="event.stopPropagation()">
             <button type="button" class="btn btn-primary bookmark-add" onclick="addCurrentBookmark()">添加当前位置</button>
             <div id="bookmarkList"></div>
+          </div>
+          <div class="txt-search-panel" id="txtSearchPanel" hidden onclick="event.stopPropagation()">
+            <div class="txt-search-row">
+              <input type="search" id="txtSearchInput" class="form-input" placeholder="区分大小写搜索本文件" autocomplete="off" oninput="scheduleTxtSearch()" onkeydown="handleTxtSearchKey(event)">
+              <button type="button" class="btn btn-secondary" onclick="clearTxtSearch()">清除</button>
+            </div>
+            <div class="txt-search-status" id="txtSearchStatus"></div>
+            <div class="txt-search-results" id="txtSearchResults"></div>
+            <button type="button" class="btn btn-secondary txt-search-more" id="txtSearchMore" onclick="loadMoreTxtSearch()" hidden>下一页</button>
           </div>
         </div>
         <button type="button" class="btn btn-primary" id="previewDownloadBtn">下载</button>
@@ -7085,6 +8896,8 @@ const FIXED_INDEX_PAGE = `
     let currentReader = null;
     let readerSaveTimer = null;
     let readerBookmarks = [];
+    let txtSearchTimer = null;
+    let txtSearchAbortController = null;
     const READER_FONT_SIZE_KEY = 'edgestash:reader-font-size:v1';
     const selectedItems = new Map();
     const favoritePaths = new Set();
@@ -7174,6 +8987,9 @@ const FIXED_INDEX_PAGE = `
       taskStore.set(task.id, task);
       maybeNotifyTaskTerminal(task, previous, options && options.forceToast);
       updateTaskUi();
+      if (task.status === 'queued' || task.status === 'running') {
+        kickTaskMonitor();
+      }
       if ((task.type === 'copy' || task.type === 'move' || task.type === 'delete') && (task.status === 'queued' || task.status === 'running')) {
         runCopyMoveTaskLoop(task.id);
       }
@@ -7302,12 +9118,35 @@ const FIXED_INDEX_PAGE = `
       }
     }
 
+    function hasActiveTaskInStore() {
+      for (const task of taskStore.values()) {
+        if (task.status === 'queued' || task.status === 'running') return true;
+      }
+      return false;
+    }
+
+    let taskPollDelay = 5000;
+
     function startTaskMonitor() {
-      loadTasks(false);
-      if (taskPollTimer) clearInterval(taskPollTimer);
-      taskPollTimer = window.setInterval(function () {
-        loadTasks(false);
-      }, 5000);
+      if (taskPollTimer) {
+        clearTimeout(taskPollTimer);
+        taskPollTimer = null;
+      }
+      const poll = async function () {
+        await loadTasks(false);
+        // Poll fast while something is running; back off to 30s when idle so an
+        // idle tab stops hammering the tasks endpoint every 5 seconds.
+        taskPollDelay = hasActiveTaskInStore() ? 5000 : 30000;
+        taskPollTimer = window.setTimeout(poll, taskPollDelay);
+      };
+      poll();
+    }
+
+    // Called when a new active task appears so we switch back to fast polling
+    // without waiting out a long idle back-off.
+    function kickTaskMonitor() {
+      if (taskPollDelay <= 5000) return;
+      startTaskMonitor();
     }
 
     function taskProgressPercent(task) {
@@ -7501,7 +9340,6 @@ const FIXED_INDEX_PAGE = `
           document.getElementById('loadingOverlay').style.display = 'none';
           msg.textContent = '';
         }
-        await loadTagOptions();
         return true;
       } catch {
         window.location.href = '/login.html';
@@ -7516,6 +9354,8 @@ const FIXED_INDEX_PAGE = `
       updateViewTabs();
       showLoading(true);
       try {
+        // Favorites (memoized) load in parallel with the listing.
+        const favoritesPromise = loadFavoritePaths();
         const response = await fetch(apiFileUrl('/api/files', currentPath));
         let data = await response.json().catch(function () {
           return { success: false, message: '文件列表接口返回异常' };
@@ -7527,14 +9367,10 @@ const FIXED_INDEX_PAGE = `
           }
           throw new Error(data.message || '加载失败');
         }
-        if (!searchRequestId && data.cached && isEmptyFileListing(data)) {
-          const refreshed = await refreshDirectoryFromSource();
-          if (refreshed && refreshed.success) data = refreshed;
-        }
         if (searchRequestId && searchRequestId !== globalSearchRequestId) return;
         currentPath = data.currentPath || currentPath;
         clearSelection(false);
-        await loadFavoritePaths();
+        await favoritesPromise;
         if (searchRequestId && searchRequestId !== globalSearchRequestId) return;
         renderBreadcrumb();
         document.getElementById('viewTitle').textContent = '当前目录';
@@ -7543,26 +9379,6 @@ const FIXED_INDEX_PAGE = `
         showToast('加载文件失败: ' + error.message, 'error');
       } finally {
         showLoading(false);
-      }
-    }
-
-    function isEmptyFileListing(data) {
-      return (!data.folders || data.folders.length === 0) && (!data.files || data.files.length === 0);
-    }
-
-    async function refreshDirectoryFromSource() {
-      try {
-        const response = await fetch(apiFileUrl('/api/files', currentPath) + '?refresh=1');
-        const data = await response.json().catch(function () {
-          return { success: false, message: '目录刷新接口返回异常' };
-        });
-        if (!response.ok || !data.success) {
-          throw new Error(data.message || '目录刷新失败');
-        }
-        return data;
-      } catch (error) {
-        console.warn('Directory source refresh failed:', error);
-        return null;
       }
     }
 
@@ -7592,19 +9408,32 @@ const FIXED_INDEX_PAGE = `
       }
     }
 
-    async function loadFavoritePaths() {
-      try {
-        const response = await fetch('/api/favorites?limit=500');
-        const data = await response.json();
-        favoritePaths.clear();
-        if (data.success) {
-          (data.favorites || []).forEach(function (item) {
-            favoritePaths.add(item.path);
-          });
+    let favoritePathsLoaded = false;
+    let favoritePathsInFlight = null;
+
+    // Favorites are fetched once and then kept in sync locally (toggleFavorite
+    // updates the set in place). Pass force=true to refetch from the server.
+    async function loadFavoritePaths(force) {
+      if (favoritePathsLoaded && !force) return;
+      if (favoritePathsInFlight) return favoritePathsInFlight;
+      favoritePathsInFlight = (async function () {
+        try {
+          const response = await fetch('/api/favorites?limit=500');
+          const data = await response.json();
+          favoritePaths.clear();
+          if (data.success) {
+            (data.favorites || []).forEach(function (item) {
+              favoritePaths.add(item.path);
+            });
+            favoritePathsLoaded = true;
+          }
+        } catch (error) {
+          console.warn('Favorites load failed:', error);
+        } finally {
+          favoritePathsInFlight = null;
         }
-      } catch (error) {
-        console.warn('Favorites load failed:', error);
-      }
+      })();
+      return favoritePathsInFlight;
     }
 
     const selectedTagFilters = new Set();
@@ -7728,6 +9557,7 @@ const FIXED_INDEX_PAGE = `
         (data.favorites || []).forEach(function (item) {
           favoritePaths.add(item.path);
         });
+        favoritePathsLoaded = true;
         document.getElementById('viewTitle').textContent = '收藏';
         renderItemList(data.favorites || [], '暂无收藏');
       } catch (error) {
@@ -7799,9 +9629,21 @@ const FIXED_INDEX_PAGE = `
     async function runSearch(refresh) {
       const q = document.getElementById('globalSearchInput').value.trim();
       const tags = getSelectedTagFilters();
+      const txtToggle = document.getElementById('globalTxtSearchToggle');
+      const txtGlobal = txtToggle && txtToggle.checked;
       if (!q && tags.length === 0) {
         const requestId = ++globalSearchRequestId;
         await loadFiles({ searchRequestId: requestId });
+        return;
+      }
+
+      if (txtGlobal && q) {
+        const requestId = ++globalSearchRequestId;
+        try {
+          await runGlobalTxtSearch(q, requestId);
+        } catch (error) {
+          if (requestId === globalSearchRequestId) showToast('全文搜索失败: ' + error.message, 'error');
+        }
         return;
       }
 
@@ -7837,30 +9679,140 @@ const FIXED_INDEX_PAGE = `
       }
     }
 
+    let globalTxtSearchCursor = null;
+    let globalTxtSearchQuery = '';
+
+    async function runGlobalTxtSearch(query, requestId, cursor) {
+      currentView = 'search';
+      updateViewTabs();
+      clearSelection(false);
+      showLoading(true);
+      try {
+        const params = new URLSearchParams({ q: query, limit: '20' });
+        if (cursor) params.set('cursor', cursor);
+        const response = await fetch('/api/txt/search/global?' + params.toString());
+        const data = await response.json();
+        if (requestId !== globalSearchRequestId) return;
+        if (!data.success) throw new Error(data.message || '全文搜索失败');
+        if (!cursor) {
+          globalTxtSearchQuery = query;
+          globalTxtSearchCursor = null;
+        }
+        document.getElementById('viewTitle').textContent = '小说全文搜索结果';
+        renderTxtGlobalResults(data, !!cursor);
+      } finally {
+        if (requestId === globalSearchRequestId) showLoading(false);
+      }
+    }
+
+    function renderTxtGlobalResults(data, append) {
+      const fileList = document.getElementById('fileList');
+      const emptyState = document.getElementById('emptyState');
+      if (!append) fileList.replaceChildren();
+
+      const results = data.results || [];
+      if (!append && results.length === 0) {
+        emptyState.style.display = 'block';
+        emptyState.querySelector('div:last-child').textContent = data.hasMore
+          ? '本页没有匹配项，可加载下一页继续查找'
+          : '没有匹配的正文内容（仅搜索已建立索引的 .txt 文件）';
+      } else {
+        emptyState.style.display = 'none';
+      }
+
+      results.forEach(function (result) {
+        const card = document.createElement('div');
+        card.className = 'file-item txt-global-result';
+
+        const title = document.createElement('div');
+        title.className = 'txt-global-result-title';
+        title.textContent = '📖 ' + (result.name || result.path);
+        if (Number.isFinite(Number(result.progressPercent))) {
+          const pos = document.createElement('span');
+          pos.className = 'txt-global-result-pos';
+          pos.textContent = ' 约 ' + Number(result.progressPercent).toFixed(2).replace(/\.00$/, '') + '% 处';
+          title.appendChild(pos);
+        }
+
+        const snippet = document.createElement('div');
+        snippet.className = 'txt-global-result-snippet';
+        const before = document.createElement('span');
+        before.textContent = result.snippetBefore || '';
+        const match = document.createElement('mark');
+        match.textContent = result.match || globalTxtSearchQuery;
+        const after = document.createElement('span');
+        after.textContent = result.snippetAfter || '';
+        snippet.append(before, match, after);
+
+        const jumpBtn = document.createElement('button');
+        jumpBtn.type = 'button';
+        jumpBtn.className = 'btn btn-sm btn-primary';
+        jumpBtn.textContent = '跳转到此处';
+        jumpBtn.addEventListener('click', function (event) {
+          event.stopPropagation();
+          previewFile(result.path, 'text', result.name || nameFromPathClient(result.path), {
+            txtJump: {
+              charOffset: Number(result.charOffset),
+              matchLength: Number(result.matchLength || globalTxtSearchQuery.length),
+              query: globalTxtSearchQuery
+            }
+          });
+        });
+
+        card.append(title, snippet, jumpBtn);
+        card.addEventListener('click', function () { jumpBtn.click(); });
+        fileList.appendChild(card);
+      });
+
+      const oldMore = document.getElementById('txtGlobalMoreBtn');
+      if (oldMore) oldMore.remove();
+      if (data.hasMore && data.nextCursor) {
+        globalTxtSearchCursor = data.nextCursor;
+        const more = document.createElement('button');
+        more.type = 'button';
+        more.id = 'txtGlobalMoreBtn';
+        more.className = 'btn btn-secondary';
+        more.style.marginTop = '12px';
+        more.textContent = '加载下一页';
+        more.addEventListener('click', function () {
+          const requestId = globalSearchRequestId;
+          runGlobalTxtSearch(globalTxtSearchQuery, requestId, globalTxtSearchCursor).catch(function (error) {
+            showToast('全文搜索失败: ' + error.message, 'error');
+          });
+        });
+        fileList.appendChild(more);
+      } else {
+        globalTxtSearchCursor = null;
+      }
+    }
+
+    function nameFromPathClient(path) {
+      const parts = String(path || '').split('/').filter(Boolean);
+      return parts.length > 0 ? parts[parts.length - 1] : path;
+    }
+
     async function refreshCurrentDirectory() {
       currentView = 'files';
       updateViewTabs();
       showLoading(true);
       try {
-        const [cacheResp, indexResp] = await Promise.all([
-          fetch('/api/cache/refresh', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ path: currentPath })
-          }),
-          fetch('/api/search?q=&type=all&limit=1&refresh=1')
-        ]);
+        // One reconcile call: the backend rescans this directory in R2 and
+        // refreshes the virtual directory tree in D1 (no separate index pass —
+        // search_items is maintained incrementally on every write).
+        const cacheResp = await fetch('/api/cache/refresh', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: currentPath })
+        });
         const data = await cacheResp.json().catch(function () { return {}; });
-        const indexData = await indexResp.json().catch(function () { return {}; });
         if (!cacheResp.ok || !data.success) throw new Error(data.message || '目录刷新失败');
-        if (!indexResp.ok || !indexData.success) throw new Error(indexData.message || '索引刷新失败');
         currentPath = data.currentPath || currentPath;
         clearSelection(false);
         await loadFavoritePaths();
         renderBreadcrumb();
         document.getElementById('viewTitle').textContent = '当前目录';
         renderFiles(data.folders || [], data.files || []);
-        showToast('已刷新目录和索引', 'success');
+        showToast('已刷新目录', 'success');
       } catch (error) {
         showToast('刷新失败: ' + error.message, 'error');
       } finally {
@@ -8340,15 +10292,42 @@ const FIXED_INDEX_PAGE = `
       loadFiles();
     }
 
-    function handleFileClick(path, previewType, filename) {
+    function handleFileClick(path, previewType, filename, options) {
       if (previewType) {
-        previewFile(path, previewType, filename);
+        previewFile(path, previewType, filename, options);
       } else {
         downloadFile(path);
       }
     }
 
-    async function previewFile(path, previewType, filename) {
+    // marked/mammoth are only needed for .md/.docx previews, so they are loaded
+    // on demand instead of blocking the initial page render.
+    const previewLibraryLoading = {};
+    function loadPreviewLibrary(name) {
+      if (window[name]) return Promise.resolve();
+      if (previewLibraryLoading[name]) return previewLibraryLoading[name];
+      const sources = {
+        marked: { src: 'https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js', integrity: 'sha384-948ahk4ZmxYVYOc+rxN1H2gM1EJ2Duhp7uHtZ4WSLkV4Vtx5MUqnV+l7u9B+jFv+' },
+        mammoth: { src: 'https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js', integrity: 'sha384-nFoSjZIoH3CCp8W639jJyQkuPHinJ2NHe7on1xvlUA7SuGfJAfvMldrsoAVm6ECz' }
+      };
+      const config = sources[name];
+      if (!config) return Promise.reject(new Error('未知预览组件: ' + name));
+      previewLibraryLoading[name] = new Promise(function (resolve, reject) {
+        const script = document.createElement('script');
+        script.src = config.src;
+        script.integrity = config.integrity;
+        script.crossOrigin = 'anonymous';
+        script.onload = function () { resolve(); };
+        script.onerror = function () {
+          delete previewLibraryLoading[name];
+          reject(new Error(name + ' 预览组件加载失败'));
+        };
+        document.head.appendChild(script);
+      });
+      return previewLibraryLoading[name];
+    }
+
+    async function previewFile(path, previewType, filename, options) {
       const overlay = document.getElementById('previewOverlay');
       const content = document.getElementById('previewContent');
       const filenameEl = document.getElementById('previewFilename');
@@ -8394,6 +10373,7 @@ const FIXED_INDEX_PAGE = `
           audio.src = previewUrl;
           content.replaceChildren(audio);
         } else if (previewType === 'word') {
+          await loadPreviewLibrary('mammoth');
           if (!window.mammoth) throw new Error('文档预览组件加载失败');
           const response = await fetch(previewUrl);
           if (!response.ok) throw new Error('文件读取失败');
@@ -8404,31 +10384,36 @@ const FIXED_INDEX_PAGE = `
           wrapper.innerHTML = sanitizePreviewHtml(result.value);
           content.replaceChildren(wrapper);
         } else if (previewType === 'text') {
-          const response = await fetch(previewUrl);
-          if (!response.ok) throw new Error('文件读取失败');
-          const buffer = await response.arrayBuffer();
-          const text = decodeTextBuffer(buffer);
           const ext = (filename.split('.').pop() || '').toLowerCase();
           if (ext === 'txt') {
-            await renderTxtReader(content, path, text);
-          } else if (ext === 'md' && window.marked) {
+            await renderTxtReader(content, path, options && options.txtJump);
+          } else {
+            const response = await fetch(previewUrl);
+            if (!response.ok) throw new Error('文件读取失败');
+            const buffer = await response.arrayBuffer();
+            const text = decodeTextBuffer(buffer);
+            if (ext === 'md') {
+            await loadPreviewLibrary('marked');
             const wrapper = document.createElement('div');
             wrapper.className = 'preview-markdown';
-            wrapper.innerHTML = sanitizePreviewHtml(window.marked.parse(text));
+            wrapper.innerHTML = window.marked
+              ? sanitizePreviewHtml(window.marked.parse(text))
+              : sanitizePreviewHtml(text);
             content.replaceChildren(wrapper);
-          } else {
-            const pre = document.createElement('pre');
-            pre.className = 'preview-text';
-            if (ext === 'json') {
-              try {
-                pre.textContent = JSON.stringify(JSON.parse(text), null, 2);
-              } catch {
+            } else {
+              const pre = document.createElement('pre');
+              pre.className = 'preview-text';
+              if (ext === 'json') {
+                try {
+                  pre.textContent = JSON.stringify(JSON.parse(text), null, 2);
+                } catch {
+                  pre.textContent = text;
+                }
+              } else {
                 pre.textContent = text;
               }
-            } else {
-              pre.textContent = text;
+              content.replaceChildren(pre);
             }
-            content.replaceChildren(pre);
           }
         } else {
           showPreviewError('不支持预览此文件类型');
@@ -8438,52 +10423,211 @@ const FIXED_INDEX_PAGE = `
       }
     }
 
-    async function renderTxtReader(content, path, text) {
+    async function renderTxtReader(content, path, jump) {
       content.classList.add('reader-mode');
       document.getElementById('readerTools').classList.add('active');
+      document.getElementById('txtSearchPanel').hidden = true;
+      document.getElementById('txtSearchInput').value = '';
+      document.getElementById('txtSearchResults').replaceChildren();
+      document.getElementById('txtSearchStatus').textContent = '';
+      document.getElementById('txtSearchMore').hidden = true;
+
+      const metaResponse = await fetch('/api/txt/meta?path=' + encodeURIComponent(path), { cache: 'no-store' });
+      if (!metaResponse.ok) throw new Error('TXT 元数据读取失败');
+      const meta = await metaResponse.json();
+      if (!meta.success) throw new Error(meta.message || 'TXT 元数据读取失败');
 
       const reader = document.createElement('div');
       reader.className = 'preview-reader';
       reader.style.fontSize = getReaderFontSize() + 'px';
       reader.tabIndex = 0;
-      const textNode = document.createTextNode(text);
-      reader.appendChild(textNode);
       content.replaceChildren(reader);
 
       const state = {
         path,
-        text,
+        meta,
         reader,
-        textNode,
+        chunks: [],
+        nextByteOffset: Math.min(Number(meta.byteOffset || 0), Number(meta.size || 0)),
+        decodedChars: 0,
+        decoder: meta.encoding === 'utf-16be' ? null : new TextDecoder(meta.encoding || 'utf-8'),
+        decoderRemainder: new Uint8Array(),
+        loadInFlight: null,
+        done: false,
         saveInFlight: null,
         saveQueued: false,
         lastSavedOffset: null,
         lastSavedAt: 0,
-        retryTimer: null
+        retryTimer: null,
+        searchCursor: null,
+        searchQuery: '',
+        searchResults: [],
+        index: meta.index || null,
+        indexBuildInFlight: false
       };
       currentReader = state;
       updateReaderFontSizeLabel();
 
-      await restoreReaderProgress(state);
-      await loadReaderBookmarks(state);
       reader.addEventListener('scroll', function () {
         scheduleReaderProgressSave(state);
+        if (reader.scrollTop + reader.clientHeight >= reader.scrollHeight - 480) {
+          loadTxtReaderChunk(state);
+        }
       }, { passive: true });
+
+      await loadTxtReaderChunk(state);
+      if (jump && Number.isFinite(Number(jump.charOffset))) {
+        // Jumped in from a global full-text search result: go straight to the
+        // match instead of restoring the saved reading position.
+        state.searchQuery = typeof jump.query === 'string' ? jump.query : '';
+        await waitForReaderLayout();
+        let jumped = await highlightTxtSearchMatch(state, Number(jump.charOffset), Number(jump.matchLength || 0));
+        if (!jumped) jumped = await scrollReaderToCharOffset(state, Number(jump.charOffset));
+        if (!jumped) showToast('无法跳转到搜索位置', 'error');
+      } else {
+        await restoreReaderProgress(state);
+      }
+      await loadReaderBookmarks(state);
+    }
+
+    function decodeIncrementalTxtBytes(state, bytes, flush) {
+      if (state.meta.encoding === 'utf-16be') {
+        state.decoderRemainder = concatClientBytes(state.decoderRemainder, bytes);
+        const completeLength = state.decoderRemainder.length - (state.decoderRemainder.length % 2);
+        const complete = state.decoderRemainder.slice(0, completeLength);
+        state.decoderRemainder = state.decoderRemainder.slice(completeLength);
+        let text = decodeUtf16Be(complete);
+        if (flush && state.decoderRemainder.length > 0) {
+          text += '\ufffd';
+          state.decoderRemainder = new Uint8Array();
+        }
+        return text;
+      }
+      return state.decoder.decode(bytes, { stream: !flush });
+    }
+
+    function concatClientBytes(first, second) {
+      const result = new Uint8Array(first.length + second.length);
+      result.set(first, 0);
+      result.set(second, first.length);
+      return result;
+    }
+
+    function appendTxtReaderChunk(state, byteStart, byteEnd, text) {
+      if (!text) return;
+      const element = document.createElement('span');
+      element.className = 'txt-reader-chunk';
+      element.textContent = text;
+      state.reader.appendChild(element);
+      state.chunks.push({
+        byteStart,
+        byteEnd,
+        charStart: state.decodedChars,
+        charEnd: state.decodedChars + text.length,
+        text,
+        element
+      });
+      state.decodedChars += text.length;
+    }
+
+    async function loadTxtReaderChunk(state) {
+      if (currentReader !== state || state.done || state.loadInFlight) return state.loadInFlight;
+      if (state.nextByteOffset >= Number(state.meta.size || 0)) {
+        state.done = true;
+        return null;
+      }
+
+      state.loadInFlight = (async function () {
+        const start = state.nextByteOffset;
+        const length = Math.min(Number(state.meta.chunkSize || 128 * 1024), Number(state.meta.size || 0) - start);
+        const response = await fetch('/api/txt/chunk?path=' + encodeURIComponent(state.path)
+          + '&offset=' + encodeURIComponent(start)
+          + '&length=' + encodeURIComponent(length), {
+          headers: { 'If-Match': state.meta.etag }
+        });
+        if (!response.ok) throw new Error(response.status === 412 ? '文件已变化，请重新加载' : 'TXT 分片读取失败');
+
+        const reader = response.body && response.body.getReader();
+        if (!reader) throw new Error('TXT 分片响应为空');
+        let bytesRead = 0;
+        let decoded = '';
+        try {
+          while (true) {
+            const result = await reader.read();
+            if (result.done) break;
+            const bytes = result.value instanceof Uint8Array ? result.value : new Uint8Array(result.value);
+            bytesRead += bytes.length;
+            decoded += decodeIncrementalTxtBytes(state, bytes, false);
+          }
+        } finally {
+          reader.releaseLock();
+        }
+
+        state.nextByteOffset = start + bytesRead;
+        appendTxtReaderChunk(state, start, state.nextByteOffset, decoded);
+        if (bytesRead === 0 || state.nextByteOffset >= Number(state.meta.size || 0)) {
+          const tail = decodeIncrementalTxtBytes(state, new Uint8Array(), true);
+          appendTxtReaderChunk(state, state.nextByteOffset, state.nextByteOffset, tail);
+          state.done = true;
+        }
+        return decoded;
+      })();
+
+      try {
+        return await state.loadInFlight;
+      } finally {
+        state.loadInFlight = null;
+      }
+    }
+
+    async function ensureTxtByteLoaded(state, byteOffset) {
+      const target = Math.max(Number(state.meta.byteOffset || 0), Math.floor(Number(byteOffset) || 0));
+      while (!state.done && state.nextByteOffset <= target) {
+        await loadTxtReaderChunk(state);
+      }
+      return state.done || state.nextByteOffset > target;
+    }
+
+    function findTxtChunkByByte(state, byteOffset) {
+      const offset = Math.max(0, Math.floor(Number(byteOffset) || 0));
+      const direct = state.chunks.find(function (chunk) {
+        return offset >= chunk.byteStart && offset < chunk.byteEnd;
+      });
+      if (direct) return direct;
+      const last = state.chunks[state.chunks.length - 1];
+      return last && offset === last.byteEnd ? last : null;
+    }
+
+    function findTxtChunkByChar(state, charOffset) {
+      const offset = Math.max(0, Math.floor(Number(charOffset) || 0));
+      const direct = state.chunks.find(function (chunk) {
+        return offset >= chunk.charStart && offset < chunk.charEnd;
+      });
+      if (direct) return direct;
+      const last = state.chunks[state.chunks.length - 1];
+      return last && offset === last.charEnd ? last : null;
+    }
+
+    async function scrollReaderToByteOffset(state, byteOffset) {
+      if (!Number.isFinite(byteOffset)) return false;
+      await ensureTxtByteLoaded(state, byteOffset);
+      const chunk = findTxtChunkByByte(state, Math.floor(byteOffset));
+      if (!chunk) return false;
+      chunk.element.scrollIntoView({ block: 'center' });
+      return true;
     }
 
     async function restoreReaderProgress(state) {
       try {
         const response = await fetch('/api/reader/progress?path=' + encodeURIComponent(state.path));
         if (!response.ok) return;
-
         const data = await response.json();
         const saved = data.progress;
-        if (!saved) return;
-
+        if (!saved || (saved.sourceEtag && saved.sourceEtag !== state.meta.etag)) return;
         await waitForReaderLayout();
-
-        const restoredByChar = scrollReaderToCharOffset(state, saved.charOffset);
-        if (!restoredByChar) {
+        if (Number.isFinite(Number(saved.byteOffset))) {
+          await scrollReaderToByteOffset(state, Number(saved.byteOffset));
+        } else {
           scrollReaderToProgress(state, saved.progress);
         }
       } catch (error) {
@@ -8499,29 +10643,16 @@ const FIXED_INDEX_PAGE = `
       });
     }
 
-    function scrollReaderToCharOffset(state, charOffset) {
-      const textLength = state.text.length;
-      if (!Number.isFinite(charOffset) || textLength === 0) return false;
-
-      const offset = Math.max(0, Math.min(textLength, Math.floor(charOffset)));
-      if (offset === 0) {
-        state.reader.scrollTop = 0;
-        return true;
+    async function scrollReaderToCharOffset(state, charOffset) {
+      if (!Number.isFinite(charOffset)) return false;
+      const target = Math.max(0, Math.floor(charOffset));
+      const chunk = findTxtChunkByChar(state, target);
+      if (!chunk && !state.done) {
+        while (!state.done && state.decodedChars <= target) await loadTxtReaderChunk(state);
       }
-
-      const range = document.createRange();
-      const start = Math.max(0, Math.min(offset, textLength - 1));
-      const end = Math.min(textLength, start + 1);
-      range.setStart(state.textNode, start);
-      range.setEnd(state.textNode, end);
-
-      const rect = range.getBoundingClientRect();
-      if (range.detach) range.detach();
-
-      if (!rect || (rect.width === 0 && rect.height === 0)) return false;
-
-      const readerRect = state.reader.getBoundingClientRect();
-      state.reader.scrollTop += rect.top - readerRect.top - 28;
+      const resolvedChunk = findTxtChunkByChar(state, target);
+      if (!resolvedChunk) return false;
+      resolvedChunk.element.scrollIntoView({ block: 'center' });
       return true;
     }
 
@@ -8529,6 +10660,31 @@ const FIXED_INDEX_PAGE = `
       const safeProgress = Number.isFinite(progress) ? Math.max(0, Math.min(1, progress)) : 0;
       const maxScrollTop = Math.max(0, state.reader.scrollHeight - state.reader.clientHeight);
       state.reader.scrollTop = maxScrollTop * safeProgress;
+    }
+
+    function getVisibleTxtChunk(state) {
+      if (state.chunks.length === 0) return null;
+      const readerRect = state.reader.getBoundingClientRect();
+      const targetTop = readerRect.top + 32;
+      return state.chunks.find(function (chunk) {
+        const rect = chunk.element.getBoundingClientRect();
+        return rect.bottom >= targetTop;
+      }) || state.chunks[state.chunks.length - 1];
+    }
+
+    function getReaderByteOffset(state) {
+      const chunk = getVisibleTxtChunk(state);
+      return chunk ? chunk.byteStart : Number(state.meta.byteOffset || 0);
+    }
+
+    function getReaderCharOffset(state) {
+      const chunk = getVisibleTxtChunk(state);
+      return chunk ? chunk.charStart : 0;
+    }
+
+    function getReaderSnippet(state) {
+      const chunk = getVisibleTxtChunk(state);
+      return chunk ? chunk.text.slice(0, 160) : '';
     }
 
     function scheduleReaderProgressSave(state) {
@@ -8545,12 +10701,20 @@ const FIXED_INDEX_PAGE = `
         clearTimeout(readerSaveTimer);
         readerSaveTimer = null;
       }
+      if (txtSearchAbortController) {
+        txtSearchAbortController.abort();
+        txtSearchAbortController = null;
+      }
+      if (txtSearchTimer) {
+        clearTimeout(txtSearchTimer);
+        txtSearchTimer = null;
+      }
+      const searchPanel = document.getElementById('txtSearchPanel');
+      if (searchPanel) searchPanel.hidden = true;
 
       const state = currentReader;
       currentReader = null;
-      if (state) {
-        saveReaderProgress(state);
-      }
+      if (state) saveReaderProgress(state);
     }
 
     async function saveReaderProgress(state) {
@@ -8572,11 +10736,13 @@ const FIXED_INDEX_PAGE = `
       try {
         const maxScrollTop = Math.max(0, state.reader.scrollHeight - state.reader.clientHeight);
         const progress = maxScrollTop > 0 ? state.reader.scrollTop / maxScrollTop : 0;
-        const charOffset = getReaderCharOffset(state);
-        if (charOffset === state.lastSavedOffset) return;
+        const byteOffset = getReaderByteOffset(state);
+        if (byteOffset === state.lastSavedOffset) return;
         const payload = {
           path: state.path,
-          charOffset,
+          charOffset: getReaderCharOffset(state),
+          byteOffset,
+          sourceEtag: state.meta.etag,
           progress,
           scrollTop: state.reader.scrollTop,
           scrollHeight: state.reader.scrollHeight
@@ -8590,7 +10756,7 @@ const FIXED_INDEX_PAGE = `
         });
         const response = await state.saveInFlight;
         if (!response.ok) throw new Error('HTTP ' + response.status);
-        state.lastSavedOffset = charOffset;
+        state.lastSavedOffset = byteOffset;
         state.lastSavedAt = Date.now();
       } catch (error) {
         console.warn('Reader progress save failed:', error);
@@ -8618,13 +10784,13 @@ const FIXED_INDEX_PAGE = `
     async function adjustReaderFontSize(delta) {
       if (!currentReader) return;
       const state = currentReader;
-      const offset = getReaderCharOffset(state);
+      const offset = getReaderByteOffset(state);
       const next = Math.max(12, Math.min(32, getReaderFontSize() + delta));
       try { localStorage.setItem(READER_FONT_SIZE_KEY, String(next)); } catch {}
       state.reader.style.fontSize = next + 'px';
       updateReaderFontSizeLabel();
       await waitForReaderLayout();
-      scrollReaderToCharOffset(state, offset);
+      await scrollReaderToByteOffset(state, offset);
       scheduleReaderProgressSave(state);
     }
 
@@ -8632,6 +10798,7 @@ const FIXED_INDEX_PAGE = `
       if (event) event.stopPropagation();
       const panel = document.getElementById('bookmarkPanel');
       panel.hidden = !panel.hidden;
+      if (!panel.hidden) document.getElementById('txtSearchPanel').hidden = true;
     }
 
     async function loadReaderBookmarks(state) {
@@ -8687,16 +10854,16 @@ const FIXED_INDEX_PAGE = `
     async function addCurrentBookmark() {
       if (!currentReader) return;
       const state = currentReader;
+      const byteOffset = getReaderByteOffset(state);
       const charOffset = getReaderCharOffset(state);
       const maxScrollTop = Math.max(0, state.reader.scrollHeight - state.reader.clientHeight);
       const progress = maxScrollTop > 0 ? state.reader.scrollTop / maxScrollTop : 0;
-      const snippetStart = Math.max(0, charOffset - 30);
-      const snippet = state.text.slice(snippetStart, Math.min(state.text.length, charOffset + 100));
+      const snippet = getReaderSnippet(state);
       try {
         const response = await fetch('/api/reader/bookmarks', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: state.path, charOffset, progress, snippet })
+          body: JSON.stringify({ path: state.path, charOffset, byteOffset, sourceEtag: state.meta.etag, progress, snippet })
         });
         const data = await response.json();
         if (!response.ok || !data.success) throw new Error(data.message || '添加书签失败');
@@ -8708,13 +10875,17 @@ const FIXED_INDEX_PAGE = `
       }
     }
 
-    function jumpToReaderBookmark(bookmark) {
+    async function jumpToReaderBookmark(bookmark) {
       if (!currentReader) return;
-      if (!scrollReaderToCharOffset(currentReader, bookmark.charOffset)) {
-        scrollReaderToProgress(currentReader, bookmark.progress);
+      const state = currentReader;
+      let jumped = false;
+      if (Number.isFinite(Number(bookmark.byteOffset))) {
+        jumped = await scrollReaderToByteOffset(state, Number(bookmark.byteOffset));
       }
+      if (!jumped) jumped = await scrollReaderToCharOffset(state, bookmark.charOffset);
+      if (!jumped) scrollReaderToProgress(state, bookmark.progress);
       document.getElementById('bookmarkPanel').hidden = true;
-      currentReader.reader.focus();
+      state.reader.focus();
     }
 
     async function deleteReaderBookmark(bookmarkId) {
@@ -8729,31 +10900,280 @@ const FIXED_INDEX_PAGE = `
       }
     }
 
-    function getReaderCharOffset(state) {
-      const rect = state.reader.getBoundingClientRect();
-      const x = rect.left + Math.min(48, Math.max(8, state.reader.clientWidth - 8));
-      const y = rect.top + 32;
-      let offset = null;
+    function toggleTxtSearchPanel(event) {
+      if (event) event.stopPropagation();
+      const panel = document.getElementById('txtSearchPanel');
+      panel.hidden = !panel.hidden;
+      if (!panel.hidden) {
+        document.getElementById('bookmarkPanel').hidden = true;
+        document.getElementById('txtSearchInput').focus();
+      }
+    }
 
-      if (document.caretPositionFromPoint) {
-        const position = document.caretPositionFromPoint(x, y);
-        if (position && position.offsetNode === state.textNode) {
-          offset = position.offset;
+    async function ensureTxtIndex(state, controller) {
+      if (!state || !state.meta) return false;
+      const existing = state.index || state.meta.index;
+      if (existing && existing.status === 'unavailable') return true;
+      if (existing && existing.status === 'ready') return true;
+
+      state.indexBuildInFlight = true;
+      try {
+        while (true) {
+          if (controller.signal.aborted || currentReader !== state) return false;
+          const response = await fetch('/api/txt/index?path=' + encodeURIComponent(state.path), {
+            method: 'POST',
+            cache: 'no-store',
+            signal: controller.signal
+          });
+          const data = await response.json().catch(function () { return {}; });
+          if (controller.signal.aborted || currentReader !== state) return false;
+          if (!response.ok || !data.success) {
+            throw new Error(data.message || 'TXT 正文索引建立失败');
+          }
+
+          if (data.index) {
+            state.index = data.index;
+            state.meta.index = data.index;
+          }
+          const index = data.index || state.index || {};
+          const progress = Number.isFinite(Number(index.progress))
+            ? Math.max(0, Math.min(100, Number(index.progress) * 100))
+            : 0;
+          document.getElementById('txtSearchStatus').textContent = index.status === 'ready'
+            ? '正文索引已就绪，正在搜索…'
+            : '正在建立正文索引… ' + progress.toFixed(progress >= 10 ? 0 : 1) + '%';
+          if (data.done || index.status === 'ready') return true;
         }
-      } else if (document.caretRangeFromPoint) {
-        const range = document.caretRangeFromPoint(x, y);
-        if (range && range.startContainer === state.textNode) {
-          offset = range.startOffset;
+      } finally {
+        state.indexBuildInFlight = false;
+      }
+    }
+
+    function handleTxtSearchKey(event) {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        scheduleTxtSearch(0);
+      } else if (event.key === 'Escape') {
+        document.getElementById('txtSearchPanel').hidden = true;
+      }
+    }
+
+    function clearTxtSearch() {
+      const input = document.getElementById('txtSearchInput');
+      input.value = '';
+      if (txtSearchTimer) clearTimeout(txtSearchTimer);
+      if (txtSearchAbortController) txtSearchAbortController.abort();
+      txtSearchAbortController = null;
+      if (currentReader) {
+        clearTxtSearchHighlight(currentReader);
+        currentReader.searchCursor = null;
+        currentReader.searchQuery = '';
+        currentReader.searchResults = [];
+      }
+      document.getElementById('txtSearchResults').replaceChildren();
+      document.getElementById('txtSearchStatus').textContent = '';
+      document.getElementById('txtSearchMore').hidden = true;
+    }
+
+    function scheduleTxtSearch(delay) {
+      if (txtSearchTimer) clearTimeout(txtSearchTimer);
+      if (txtSearchAbortController) txtSearchAbortController.abort();
+      txtSearchAbortController = null;
+      const query = document.getElementById('txtSearchInput').value;
+      const wait = Number.isFinite(delay) ? delay : 280;
+      txtSearchTimer = window.setTimeout(function () {
+        txtSearchTimer = null;
+        runTxtSearch(true, query);
+      }, wait);
+    }
+
+    async function runTxtSearch(reset, queryOverride) {
+      const state = currentReader;
+      if (!state) return;
+      const query = queryOverride === undefined
+        ? document.getElementById('txtSearchInput').value
+        : queryOverride;
+      if (!query) {
+        clearTxtSearch();
+        return;
+      }
+      if (reset) {
+        clearTxtSearchHighlight(state);
+        state.searchCursor = null;
+        state.searchQuery = query;
+        state.searchResults = [];
+        document.getElementById('txtSearchResults').replaceChildren();
+      }
+      if (state.searchQuery !== query) return;
+
+      const controller = new AbortController();
+      txtSearchAbortController = controller;
+      let cursor = state.searchCursor;
+      try {
+        const indexReady = await ensureTxtIndex(state, controller);
+        if (!indexReady || controller.signal.aborted || currentReader !== state || state.searchQuery !== query) return;
+        do {
+          const params = new URLSearchParams({
+            path: state.path,
+            q: query,
+            limit: '50'
+          });
+          if (cursor) params.set('cursor', cursor);
+          document.getElementById('txtSearchStatus').textContent = '正在搜索正文…';
+          const response = await fetch('/api/txt/search?' + params.toString(), { signal: controller.signal });
+          const data = await response.json();
+          if (controller.signal.aborted || currentReader !== state || state.searchQuery !== query) return;
+          if (!response.ok || !data.success) throw new Error(data.message || 'TXT 搜索失败');
+          state.searchResults = state.searchResults.concat(data.results || []);
+          cursor = data.nextCursor || null;
+          state.searchCursor = cursor;
+          renderTxtSearchResults(state);
+        } while (cursor);
+        document.getElementById('txtSearchStatus').textContent = state.searchResults.length
+          ? '全文搜索完成，找到 ' + state.searchResults.length + ' 条'
+          : '全文搜索完成，没有匹配项';
+        document.getElementById('txtSearchMore').hidden = true;
+      } catch (error) {
+        if (error.name === 'AbortError') return;
+        if (currentReader === state) document.getElementById('txtSearchStatus').textContent = error.message;
+      } finally {
+        if (txtSearchAbortController === controller) txtSearchAbortController = null;
+      }
+    }
+
+    function loadMoreTxtSearch() {
+      if (!currentReader || !currentReader.searchCursor) return;
+      runTxtSearch(false, currentReader.searchQuery);
+    }
+
+    function renderTxtSearchResults(state) {
+      const results = document.getElementById('txtSearchResults');
+      results.replaceChildren();
+      state.searchResults.forEach(function (result) {
+        const row = document.createElement('div');
+        row.className = 'txt-search-result';
+        const snippet = document.createElement('div');
+        snippet.className = 'txt-search-snippet';
+        const before = document.createElement('span');
+        before.textContent = result.snippetBefore || '';
+        const match = document.createElement('mark');
+        match.textContent = result.match || state.searchQuery;
+        const after = document.createElement('span');
+        after.textContent = result.snippetAfter || '';
+        const snippetBody = document.createElement('div');
+        snippetBody.append(before, match, after);
+        const meta = document.createElement('div');
+        meta.className = 'txt-search-meta';
+        if (Number.isFinite(Number(result.progressPercent))) {
+          meta.textContent = '约 ' + Number(result.progressPercent).toFixed(2).replace(/\.00$/, '') + '%';
+        } else if (Number.isFinite(Number(result.byteOffset))) {
+          meta.textContent = '文件位置约 ' + Number(result.byteOffset).toLocaleString() + ' 字节';
+        }
+        snippet.append(snippetBody, meta);
+        const jump = document.createElement('button');
+        jump.type = 'button';
+        jump.className = 'btn btn-secondary txt-search-jump';
+        jump.textContent = '跳转';
+        jump.addEventListener('click', function () { jumpToTxtSearchResult(state, result); });
+        row.append(snippet, jump);
+        results.appendChild(row);
+      });
+    }
+
+    function clearTxtSearchHighlight(state) {
+      if (!state || !state.chunks) return;
+      state.chunks.forEach(function (chunk) {
+        chunk.element.classList.remove('search-target');
+        if (chunk.element.querySelector('.txt-search-highlight')) {
+          chunk.element.replaceChildren(document.createTextNode(chunk.text));
+        }
+      });
+    }
+
+    async function highlightTxtSearchMatch(state, charOffset, matchLength) {
+      const start = Math.max(0, Math.floor(Number(charOffset) || 0));
+      const length = Math.max(1, Math.floor(Number(matchLength) || state.searchQuery.length || 1));
+      const end = start + length;
+      if (!Number.isFinite(end)) return false;
+      if (!await scrollReaderToCharOffset(state, start)) return false;
+      if (!await scrollReaderToCharOffset(state, end - 1)) return false;
+
+      clearTxtSearchHighlight(state);
+      let firstMark = null;
+      state.chunks.forEach(function (chunk) {
+        const overlapStart = Math.max(start, chunk.charStart);
+        const overlapEnd = Math.min(end, chunk.charEnd);
+        if (overlapStart >= overlapEnd) return;
+
+        const localStart = overlapStart - chunk.charStart;
+        const localEnd = overlapEnd - chunk.charStart;
+        const fragment = document.createDocumentFragment();
+        if (localStart > 0) fragment.appendChild(document.createTextNode(chunk.text.slice(0, localStart)));
+        const mark = document.createElement('mark');
+        mark.className = 'txt-search-highlight';
+        mark.textContent = chunk.text.slice(localStart, localEnd);
+        fragment.appendChild(mark);
+        if (localEnd < chunk.text.length) fragment.appendChild(document.createTextNode(chunk.text.slice(localEnd)));
+        chunk.element.replaceChildren(fragment);
+        chunk.element.classList.add('search-target');
+        if (!firstMark) firstMark = mark;
+      });
+
+      if (!firstMark) return false;
+      firstMark.scrollIntoView({ block: 'center' });
+      return true;
+    }
+
+    function setTxtReaderLoading(state, visible, message) {
+      if (!state || !state.reader) return;
+      let indicator = state.reader.querySelector('.txt-reader-loading');
+      if (!visible) {
+        if (indicator) indicator.remove();
+        state.reader.removeAttribute('aria-busy');
+        return;
+      }
+      if (!indicator) {
+        indicator = document.createElement('div');
+        indicator.className = 'txt-reader-loading';
+        indicator.setAttribute('role', 'status');
+        indicator.setAttribute('aria-live', 'polite');
+        state.reader.prepend(indicator);
+      }
+      indicator.textContent = message || '正在加载…';
+      state.reader.setAttribute('aria-busy', 'true');
+    }
+
+    async function jumpToTxtSearchResult(state, result) {
+      if (currentReader !== state) return;
+      setTxtReaderLoading(state, true, '正在跳转到搜索位置…');
+      document.getElementById('txtSearchStatus').textContent = '正在跳转到搜索位置…';
+      try {
+        clearTxtSearchHighlight(state);
+        let jumped = false;
+        if (Number.isFinite(Number(result.charOffset))) {
+          jumped = await highlightTxtSearchMatch(state, Number(result.charOffset), Number(result.matchLength || state.searchQuery.length));
+        }
+        if (!jumped && Number.isFinite(Number(result.byteOffset))) {
+          jumped = await scrollReaderToByteOffset(state, Number(result.byteOffset));
+          const chunk = findTxtChunkByByte(state, Number(result.byteOffset));
+          if (chunk) {
+            chunk.element.classList.add('search-target');
+            window.setTimeout(function () {
+              chunk.element.classList.remove('search-target');
+            }, 1800);
+          }
+        }
+        if (!jumped) return;
+        state.reader.focus();
+      } finally {
+        setTxtReaderLoading(state, false);
+        if (currentReader === state) {
+          const progress = Number.isFinite(Number(result.progressPercent))
+            ? '（约 ' + Number(result.progressPercent).toFixed(2).replace(/\.00$/, '') + '%）'
+            : '';
+          document.getElementById('txtSearchStatus').textContent = '已跳转到匹配位置' + progress;
         }
       }
-
-      if (!Number.isFinite(offset)) {
-        const maxScrollTop = Math.max(0, state.reader.scrollHeight - state.reader.clientHeight);
-        const progress = maxScrollTop > 0 ? state.reader.scrollTop / maxScrollTop : 0;
-        offset = Math.floor(state.text.length * progress);
-      }
-
-      return Math.max(0, Math.min(state.text.length, Math.floor(offset)));
     }
 
     function decodeTextBuffer(buffer) {
@@ -9687,7 +12107,8 @@ const FIXED_INDEX_PAGE = `
       const authenticated = await checkAuth();
       if (!authenticated) return;
       startTaskMonitor();
-      await loadFiles();
+      // Tag options and the initial listing are independent — load in parallel.
+      await Promise.all([loadFiles(), loadTagOptions()]);
     }
 
     initializeApp();
@@ -9728,6 +12149,25 @@ const FIXED_ADMIN_PAGE = `
         <div class="stat-card"><div class="stat-value" id="totalShares">0</div><div class="stat-label">总分享链接数</div></div>
         <div class="stat-card"><div class="stat-value" id="totalViews">0</div><div class="stat-label">总浏览次数</div></div>
         <div class="stat-card"><div class="stat-value" id="totalDownloads">0</div><div class="stat-label">总下载次数</div></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">小说全文索引（.txt）</div>
+        </div>
+        <p style="margin: 0 0 12px; opacity: 0.75; font-size: 14px;">
+          为网盘中的 .txt 小说建立正文索引，建立后即可使用全文搜索并跳转到对应段落。新上传的 .txt 文件会自动在后台建立索引；此按钮用于批量处理存量文件。
+        </p>
+        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+          <button type="button" class="btn btn-primary" id="rebuildTxtIndexBtn" onclick="rebuildTxtIndexes(false)">重建全部小说索引</button>
+          <label style="font-size: 14px; display: inline-flex; align-items: center; gap: 6px;">
+            <input type="checkbox" id="rebuildTxtForce"> 强制重建（忽略已有索引）
+          </label>
+        </div>
+        <div id="rebuildTxtProgress" style="display: none; margin-top: 12px;">
+          <progress id="rebuildTxtProgressBar" value="0" max="100" style="width: 100%;"></progress>
+          <div id="rebuildTxtProgressText" style="font-size: 13px; opacity: 0.75; margin-top: 6px;"></div>
+        </div>
       </div>
     </div>
 
@@ -9857,6 +12297,67 @@ const FIXED_ADMIN_PAGE = `
         }
       } catch (error) {
         showToast('加载统计数据失败: ' + error.message, 'error');
+      }
+    }
+
+    let rebuildTxtRunning = false;
+
+    async function rebuildTxtIndexes(forceOverride) {
+      if (rebuildTxtRunning) return;
+      const force = forceOverride || document.getElementById('rebuildTxtForce').checked;
+      const button = document.getElementById('rebuildTxtIndexBtn');
+      const progressBox = document.getElementById('rebuildTxtProgress');
+      const progressBar = document.getElementById('rebuildTxtProgressBar');
+      const progressText = document.getElementById('rebuildTxtProgressText');
+
+      rebuildTxtRunning = true;
+      button.disabled = true;
+      progressBox.style.display = 'block';
+      progressBar.value = 0;
+      progressText.textContent = '正在准备…';
+
+      let cursor = '';
+      let processed = 0;
+      let indexed = 0;
+      let skipped = 0;
+      let missing = 0;
+      let failed = 0;
+      let total = 0;
+
+      try {
+        for (;;) {
+          const response = await fetch('/api/admin/txt/rebuild', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ force, cursor, batch: 5 })
+          });
+          const data = await response.json();
+          if (!data.success) throw new Error(data.message || '重建失败');
+
+          total = data.total || 0;
+          processed += data.batch || 0;
+          indexed += data.indexed || 0;
+          skipped += data.skipped || 0;
+          missing += data.missing || 0;
+          failed += (data.details || []).filter(item => item.status === 'error').length;
+          cursor = data.cursor || cursor;
+
+          const percent = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 100;
+          progressBar.value = percent;
+          progressText.textContent = '进度 ' + percent + '%（已处理 ' + processed + '/' + total
+            + '，新建 ' + indexed + '，跳过 ' + skipped + (missing ? '，缺失 ' + missing : '') + (failed ? '，失败 ' + failed : '') + '）';
+
+          if (data.done) break;
+        }
+        progressText.textContent = '完成：共 ' + total + ' 本，新建索引 ' + indexed + '，跳过 ' + skipped
+          + (missing ? '，已删除 ' + missing : '') + (failed ? '，失败 ' + failed : '') + '。';
+        showToast('小说索引重建完成', 'success');
+      } catch (error) {
+        progressText.textContent = '重建中断：' + error.message;
+        showToast('重建小说索引失败: ' + error.message, 'error');
+      } finally {
+        rebuildTxtRunning = false;
+        button.disabled = false;
       }
     }
 
@@ -10399,6 +12900,7 @@ const FIXED_SHARE_PAGE = `
             <div class="share-filesize" id="fileSize"></div>
           </div>
         </div>
+        <div id="shareStateNotice" class="share-state-notice" hidden></div>
         <div id="passwordForm" style="display: none;">
           <div class="form-group">
             <label class="form-label" for="sharePassword">请输入分享密码</label>
@@ -10445,6 +12947,7 @@ const FIXED_SHARE_PAGE = `
         document.getElementById('shareContent').style.display = 'block';
         document.getElementById('fileName').textContent = data.fileName;
         document.getElementById('fileSize').textContent = data.itemCount > 1 ? data.itemCount + ' 个项目' : data.fileSizeFormatted;
+        updateShareStateNotice(data.state);
         requiresPassword = !!data.requiresPassword;
         document.getElementById('passwordForm').style.display = requiresPassword ? 'block' : 'none';
         if (!requiresPassword) {
@@ -10458,6 +12961,13 @@ const FIXED_SHARE_PAGE = `
     function showExpired() {
       document.getElementById('loadingState').style.display = 'none';
       document.getElementById('expiredState').style.display = 'block';
+    }
+
+    function updateShareStateNotice(state) {
+      const notice = document.getElementById('shareStateNotice');
+      if (!notice) return;
+      notice.hidden = state !== 'partial';
+      notice.textContent = state === 'partial' ? '部分分享项目已失效，当前仅显示仍然存在的项目。' : '';
     }
 
     function handlePasswordKey(event) {
@@ -10491,6 +13001,7 @@ const FIXED_SHARE_PAGE = `
         }
 
         currentPath = data.currentPath || path || '/';
+        updateShareStateNotice(data.state);
         document.getElementById('passwordForm').style.display = 'none';
         document.getElementById('shareBrowser').classList.add('active');
         renderBreadcrumb();
@@ -10684,7 +13195,7 @@ const FIXED_SHARE_PAGE = `
 // ============================================================================
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
@@ -10728,7 +13239,7 @@ export default {
         if (path === '/api/d1/init' && method === 'GET') {
           const auth = await verifyAuth(request, env);
           if (!auth) return jsonResponse({ success: false }, 401);
-          const alreadyReady = d1SchemaReady || (env.KV_STORE ? await env.KV_STORE.get(D1_SCHEMA_KV_KEY) : null);
+          const alreadyReady = env.KV_STORE ? await env.KV_STORE.get(D1_SCHEMA_KV_KEY) : null;
           if (alreadyReady) return jsonResponse({ success: true, initialized: false });
           await ensureD1Schema(env);
           return jsonResponse({ success: true, initialized: true });
@@ -10818,6 +13329,42 @@ export default {
         if (path === '/api/folders/search' && method === 'GET') {
           return await handleSearchFolders(request, env);
         }
+
+        if (path === '/api/txt/meta' && method === 'GET') {
+          return await handleTxtMeta(request, env);
+        }
+
+        if (path === '/api/txt/chunk' && method === 'GET') {
+          return await handleTxtChunk(request, env);
+        }
+
+        if (path === '/api/txt/index' && method === 'GET') {
+          return await handleTxtIndexStatus(request, env);
+        }
+
+        if (path === '/api/txt/index' && method === 'POST') {
+          return await handleTxtIndexBuild(request, env);
+        }
+
+        if (path === '/api/txt/search' && method === 'GET') {
+          return await handleTxtSearch(request, env);
+        }
+
+        if (path === '/api/txt/search/global' && method === 'GET') {
+          return await handleTxtGlobalSearch(request, env);
+        }
+
+        if (path === '/api/preview/txt/meta' && method === 'GET') {
+          return await handleTxtMeta(request, env);
+        }
+
+        if (path === '/api/preview/txt/chunk' && method === 'GET') {
+          return await handleTxtChunk(request, env);
+        }
+
+        if (path === '/api/preview/txt/search' && method === 'GET') {
+          return await handleTxtSearch(request, env);
+        }
         
         // File management routes
         if (path.startsWith('/api/files')) {
@@ -10827,7 +13374,7 @@ export default {
             return await handleListFiles(request, env, filePath);
           }
           if (method === 'POST') {
-            return await handleUploadFile(request, env, filePath);
+            return await handleUploadFile(request, env, filePath, ctx);
           }
           if (method === 'PUT') {
             return await handleRenameFile(request, env, filePath);
@@ -10906,6 +13453,10 @@ export default {
 
         if (path === '/api/admin/debug/storage' && method === 'GET') {
           return await handleAdminStorageDebug(request, env);
+        }
+
+        if (path === '/api/admin/txt/rebuild' && method === 'POST') {
+          return await handleAdminTxtRebuild(request, env);
         }
 
         if (path.match(/^\/api\/admin\/users\/[^/]+\/permissions$/) && method === 'GET') {
