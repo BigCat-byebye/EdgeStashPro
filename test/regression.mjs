@@ -34,6 +34,11 @@ async function signUserCookie(secret, email) {
   return signCookie(secret, { role: 'user', email });
 }
 
+async function sha256Hex(value) {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(value)));
+  return Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
 function makeObject(key, bytes, etag = '"txt-v1"') {
   const bodyBytes = bytes instanceof Uint8Array ? bytes : encoder.encode(bytes);
   return {
@@ -79,11 +84,13 @@ function makeR2(objects) {
   }]));
   const ranges = [];
   const heads = [];
+  const gets = [];
   const lists = [];
   let generation = objects.length;
   return {
     ranges,
     heads,
+    gets,
     lists,
     async head(key) {
       heads.push(key);
@@ -91,15 +98,24 @@ function makeR2(objects) {
       return record ? { ...makeObject(key, record.bytes, record.etag), body: undefined } : null;
     },
     async get(key, options = {}) {
+      let range = options.range || null;
+      if (range instanceof Headers) {
+        const header = range.get('Range');
+        const match = header && header.match(/^bytes=(\d+)-(\d*)$/i);
+        range = match
+          ? { offset: Number(match[1]), length: match[2] ? Number(match[2]) - Number(match[1]) + 1 : undefined }
+          : null;
+      }
+      gets.push({ key, range });
       const record = store.get(key);
       if (!record) return null;
-      const range = options.range;
       if (!range) return makeObject(key, record.bytes, record.etag);
       const offset = Number(range.offset || 0);
       const length = Number(range.length ?? (record.bytes.length - offset));
       ranges.push({ key, offset, length });
       const bounded = record.bytes.slice(offset, Math.min(record.bytes.length, offset + length));
       const ranged = makeObject(key, bounded, record.etag);
+      ranged.size = record.bytes.length;
       ranged.range = { offset, length: bounded.length };
       return ranged;
     },
@@ -289,6 +305,8 @@ class MemoryD1 {
       const row = {};
       columns.forEach((column, index) => { row[column] = args[index]; });
       if (table === 'search_items') {
+        row.updated_at = row.sync_status;
+        row.sync_status = 'ready';
         const existing = this.tables.get(table).find(item => item.path === row.path);
         if (existing) Object.assign(existing, row);
         else this.tables.get(table).push(row);
@@ -305,6 +323,24 @@ class MemoryD1 {
         if (!existing) this.tables.get(table).push(row);
       } else if (table === 'reader_bookmarks') {
         this.tables.get(table).push(row);
+      } else if (table === 'reader_progress') {
+        const progressRow = {
+          owner_key: args[0],
+          path: args[1],
+          source_etag: args[2],
+          char_offset: args[3],
+          byte_offset: args[4],
+          anchor_char_offset: args[5],
+          anchor_byte_offset: args[6],
+          anchor_ratio: args[7],
+          progress: args[8],
+          scroll_top: args[9],
+          scroll_height: args[10],
+          revision: 1,
+          updated_at: args[11]
+        };
+        const existing = this.tables.get(table).find(item => item.owner_key === progressRow.owner_key && item.path === progressRow.path);
+        if (!existing) this.tables.get(table).push(progressRow);
       } else if (table === 'app_stats') {
         const existing = this.tables.get(table).find(item => item.key === row.key);
         if (existing) Object.assign(existing, row);
@@ -344,10 +380,12 @@ class MemoryD1 {
         this.tables.set(table, rows.filter(row => !(row.id === args[0] && row.owner_key === args[1])));
       } else if (table === 'reader_bookmarks' && compact.includes('owner_key = ?')) {
         this.tables.set(table, rows.filter(row => row.owner_key !== args[0]));
+      } else if (table === 'reader_progress' && compact.includes('owner_key = ?') && !compact.includes('path = ?')) {
+        this.tables.set(table, rows.filter(row => row.owner_key !== args[0]));
       } else if ((table === 'txt_index_files' || table === 'txt_index_chunks') && compact.includes('path = ?')) {
         const root = args[0];
         this.tables.set(table, rows.filter(row => !(row.path === root || pathMatchesRoot(root, row.path))));
-      } else if (table === 'search_items' || table === 'favorites' || table === 'recent_items' || table === 'reader_bookmarks') {
+      } else if (table === 'search_items' || table === 'favorites' || table === 'recent_items' || table === 'reader_bookmarks' || table === 'reader_progress') {
         const root = args[0];
         if (table === 'search_items' && compact.includes('indexed_at != ?')) {
           const indexedAt = args[args.length - 1];
@@ -414,6 +452,24 @@ class MemoryD1 {
             row.updated_at = args[8];
           }
         }
+      } else if (table === 'reader_progress') {
+        const row = rows.find(item => item.owner_key === args[10]
+          && item.path === args[11]
+          && Number(item.revision) === Number(args[12]));
+        if (row) {
+          row.source_etag = args[0];
+          row.char_offset = args[1];
+          row.byte_offset = args[2];
+          row.anchor_char_offset = args[3];
+          row.anchor_byte_offset = args[4];
+          row.anchor_ratio = args[5];
+          row.progress = args[6];
+          row.scroll_top = args[7];
+          row.scroll_height = args[8];
+          row.revision = Number(row.revision || 0) + 1;
+          row.updated_at = args[9];
+        }
+        return { success: true, meta: { changes: row ? 1 : 0 } };
       } else if (table === 'share_links') {
         const shareId = args[args.length - 1];
         const row = rows.find(item => item.share_id === shareId);
@@ -477,6 +533,9 @@ class MemoryD1 {
           && (!compact.includes('source_etag') || row.source_etag === null || row.source_etag === args[2]))
       };
     }
+    if (table === 'reader_progress') {
+      return { results: rows.filter(row => row.owner_key === args[0] && row.path === args[1]) };
+    }
     if (table === 'txt_index_files' && compact.includes('where path = ?')) {
       return { results: rows.filter(row => row.path === args[0]) };
     }
@@ -508,6 +567,46 @@ class MemoryD1 {
           .slice(0, limit)
       };
     }
+    if (table === 'txt_index_chunks' && compact.includes('byte_start <= ?') && compact.includes('byte_end > ?')) {
+      const target = Number(args[2]);
+      return {
+        results: rows
+          .filter(row => row.path === args[0]
+            && row.source_etag === args[1]
+            && Number(row.byte_start) <= target
+            && Number(row.byte_end) > target)
+          .sort((a, b) => Number(b.chunk_no) - Number(a.chunk_no))
+          .map(row => ({ chunk_no: row.chunk_no }))
+          .slice(0, 1)
+      };
+    }
+    if (table === 'txt_index_chunks' && compact.includes('chunk_no between ? and ?')) {
+      return {
+        results: rows
+          .filter(row => row.path === args[0]
+            && row.source_etag === args[1]
+            && Number(row.chunk_no) >= Number(args[2])
+            && Number(row.chunk_no) <= Number(args[3]))
+          .sort((a, b) => Number(a.chunk_no) - Number(b.chunk_no))
+          .slice(0, 4)
+      };
+    }
+    if (table === 'txt_index_chunks' && compact.includes('select chunk_no, byte_start')) {
+      return {
+        results: rows
+          .filter(row => row.path === args[0] && row.source_etag === args[1])
+          .sort((a, b) => Number(a.chunk_no) - Number(b.chunk_no))
+          .map(row => ({ chunk_no: row.chunk_no, byte_start: row.byte_start }))
+          .slice(0, 1)
+      };
+    }
+    if (table === 'txt_index_chunks' && compact.includes('chunk_no = ?')) {
+      return {
+        results: rows.filter(row => row.path === args[0]
+          && row.source_etag === args[1]
+          && Number(row.chunk_no) === Number(args[2]))
+      };
+    }
     if (table === 'user_permissions' && compact.includes('select id')) return { results: [] };
     if (table === 'search_items') {
       if (compact.includes('count(*) as count')) {
@@ -530,6 +629,9 @@ class MemoryD1 {
       if (compact.includes('where path in (')) {
         const wanted = new Set(args);
         return { results: rows.filter(row => wanted.has(row.path)) };
+      }
+      if (compact.includes('where path = ?')) {
+        return { results: rows.filter(row => row.path === args[0] && row.sync_status !== 'stale') };
       }
       if (compact.includes("where path = ? and item_type = 'folder'")) {
         return { results: rows.filter(row => row.path === args[0] && row.item_type === 'folder') };
@@ -565,7 +667,12 @@ function makeEnv(bytes, options = {}) {
 async function request(path, env, cookie, init = {}) {
   const headers = new Headers(init.headers || {});
   if (cookie) headers.set('Cookie', cookie);
-  return worker.fetch(new Request(`https://example.test${path}`, { ...init, headers }), env);
+  const pending = [];
+  const response = await worker.fetch(new Request(`https://example.test${path}`, { ...init, headers }), env, {
+    waitUntil(promise) { pending.push(Promise.resolve(promise)); }
+  });
+  await Promise.all(pending);
+  return response;
 }
 
 async function testTxtRoutes() {
@@ -661,6 +768,7 @@ async function testTxtSearchPagingAndBoundaries() {
   assert.equal(wrongPath.status, 404, 'the path must be resolved before a cursor can be reused');
 
   await pagedEnv.R2_BUCKET.put('notes.txt', encoder.encode('a'.repeat(70)));
+  await request('/api/txt/meta?path=%2Fnotes.txt', pagedEnv, pagedCookie);
   const changedCursor = await request('/api/txt/search?path=%2Fnotes.txt&q=aa&limit=50&cursor=' + encodeURIComponent(firstBody.nextCursor), pagedEnv, pagedCookie);
   assert.equal(changedCursor.status, 400, 'a cursor must be invalid after the source ETag changes');
 
@@ -709,9 +817,25 @@ async function testTxtIndexedSearchLifecycle() {
   const searchBody = await search.json();
   assert.equal(searchBody.indexed, true);
   assert.equal(searchBody.results[0].charOffset, 65_534, 'indexed search must return an exact character offset across a page boundary');
+  assert.equal(searchBody.results[0].chunkByteOffset, 0, 'a boundary-spanning result must jump from the previous indexed byte page');
+  assert.equal(searchBody.results[0].chunkCharOffset, 0, 'a boundary-spanning result must use the previous indexed character base');
   assert.equal(searchBody.results[0].match, 'abcde');
   assert.ok(searchBody.results[0].progressPercent > 0);
   assert.equal(env.R2_BUCKET.ranges.length, rangesBeforeSearch, 'a ready index search must not rescan R2 content');
+
+  const rangesBeforeOpen = env.R2_BUCKET.ranges.length;
+  const opened = await request('/api/txt/open?path=%2Fnotes.txt', env, cookie);
+  assert.equal(opened.status, 200);
+  const openedBody = await opened.json();
+  assert.equal(openedBody.windowSource, 'd1', 'an indexed novel must open from the D1 text read model');
+  assert.ok(openedBody.chunks.length >= 2, 'the open response must include nearby indexed chunks');
+  assert.equal(env.R2_BUCKET.ranges.length, rangesBeforeOpen, 'a ready D1 text window must not read R2');
+  const cachedOpen = await request('/api/txt/open?path=%2Fnotes.txt&cachedEtag='
+    + encodeURIComponent(openedBody.meta.etag)
+    + '&cached=' + openedBody.chunks[0].byteStart, env, cookie);
+  const cachedOpenBody = await cachedOpen.json();
+  assert.equal(cachedOpenBody.chunks[0].cached, true, 'the server must omit a chunk already present in the device cache');
+  assert.equal('text' in cachedOpenBody.chunks[0], false, 'cached open windows must not resend cached text');
 
   const firstPaged = await request('/api/txt/search?path=%2Fnotes.txt&q=x&limit=1', env, cookie);
   const firstPagedBody = await firstPaged.json();
@@ -761,7 +885,11 @@ async function testReaderProgressAndBookmarks() {
       charOffset: 4,
       byteOffset: 4,
       sourceEtag: '"txt-v1"',
-      progress: 0.25
+      progress: 0.25,
+      anchorRatio: 0.625,
+      anchorCharOffset: 7,
+      anchorByteOffset: 7,
+      baseRevision: 0
     })
   });
   assert.equal(saved.status, 200);
@@ -771,6 +899,66 @@ async function testReaderProgressAndBookmarks() {
   const progressBody = await progress.json();
   assert.equal(progressBody.progress.byteOffset, 4);
   assert.equal(progressBody.progress.sourceEtag, '"txt-v1"');
+  assert.equal(progressBody.progress.anchorRatio, 0.625, 'reader progress must preserve the position inside a large TXT chunk');
+  assert.equal(progressBody.progress.anchorCharOffset, 7);
+  assert.equal(progressBody.progress.revision, 1, 'the first global book progress write starts revision tracking');
+
+  const advanced = await request('/api/reader/progress', env, cookie, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      path: '/notes.txt',
+      charOffset: 8,
+      byteOffset: 8,
+      anchorCharOffset: 9,
+      anchorByteOffset: 9,
+      sourceEtag: '"txt-v1"',
+      progress: 0.5,
+      baseRevision: 1
+    })
+  });
+  assert.equal(advanced.status, 200);
+  assert.equal((await advanced.json()).progress.revision, 2, 'another device must advance the shared book revision');
+
+  const staleDevice = await request('/api/reader/progress', env, cookie, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      path: '/notes.txt',
+      charOffset: 5,
+      byteOffset: 5,
+      sourceEtag: '"txt-v1"',
+      progress: 0.3,
+      baseRevision: 1
+    })
+  });
+  assert.equal(staleDevice.status, 409, 'a stale device must not overwrite newer global reading progress');
+  const staleDeviceBody = await staleDevice.json();
+  assert.equal(staleDeviceBody.code, 'READER_PROGRESS_CONFLICT');
+  assert.equal(staleDeviceBody.progress.revision, 2);
+
+  const reopened = await request('/api/txt/open?path=%2Fnotes.txt', env, cookie);
+  assert.equal(reopened.status, 200);
+  const reopenedBody = await reopened.json();
+  assert.equal(reopenedBody.progress.revision, 2, 'every device must open from the same account-and-book progress');
+  assert.equal(reopenedBody.target.byteOffset, 8);
+  assert.equal(reopenedBody.target.anchorByteOffset, 9);
+
+  const legacyKv = new MemoryKV();
+  const legacyD1 = new MemoryD1();
+  await legacyKv.put('reader:admin:' + await sha256Hex('/notes.txt'), JSON.stringify({
+    path: '/notes.txt',
+    charOffset: 3,
+    byteOffset: 3,
+    sourceEtag: '"txt-v1"',
+    progress: 0.2,
+    updatedAt: 1234
+  }));
+  const legacyEnv = makeEnv(encoder.encode('legacy progress text'), { d1: legacyD1, kv: legacyKv });
+  const legacyCookie = await signAdminCookie(legacyEnv.ADMIN_PASSWORD);
+  const legacyProgress = await request('/api/reader/progress?path=%2Fnotes.txt', legacyEnv, legacyCookie);
+  assert.equal((await legacyProgress.json()).progress.byteOffset, 3, 'legacy KV progress must remain readable');
+  assert.equal((legacyD1.tables.get('reader_progress') || []).length, 1, 'legacy KV progress must migrate into D1 on first read');
 
   const bookmark = await request('/api/reader/bookmarks', env, cookie, {
     method: 'POST',
@@ -793,6 +981,7 @@ async function testReaderProgressAndBookmarks() {
   assert.equal(bookmarkBody.bookmarks[0].sourceEtag, '"txt-v1"');
 
   await env.R2_BUCKET.put('notes.txt', encoder.encode('changed text'));
+  await request('/api/txt/meta?path=%2Fnotes.txt', env, cookie);
   const staleProgress = await request('/api/reader/progress?path=%2Fnotes.txt', env, cookie);
   assert.equal(staleProgress.status, 200);
   const staleProgressBody = await staleProgress.json();
@@ -998,6 +1187,8 @@ async function testVirtualDirectoryIncrementalAndGlobalTxtSearch() {
   );
   for (const result of globalBody.results) {
     assert.ok(Number.isFinite(result.charOffset) && result.charOffset > 0, 'each global result needs an exact jump offset');
+    assert.ok(Number.isFinite(result.chunkByteOffset) && result.chunkByteOffset >= 0, 'each global result needs an indexed byte-page start for a direct reader seek');
+    assert.ok(Number.isFinite(result.chunkCharOffset) && result.chunkCharOffset >= 0 && result.chunkCharOffset <= result.charOffset, 'each global result needs the matching page character base for a direct reader seek');
     assert.equal(result.match, '灵狐传说');
     assert.ok(result.snippetBefore.length > 0, 'each global result needs surrounding context');
     assert.ok(result.name.endsWith('.txt'));
@@ -1007,6 +1198,87 @@ async function testVirtualDirectoryIncrementalAndGlobalTxtSearch() {
   const emptySearch = await request('/api/txt/search/global?q=' + encodeURIComponent('不存在的词'), env, cookie);
   assert.equal(emptySearch.status, 200);
   assert.equal((await emptySearch.json()).results.length, 0);
+}
+
+async function testD1ReadModelHotPaths() {
+  const env = makeEnv(encoder.encode('fast-path text'), { d1: new MemoryD1() });
+  const cookie = await signAdminCookie(env.ADMIN_PASSWORD);
+  const bootstrap = await request('/api/bootstrap', env, cookie);
+  assert.equal(bootstrap.status, 200);
+  const bootstrapBody = await bootstrap.json();
+  assert.equal(bootstrapBody.success, true);
+  assert.equal(bootstrapBody.listing.files[0].path, '/notes.txt');
+  assert.ok(env.R2_BUCKET.lists.length > 0, 'the first bootstrap must import R2 metadata once');
+
+  function resetR2Calls() {
+    env.R2_BUCKET.heads.length = 0;
+    env.R2_BUCKET.lists.length = 0;
+    env.R2_BUCKET.gets.length = 0;
+    env.R2_BUCKET.ranges.length = 0;
+  }
+
+  function assertNoR2MetadataReads(message) {
+    assert.equal(env.R2_BUCKET.heads.length, 0, message + ': no R2 HEAD');
+    assert.equal(env.R2_BUCKET.lists.length, 0, message + ': no R2 LIST');
+    assert.equal(env.R2_BUCKET.gets.length, 0, message + ': no R2 GET');
+  }
+
+  resetR2Calls();
+  assert.equal((await request('/api/files/', env, cookie)).status, 200);
+  assertNoR2MetadataReads('repeat directory listing must be D1-only');
+
+  assert.equal((await request('/api/search?q=notes', env, cookie)).status, 200);
+  assertNoR2MetadataReads('metadata search must be D1-only');
+  assert.equal((await request('/api/favorites', env, cookie)).status, 200);
+  assertNoR2MetadataReads('favorites must be D1-only');
+  assert.equal((await request('/api/recent', env, cookie)).status, 200);
+  assertNoR2MetadataReads('recent items must be D1-only');
+  assert.equal((await request('/api/tags/list', env, cookie)).status, 200);
+  assertNoR2MetadataReads('tag options must be D1-only');
+
+  resetR2Calls();
+  const preview = await request('/api/preview/notes.txt', env, cookie);
+  assert.equal(preview.status, 200);
+  assert.equal(env.R2_BUCKET.gets.length, 1, 'preview must issue one exact R2 GET');
+  assert.equal(env.R2_BUCKET.heads.length, 0, 'preview must not issue a separate R2 HEAD');
+  assert.equal(env.R2_BUCKET.lists.length, 0, 'preview must not issue an R2 LIST');
+
+  resetR2Calls();
+  const txtMeta = await request('/api/txt/meta?path=%2Fnotes.txt', env, cookie);
+  assert.equal(txtMeta.status, 200);
+  assert.equal(env.R2_BUCKET.gets.length, 1, 'TXT metadata must use one bounded R2 GET');
+  resetR2Calls();
+  assert.equal((await request('/api/reader/progress?path=%2Fnotes.txt', env, cookie)).status, 200);
+  assertNoR2MetadataReads('reader progress must use the D1 source identity');
+
+  const shareResponse = await request('/api/share', env, cookie, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ path: '/notes.txt' }], expiresIn: 'permanent' })
+  });
+  const share = await shareResponse.json();
+  resetR2Calls();
+  const shareInfo = await request('/api/share/' + share.shareId, env);
+  assert.equal(shareInfo.status, 200);
+  assertNoR2MetadataReads('share metadata must be D1-only');
+
+  resetR2Calls();
+  const shareDownload = await request('/api/share/' + share.shareId + '/download', env, null, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: '/notes.txt' })
+  });
+  assert.equal(shareDownload.status, 200);
+  assert.equal(env.R2_BUCKET.gets.length, 1, 'share download must issue one exact R2 GET');
+  assert.equal(env.R2_BUCKET.heads.length, 0);
+  assert.equal(env.R2_BUCKET.lists.length, 0);
+
+  const emptyEnv = makeEnv(null, { d1: new MemoryD1(), objects: [] });
+  const emptyCookie = await signAdminCookie(emptyEnv.ADMIN_PASSWORD);
+  assert.equal((await request('/api/bootstrap', emptyEnv, emptyCookie)).status, 200);
+  emptyEnv.R2_BUCKET.lists.length = 0;
+  assert.equal((await request('/api/files/', emptyEnv, emptyCookie)).status, 200);
+  assert.equal(emptyEnv.R2_BUCKET.lists.length, 0, 'an initialized empty bucket must not be rescanned');
 }
 
 function testStaticContracts() {
@@ -1036,6 +1308,32 @@ function testStaticContracts() {
   assert.match(workerSource, /txt_index_files/, 'D1 must persist TXT index file state');
   assert.match(workerSource, /charOffset/, 'indexed search results must expose exact character offsets');
   assert.match(workerSource, /txt-search-highlight/, 'TXT jumps must highlight the exact matched text');
+  assert.match(workerSource, /txt-reader-jump-overlay/, 'long TXT jumps must cover incremental rendering with a consistent loading overlay');
+  assert.match(workerSource, /function resetReaderToIndexedWindow\(/, 'indexed TXT results must reset the reader directly to the indexed chunk');
+  assert.match(workerSource, /result\s*&&\s*result\.chunkByteOffset/, 'direct TXT jumps must consume indexed byte-page offsets');
+  assert.match(workerSource, /result\s*&&\s*result\.chunkCharOffset/, 'direct TXT jumps must consume indexed character-page offsets');
+  assert.match(workerSource, /anchorRatio/, 'reader progress must retain a location within the current chunk');
+  assert.match(workerSource, /@media\s*\(prefers-reduced-motion:\s*reduce\)/, 'new TXT reader motion must respect reduced-motion preferences');
+  assert.match(workerSource, /\.preview-actions\s*>\s*\.btn\s*\{\s*display:\s*none;/, 'mobile styles must hide only direct desktop actions');
+  assert.doesNotMatch(workerSource, /\.preview-actions\s+\.btn\s*\{\s*display:\s*none;/, 'mobile styles must not hide search and bookmark panel buttons');
+
+  assert.match(workerSource, /fetch\('\/api\/txt\/open\?'/, 'TXT opening must aggregate progress, metadata, and nearby content into one request');
+  assert.match(workerSource, /indexedDB\.open\(TXT_CACHE_DB_NAME/, 'TXT content must use a persistent device-local IndexedDB cache');
+  assert.match(workerSource, /READER_PROGRESS_CONFLICT/, 'global reading progress must reject stale device revisions');
+  assert.match(workerSource, /baseRevision/, 'reader saves must carry the last synchronized global revision');
+  assert.match(workerSource, /windowSource = 'd1'/, 'ready TXT indexes must serve nearby text from D1 before R2');
+
+  const readerScrollStart = workerSource.indexOf('function scrollTxtReaderElementIntoView(');
+  const readerScrollEnd = workerSource.indexOf('\n    async function scrollReaderToByteOffset', readerScrollStart);
+  const readerScrollSource = workerSource.slice(readerScrollStart, readerScrollEnd);
+  assert.ok(readerScrollStart >= 0 && readerScrollEnd > readerScrollStart, 'TXT reader must own an explicit scroll helper');
+  assert.match(readerScrollSource, /reader\.scrollTop\s*=\s*targetTop/, 'search navigation must update the nested reader scroll container');
+  assert.doesNotMatch(readerScrollSource, /scrollIntoView\(/, 'the nested reader helper must not delegate to the ambiguous outer-container scroll API');
+  assert.match(workerSource, /return scrollTxtReaderElementIntoView\(state, resolvedChunk\.element, ratio\)/, 'character-offset jumps must preserve an exact in-chunk reading position');
+  assert.match(workerSource, /return scrollTxtReaderElementIntoView\(state, firstMark\)/, 'highlighted global-search results must use the nested reader scroll helper');
+  assert.match(workerSource, /getElementById\('txtSearchPanel'\)\.hidden = true/, 'successful in-reader result activation must close the search panel');
+  assert.match(workerSource, /row\.addEventListener\('click', activateResult\)/, 'clicking an in-reader result row must activate the jump');
+  assert.match(workerSource, /row\.setAttribute\('role', 'button'\)/, 'in-reader result rows must expose their click behavior');
 }
 
 await testTxtRoutes();
@@ -1045,5 +1343,6 @@ await testReaderProgressAndBookmarks();
 await testPathBoundPermissionsAndShares();
 await testCachedAdminDirectoryNavigationAvoidsPerItemR2Checks();
 await testVirtualDirectoryIncrementalAndGlobalTxtSearch();
+await testD1ReadModelHotPaths();
 testStaticContracts();
-console.log('regression: TXT, reader, path-bound permission/share, virtual-directory and global-search contracts passed');
+console.log('regression: TXT, reader, D1 read model, path-bound permission/share, virtual-directory and global-search contracts passed');

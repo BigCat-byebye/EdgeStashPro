@@ -1,6 +1,6 @@
 # EdgeStashPro
 
-EdgeStashPro 是一个单文件 Cloudflare Worker 网盘。核心代码在 `worker.js`，页面、样式、前端交互和后端逻辑都内嵌在这个 Worker 中；文件存储使用 Cloudflare R2，用户、阅读进度和管理员 OTP 状态使用 Workers KV，虚拟目录树、搜索索引、收藏、最近访问、分享、统计和文件任务使用 Cloudflare D1。
+EdgeStashPro 是一个单文件 Cloudflare Worker 网盘。核心代码在 `worker.js`，页面、样式、前端交互和后端逻辑都内嵌在这个 Worker 中；文件存储使用 Cloudflare R2，用户和管理员 OTP 状态使用 Workers KV，虚拟目录树、搜索索引、跨设备阅读进度、收藏、最近访问、分享、统计和文件任务使用 Cloudflare D1。
 
 项目当前需要 R2、KV、D1 和 `ADMIN_PASSWORD`，不需要单独构建前端，也不需要额外的运行时服务。
 
@@ -32,13 +32,13 @@ https://s3.zxhf.dev/
 - 文件管理：上传文件、上传文件夹、下载、删除、重命名、创建文件夹。
 - 批量操作：批量复制、移动、删除和打包下载；批量下载由浏览器原生下载 ZIP 压缩包。
 - 后台任务：上传、下载、复制、移动和批量删除会进入顶部任务状态栏，可查看进度、历史状态、停止或删除任务。
-- 目录浏览：支持中文路径、中文文件名；目录结构保存在 D1 虚拟目录树中，打开目录不扫描 R2。
+- 目录浏览：支持中文路径、中文文件名；D1 是页面元数据的权威读模型，打开目录、搜索、收藏、最近访问、标签和分享信息都不扫描 R2。
 - 搜索：支持按名称、路径或标签即时搜索，可筛选全部、文件、文件夹。
 - 小说全文搜索：对已建立正文索引的 `.txt` 小说跨书搜索正文片段，命中后可直接打开阅读器并跳转到对应段落。
 - 标签：可为文件/文件夹维护标签，并在搜索结果、收藏、最近访问和目录列表中展示。
 - 收藏和最近访问：支持文件/文件夹收藏、最近访问列表。
 - 在线预览：图片、PDF、文本、Markdown、音视频、docx。
-- TXT 阅读：支持常见中文编码、字号调节、自动保存阅读进度和多书签快速跳转。
+- TXT 阅读：支持常见中文编码、字号调节、账号级跨设备阅读进度、IndexedDB 附近正文缓存、D1 索引快速打开和多书签跳转。
 - 日间/夜间模式：登录、云盘、管理后台和分享页面均可一键切换，并记住浏览器偏好。
 - 分享链接：支持单个或多个文件/目录公开分享、只读目录浏览、可选密码、过期时间、二维码、浏览和下载统计。
 - 用户体系：管理员账号和授权用户账号分离。
@@ -52,6 +52,7 @@ https://s3.zxhf.dev/
 
 ```txt
 worker.js    # Cloudflare Worker 主文件，包含后端和内嵌页面
+migrations/  # D1 增量迁移
 README.md    # 部署和使用说明
 merged-images.png       # README 预览图
 wrangler.toml.example    # Wrangler 部署配置示例
@@ -64,8 +65,8 @@ wrangler.toml.example    # Wrangler 部署配置示例
 | 资源 | Binding 名 | 用途 |
 | --- | --- | --- |
 | R2 Bucket | `R2_BUCKET` | 保存上传的文件 |
-| KV Namespace | `KV_STORE` | 保存用户、阅读进度和管理员 OTP |
-| D1 Database | `D1_DB` | 保存虚拟目录树/资源搜索索引、TXT 正文分片索引、收藏、最近访问、TXT 书签、分享链接、统计、用户路径权限和文件任务 |
+| KV Namespace | `KV_STORE` | 保存用户、管理员 OTP，以及兼容旧版本阅读进度迁移 |
+| D1 Database | `D1_DB` | 保存虚拟目录树/资源搜索索引、TXT 正文分片索引、账号级阅读进度、收藏、最近访问、TXT 书签、分享链接、统计、用户路径权限和文件任务 |
 
 环境变量：
 
@@ -75,7 +76,7 @@ wrangler.toml.example    # Wrangler 部署配置示例
 
 Binding 名必须和代码一致。如果你改了 binding 名，需要同步改 `worker.js` 和 `wrangler.toml`。
 
-TXT 书签和正文分片索引直接复用现有 D1。正文索引只针对 `.txt` 文件：新上传的 `.txt` 会在上传完成后自动在后台建立索引；也可以在管理后台一次性批量重建全部小说索引；此外打开某本小说后首次搜索正文时，也会按需为该书建立索引并显示进度。主题和字号偏好保存在浏览器本地。这些功能不会创建 Durable Objects、Cron Trigger、Queue、Workflow 或其他 Cloudflare 资源。
+TXT 阅读进度、书签和正文分片索引直接使用 D1。同一账号同一本书只有一条全局阅读进度，手机、平板和电脑会接续最新版本；旧 KV 阅读进度会在首次读取时自动迁移。已建立正文索引的小说会从 D1 一次返回进度和附近正文，索引不可用时回退到 R2 Range。每台设备使用 IndexedDB 保存有限数量的附近正文分片，缓存只负责加速，不产生设备独立进度。正文索引只针对 `.txt` 文件：新上传的 `.txt` 会在上传完成后自动在后台建立索引；也可以在管理后台一次性批量重建全部小说索引；此外打开某本小说后首次搜索正文时，也会按需为该书建立索引并显示进度。主题和字号偏好保存在浏览器本地。这些功能不会创建 Durable Objects、Cron Trigger、Queue、Workflow 或其他 Cloudflare 资源。
 
 ## Wrangler 部署流程
 
@@ -128,6 +129,7 @@ bucket_name = "YOUR_R2_BUCKET"
 binding = "D1_DB"
 database_name = "YOUR_D1_DATABASE"
 database_id = "YOUR_D1_DATABASE_ID"
+migrations_dir = "migrations"
 ```
 
 `binding` 字段不要改，代码固定读取 `R2_BUCKET`、`KV_STORE`、`D1_DB`。`keep_vars = true` 建议保留，它可以避免 `wrangler deploy` 清掉 Dashboard 中配置的 `ADMIN_PASSWORD` 等变量。
@@ -142,10 +144,11 @@ wrangler secret put ADMIN_PASSWORD
 
 按提示输入强密码。`ADMIN_PASSWORD` 也是 JWT 签名密钥，修改后所有已登录会话都会失效。
 
-### 5. 预检并部署
+### 5. 执行 D1 迁移、预检并部署
 
 ```bash
 node --check worker.js
+wrangler d1 migrations apply YOUR_D1_DATABASE --remote
 wrangler deploy --dry-run
 wrangler deploy
 ```
@@ -225,7 +228,7 @@ https://your-worker.your-subdomain.workers.dev/
 6. 使用 Google Authenticator、Microsoft Authenticator、1Password 等 App 扫码。
 7. 输入 App 中显示的 6 位 OTP，完成绑定并登录。
 8. 进入管理后台后，可以创建普通授权用户，并为用户选择可访问的文件或目录。
-9. 首次打开任意目录时，系统会自动从 R2 建立 D1 虚拟目录树（无需手动刷新）。要跨书搜索小说正文，先在搜索栏勾选“全文(.txt)”再输入关键词；新上传的 `.txt` 会在后台自动建立正文索引，也可以在管理后台批量重建。
+9. 首次进入云盘时，系统会自动从 R2 建立一次 D1 虚拟目录树（无需手动刷新）；以后页面优先读取 D1。若在 Cloudflare 控制台或其他 S3 客户端直接改了 R2，请点击页面刷新按钮主动同步。要跨书搜索小说正文，先在搜索栏勾选“全文(.txt)”再输入关键词；新上传的 `.txt` 会在后台自动建立正文索引，也可以在管理后台批量重建。
 
 普通用户登录不需要 OTP，只使用管理员创建的邮箱和密码。
 
