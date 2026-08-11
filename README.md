@@ -52,7 +52,6 @@ https://s3.zxhf.dev/
 
 ```txt
 worker.js    # Cloudflare Worker 主文件，包含后端和内嵌页面
-migrations/  # D1 增量迁移
 README.md    # 部署和使用说明
 merged-images.png       # README 预览图
 wrangler.toml.example    # Wrangler 部署配置示例
@@ -129,7 +128,6 @@ bucket_name = "YOUR_R2_BUCKET"
 binding = "D1_DB"
 database_name = "YOUR_D1_DATABASE"
 database_id = "YOUR_D1_DATABASE_ID"
-migrations_dir = "migrations"
 ```
 
 `binding` 字段不要改，代码固定读取 `R2_BUCKET`、`KV_STORE`、`D1_DB`。`keep_vars = true` 建议保留，它可以避免 `wrangler deploy` 清掉 Dashboard 中配置的 `ADMIN_PASSWORD` 等变量。
@@ -144,14 +142,15 @@ wrangler secret put ADMIN_PASSWORD
 
 按提示输入强密码。`ADMIN_PASSWORD` 也是 JWT 签名密钥，修改后所有已登录会话都会失效。
 
-### 5. 执行 D1 迁移、预检并部署
+### 5. 预检并部署
 
 ```bash
 node --check worker.js
-wrangler d1 migrations apply YOUR_D1_DATABASE --remote
 wrangler deploy --dry-run
 wrangler deploy
 ```
+
+D1 表、字段和索引由 `worker.js` 在首次管理员登录或页面初始化时自动创建和升级，不需要额外执行迁移文件。
 
 `--dry-run` 输出中应该能看到这些绑定：
 

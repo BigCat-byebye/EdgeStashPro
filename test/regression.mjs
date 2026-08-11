@@ -1282,6 +1282,28 @@ async function testD1ReadModelHotPaths() {
 }
 
 function testStaticContracts() {
+  const schemaStart = workerSource.indexOf('async function ensureD1Schema(env)');
+  const schemaEnd = workerSource.indexOf('\nconst USER_PERMISSIONS_DDL', schemaStart);
+  const schemaSource = workerSource.slice(schemaStart, schemaEnd);
+  const standaloneSchemaTables = [
+    'search_items',
+    'favorites',
+    'recent_items',
+    'share_links',
+    'share_items',
+    'app_stats',
+    'reader_bookmarks',
+    'reader_progress',
+    'txt_index_files',
+    'txt_index_chunks'
+  ];
+  assert.ok(schemaStart >= 0 && schemaEnd > schemaStart, 'the standalone Worker must expose runtime D1 initialization');
+  for (const table of standaloneSchemaTables) {
+    assert.match(schemaSource, new RegExp('CREATE TABLE IF NOT EXISTS\\s+' + table + '\\b'), `runtime D1 initialization must create ${table}`);
+  }
+  assert.match(workerSource, /const USER_PERMISSIONS_DDL = \[/, 'the standalone Worker must bundle user permission schema');
+  assert.match(workerSource, /const FILE_TASKS_DDL = \[/, 'the standalone Worker must bundle file task schema');
+
   const txtBranchStart = workerSource.indexOf("if (ext === 'txt')");
   const txtBranchEnd = workerSource.indexOf('await renderTxtReader(content, path, options && options.txtJump);', txtBranchStart)
     + 'await renderTxtReader(content, path, options && options.txtJump);'.length;
