@@ -527,6 +527,14 @@ class MemoryD1 {
     }
     if (table === 'app_stats') return { results: rows.filter(row => row.key === args[0]) };
     if (table === 'reader_bookmarks') {
+      if (compact.includes('select id') && compact.includes('coalesce(anchor_ratio')) {
+        return {
+          results: rows.filter(row => row.owner_key === args[0]
+            && row.path === args[1]
+            && Math.abs(Number(row.char_offset || 0) - Number(args[2] || 0)) <= 2
+            && Math.abs(Number(row.anchor_ratio || 0) - Number(args[3] || 0)) <= 0.002)
+        };
+      }
       return {
         results: rows.filter(row => row.owner_key === args[0]
           && row.path === args[1]
@@ -967,6 +975,7 @@ async function testReaderProgressAndBookmarks() {
       path: '/notes.txt',
       charOffset: 4,
       byteOffset: 4,
+      anchorRatio: 0.625,
       sourceEtag: '"txt-v1"',
       progress: 0.25,
       snippet: 'bookmarkable'
@@ -978,7 +987,23 @@ async function testReaderProgressAndBookmarks() {
   assert.equal(bookmarks.status, 200);
   const bookmarkBody = await bookmarks.json();
   assert.equal(bookmarkBody.bookmarks[0].byteOffset, 4);
+  assert.equal(bookmarkBody.bookmarks[0].anchorRatio, 0.625, 'bookmarks must preserve the position within a large TXT chunk');
   assert.equal(bookmarkBody.bookmarks[0].sourceEtag, '"txt-v1"');
+
+  const secondBookmark = await request('/api/reader/bookmarks', env, cookie, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      path: '/notes.txt',
+      charOffset: 4,
+      byteOffset: 4,
+      anchorRatio: 0.2,
+      sourceEtag: '"txt-v1"',
+      progress: 0.1,
+      snippet: 'another position in the same chunk'
+    })
+  });
+  assert.equal(secondBookmark.status, 201, 'different positions in the same large TXT chunk must allow separate bookmarks');
 
   await env.R2_BUCKET.put('notes.txt', encoder.encode('changed text'));
   await request('/api/txt/meta?path=%2Fnotes.txt', env, cookie);
@@ -1335,9 +1360,17 @@ function testStaticContracts() {
   assert.match(workerSource, /result\s*&&\s*result\.chunkByteOffset/, 'direct TXT jumps must consume indexed byte-page offsets');
   assert.match(workerSource, /result\s*&&\s*result\.chunkCharOffset/, 'direct TXT jumps must consume indexed character-page offsets');
   assert.match(workerSource, /anchorRatio/, 'reader progress must retain a location within the current chunk');
+  assert.match(workerSource, /body:\s*JSON\.stringify\(\{ path: state\.path, charOffset, byteOffset, anchorRatio, sourceEtag:/, 'bookmark saves must include their in-chunk anchor');
+  assert.match(workerSource, /bookmark\.anchorRatio === null \|\| bookmark\.anchorRatio === undefined/, 'legacy bookmarks must derive an in-chunk anchor from their saved progress');
   assert.match(workerSource, /@media\s*\(prefers-reduced-motion:\s*reduce\)/, 'new TXT reader motion must respect reduced-motion preferences');
   assert.match(workerSource, /\.preview-actions\s*>\s*\.btn\s*\{\s*display:\s*none;/, 'mobile styles must hide only direct desktop actions');
   assert.doesNotMatch(workerSource, /\.preview-actions\s+\.btn\s*\{\s*display:\s*none;/, 'mobile styles must not hide search and bookmark panel buttons');
+  assert.doesNotMatch(workerSource, /id="globalTxtSearchToggle"/, 'the main search toolbar must not expose the obsolete TXT full-text toggle');
+  assert.match(workerSource, /\.view-toolbar\s*\{[^}]*align-items:\s*flex-start;[^}]*flex-wrap:\s*nowrap;/s, 'desktop view tabs and search tools must share one top-aligned row');
+  assert.match(workerSource, /\.search-tools \.form-input\s*\{[^}]*height:\s*36px;/s, 'desktop search controls must match the view-tab control height');
+  assert.match(workerSource, /\.search-tools \.tag-filter\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*flex-start;/s, 'the tag-filter wrapper must not baseline-shift its trigger below adjacent controls');
+  assert.match(workerSource, /\.tag-filter-trigger\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*center;[^}]*vertical-align:\s*top;/s, 'the tag-filter trigger must fill and top-align within its toolbar slot');
+  assert.match(workerSource, /\.search-tools \.tag-filter\s*\{[^}]*grid-column:\s*1 \/ -1;/s, 'mobile tag filtering must retain a full-width row after removing the TXT toggle');
 
   assert.match(workerSource, /fetch\('\/api\/txt\/open\?'/, 'TXT opening must aggregate progress, metadata, and nearby content into one request');
   assert.match(workerSource, /indexedDB\.open\(TXT_CACHE_DB_NAME/, 'TXT content must use a persistent device-local IndexedDB cache');

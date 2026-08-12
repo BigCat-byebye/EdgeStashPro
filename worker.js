@@ -4221,6 +4221,9 @@ function readerBookmarkToClient(row) {
     path: row.path,
     charOffset: Number(row.char_offset || 0),
     byteOffset: row.source_etag ? Number(row.byte_offset || 0) : null,
+    anchorRatio: row.anchor_ratio === null || row.anchor_ratio === undefined
+      ? null
+      : Number(row.anchor_ratio),
     sourceEtag: row.source_etag || null,
     progress: Number(row.progress || 0),
     snippet: row.snippet || '',
@@ -4252,6 +4255,7 @@ async function handleReaderBookmarks(request, env) {
   if (auth instanceof Response) return auth;
 
   try {
+    await ensureD1Schema(env);
     const ownerKey = ownerKeyFromAuth(auth);
 
     if (request.method === 'GET') {
@@ -4262,7 +4266,7 @@ async function handleReaderBookmarks(request, env) {
       );
       if (checked.error) return checked.error;
       const result = await env.D1_DB.prepare(`
-        SELECT id, path, char_offset, byte_offset, source_etag, progress, snippet, created_at
+        SELECT id, path, char_offset, byte_offset, anchor_ratio, source_etag, progress, snippet, created_at
         FROM reader_bookmarks
         WHERE owner_key = ? AND path = ?
           AND (source_etag IS NULL OR source_etag = ?)
@@ -4281,6 +4285,7 @@ async function handleReaderBookmarks(request, env) {
       if (checked.error) return checked.error;
       const charOffset = Math.floor(normalizeReaderNumber(body.charOffset, 0, 0, Number.MAX_SAFE_INTEGER));
       const byteOffset = Math.floor(normalizeReaderNumber(body.byteOffset, 0, 0, checked.size));
+      const anchorRatio = normalizeReaderNumber(body.anchorRatio, 0, 0, 1);
       if (body.sourceEtag && body.sourceEtag !== checked.sourceEtag) {
         return jsonResponse({ success: false, message: '文件已变化，请重新加载' }, 412, { ETag: checked.sourceEtag });
       }
@@ -4289,8 +4294,9 @@ async function handleReaderBookmarks(request, env) {
       const duplicate = await env.D1_DB.prepare(`
         SELECT id FROM reader_bookmarks
         WHERE owner_key = ? AND path = ? AND ABS(char_offset - ?) <= 2
+          AND ABS(COALESCE(anchor_ratio, 0) - ?) <= 0.002
         LIMIT 1
-      `).bind(ownerKey, checked.filePath, charOffset).first();
+      `).bind(ownerKey, checked.filePath, charOffset, anchorRatio).first();
       if (duplicate) {
         return jsonResponse({ success: false, message: '当前位置已经有书签' }, 409);
       }
@@ -4299,20 +4305,22 @@ async function handleReaderBookmarks(request, env) {
         path: checked.filePath,
         charOffset,
         byteOffset,
+        anchorRatio,
         sourceEtag: checked.sourceEtag,
         progress,
         snippet,
         createdAt: Date.now()
       };
       await env.D1_DB.prepare(`
-        INSERT INTO reader_bookmarks (id, owner_key, path, char_offset, byte_offset, source_etag, progress, snippet, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO reader_bookmarks (id, owner_key, path, char_offset, byte_offset, anchor_ratio, source_etag, progress, snippet, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).bind(
         bookmark.id,
         ownerKey,
         bookmark.path,
         bookmark.charOffset,
         bookmark.byteOffset,
+        bookmark.anchorRatio,
         bookmark.sourceEtag,
         bookmark.progress,
         bookmark.snippet,
@@ -5493,7 +5501,7 @@ async function handleAdminTxtRebuild(request, env) {
 // D1 SEARCH, FAVORITES, AND RECENT VISITS
 // ============================================================================
 
-const D1_SCHEMA_KV_KEY = 'd1:schema:v5-reader-progress';
+const D1_SCHEMA_KV_KEY = 'd1:schema:v6-bookmark-anchor';
 const D1_SCHEMA_TAGS_KV_KEY = 'd1:schema:v2-tags';
 
 async function ensureD1Schema(env) {
@@ -5582,6 +5590,7 @@ async function ensureD1Schema(env) {
       path TEXT NOT NULL,
       char_offset INTEGER NOT NULL DEFAULT 0,
       byte_offset INTEGER NOT NULL DEFAULT 0,
+      anchor_ratio REAL,
       source_etag TEXT,
       progress REAL NOT NULL DEFAULT 0,
       snippet TEXT NOT NULL DEFAULT '',
@@ -5655,6 +5664,7 @@ async function ensureD1Schema(env) {
     ['share_items', 'resource_version', 'ALTER TABLE share_items ADD COLUMN resource_version TEXT'],
     ['share_items', 'resource_etag', 'ALTER TABLE share_items ADD COLUMN resource_etag TEXT'],
     ['reader_bookmarks', 'byte_offset', 'ALTER TABLE reader_bookmarks ADD COLUMN byte_offset INTEGER NOT NULL DEFAULT 0'],
+    ['reader_bookmarks', 'anchor_ratio', 'ALTER TABLE reader_bookmarks ADD COLUMN anchor_ratio REAL'],
     ['reader_bookmarks', 'source_etag', 'ALTER TABLE reader_bookmarks ADD COLUMN source_etag TEXT'],
     ['user_permissions', 'resource_key', 'ALTER TABLE user_permissions ADD COLUMN resource_key TEXT'],
     ['user_permissions', 'resource_version', 'ALTER TABLE user_permissions ADD COLUMN resource_version TEXT'],
@@ -7456,60 +7466,6 @@ const CSS_STYLES = `
     margin-top: 10px;
   }
 
-  .txt-global-toggle {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 13px;
-    color: var(--text);
-    white-space: nowrap;
-    cursor: pointer;
-    user-select: none;
-  }
-
-  .txt-global-toggle input {
-    width: auto;
-    margin: 0;
-  }
-
-  .txt-global-result {
-    display: block;
-    padding: 12px 14px;
-    text-align: left;
-    cursor: pointer;
-  }
-
-  .txt-global-result-title {
-    font-weight: 600;
-    margin-bottom: 6px;
-    overflow-wrap: anywhere;
-  }
-
-  .txt-global-result-pos {
-    color: var(--text-muted);
-    font-weight: 400;
-    font-size: 12px;
-  }
-
-  .txt-global-result-snippet {
-    color: var(--text-muted);
-    font-size: 13px;
-    line-height: 1.6;
-    margin-bottom: 10px;
-    overflow-wrap: anywhere;
-    display: -webkit-box;
-    -webkit-line-clamp: 3;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-  }
-
-  .txt-global-result-snippet mark {
-    padding: 0 2px;
-    border-radius: 3px;
-    background: color-mix(in srgb, var(--warning) 55%, transparent);
-    color: inherit;
-  }
-
   .txt-reader-chunk {
     display: block;
     min-height: 1.85em;
@@ -8682,11 +8638,11 @@ const CSS_STYLES = `
 
   .view-toolbar {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
     gap: 10px;
     margin-bottom: 12px;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
   }
 
   .view-tabs {
@@ -8735,7 +8691,7 @@ const CSS_STYLES = `
   .search-tools .form-input {
     flex: 1 1 auto;
     min-width: 150px;
-    height: 34px;
+    height: 36px;
     padding: 6px 10px;
     margin: 0;
     font-size: 13px;
@@ -8743,21 +8699,27 @@ const CSS_STYLES = `
 
   .search-tools .form-select {
     width: 96px;
-    height: 34px;
+    height: 36px;
     padding: 6px 28px 6px 10px;
     margin: 0;
     font-size: 13px;
   }
 
   .search-tools .tag-filter {
+    display: flex;
+    align-items: flex-start;
     position: relative;
     width: 150px;
-    height: 34px;
+    height: 36px;
+    line-height: 1;
   }
 
   .tag-filter-trigger {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
     width: 100%;
-    height: 34px;
+    height: 36px;
     padding: 6px 28px 6px 10px;
     margin: 0;
     font-size: 13px;
@@ -8766,6 +8728,7 @@ const CSS_STYLES = `
     overflow: hidden;
     white-space: nowrap;
     text-overflow: ellipsis;
+    vertical-align: top;
   }
 
   .tag-filter-trigger #tagFilterLabel {
@@ -9088,6 +9051,7 @@ const CSS_STYLES = `
 
     .search-tools .tag-filter {
       width: 100%;
+      grid-column: 1 / -1;
     }
 
     .search-tools .btn {
@@ -9488,9 +9452,6 @@ const FIXED_INDEX_PAGE = `
           <option value="files">文件</option>
           <option value="folders">文件夹</option>
         </select>
-        <label class="txt-global-toggle" title="在 .txt 小说正文中搜索并跳转到匹配位置">
-          <input type="checkbox" id="globalTxtSearchToggle" onchange="handleSearchTypeChange()"> 全文(.txt)
-        </label>
         <div class="tag-filter" id="tagFilterWrap">
           <button type="button" id="tagFilterTrigger" class="form-select tag-filter-trigger" onclick="toggleTagFilterMenu(event)" title="按标签筛选" aria-haspopup="listbox" aria-expanded="false">
             <span id="tagFilterLabel">标签</span>
@@ -10479,24 +10440,11 @@ const FIXED_INDEX_PAGE = `
     async function runSearch(refresh) {
       const q = document.getElementById('globalSearchInput').value.trim();
       const tags = getSelectedTagFilters();
-      const txtToggle = document.getElementById('globalTxtSearchToggle');
-      const txtGlobal = txtToggle && txtToggle.checked;
       if (globalSearchAbortController) globalSearchAbortController.abort();
       globalSearchAbortController = new AbortController();
       if (!q && tags.length === 0) {
         const requestId = ++globalSearchRequestId;
         await loadFiles({ searchRequestId: requestId });
-        return;
-      }
-
-      if (txtGlobal && q) {
-        const requestId = ++globalSearchRequestId;
-        try {
-          await runGlobalTxtSearch(q, requestId);
-        } catch (error) {
-          if (error && error.name === 'AbortError') return;
-          if (requestId === globalSearchRequestId) showToast('全文搜索失败: ' + error.message, 'error');
-        }
         return;
       }
 
@@ -10533,125 +10481,6 @@ const FIXED_INDEX_PAGE = `
       } finally {
         if (refresh) showLoading(false);
       }
-    }
-
-    let globalTxtSearchCursor = null;
-    let globalTxtSearchQuery = '';
-
-    async function runGlobalTxtSearch(query, requestId, cursor) {
-      currentView = 'search';
-      updateViewTabs();
-      clearSelection(false);
-      showLoading(true);
-      try {
-        const params = new URLSearchParams({ q: query, limit: '20' });
-        if (cursor) params.set('cursor', cursor);
-        const response = await fetch('/api/txt/search/global?' + params.toString(), {
-          signal: globalSearchAbortController ? globalSearchAbortController.signal : undefined
-        });
-        const data = await response.json();
-        if (requestId !== globalSearchRequestId) return;
-        if (!data.success) throw new Error(data.message || '全文搜索失败');
-        if (!cursor) {
-          globalTxtSearchQuery = query;
-          globalTxtSearchCursor = null;
-        }
-        document.getElementById('viewTitle').textContent = '小说全文搜索结果';
-        renderTxtGlobalResults(data, !!cursor);
-      } finally {
-        if (requestId === globalSearchRequestId) showLoading(false);
-      }
-    }
-
-    function renderTxtGlobalResults(data, append) {
-      const fileList = document.getElementById('fileList');
-      const emptyState = document.getElementById('emptyState');
-      if (!append) fileList.replaceChildren();
-
-      const results = data.results || [];
-      if (!append && results.length === 0) {
-        emptyState.style.display = 'block';
-        emptyState.querySelector('div:last-child').textContent = data.hasMore
-          ? '本页没有匹配项，可加载下一页继续查找'
-          : '没有匹配的正文内容（仅搜索已建立索引的 .txt 文件）';
-      } else {
-        emptyState.style.display = 'none';
-      }
-
-      results.forEach(function (result) {
-        const card = document.createElement('div');
-        card.className = 'file-item txt-global-result';
-
-        const title = document.createElement('div');
-        title.className = 'txt-global-result-title';
-        title.textContent = '📖 ' + (result.name || result.path);
-        if (Number.isFinite(Number(result.progressPercent))) {
-          const pos = document.createElement('span');
-          pos.className = 'txt-global-result-pos';
-          pos.textContent = ' 约 ' + Number(result.progressPercent).toFixed(2).replace(/\.00$/, '') + '% 处';
-          title.appendChild(pos);
-        }
-
-        const snippet = document.createElement('div');
-        snippet.className = 'txt-global-result-snippet';
-        const before = document.createElement('span');
-        before.textContent = result.snippetBefore || '';
-        const match = document.createElement('mark');
-        match.textContent = result.match || globalTxtSearchQuery;
-        const after = document.createElement('span');
-        after.textContent = result.snippetAfter || '';
-        snippet.append(before, match, after);
-
-        const jumpBtn = document.createElement('button');
-        jumpBtn.type = 'button';
-        jumpBtn.className = 'btn btn-sm btn-primary';
-        jumpBtn.textContent = '跳转到此处';
-        jumpBtn.addEventListener('click', function (event) {
-          event.stopPropagation();
-          previewFile(result.path, 'text', result.name || nameFromPathClient(result.path), {
-            txtJump: {
-              charOffset: Number(result.charOffset),
-              matchLength: Number(result.matchLength || globalTxtSearchQuery.length),
-              query: globalTxtSearchQuery,
-              // Indexed global-search hits retain the start of their D1 text
-              // page. Start the reader there rather than decoding the entire
-              // novel from byte zero before a distant result can be shown.
-              chunkByteOffset: Number(result.chunkByteOffset),
-              chunkCharOffset: Number(result.chunkCharOffset)
-            }
-          });
-        });
-
-        card.append(title, snippet, jumpBtn);
-        card.addEventListener('click', function () { jumpBtn.click(); });
-        fileList.appendChild(card);
-      });
-
-      const oldMore = document.getElementById('txtGlobalMoreBtn');
-      if (oldMore) oldMore.remove();
-      if (data.hasMore && data.nextCursor) {
-        globalTxtSearchCursor = data.nextCursor;
-        const more = document.createElement('button');
-        more.type = 'button';
-        more.id = 'txtGlobalMoreBtn';
-        more.className = 'btn btn-secondary';
-        more.style.marginTop = '12px';
-        more.textContent = '加载下一页';
-        more.addEventListener('click', function () {
-          const requestId = globalSearchRequestId;
-          runGlobalTxtSearch(globalTxtSearchQuery, requestId, globalTxtSearchCursor).catch(function (error) {
-            showToast('全文搜索失败: ' + error.message, 'error');
-          });
-        });
-        fileList.appendChild(more);
-      } else {
-        globalTxtSearchCursor = null;
-      }
-    }
-
-    function nameFromPathClient(path) {
-      const parts = String(path || '').split('/').filter(Boolean);
-      return parts.length > 0 ? parts[parts.length - 1] : path;
     }
 
     async function refreshCurrentDirectory() {
@@ -12109,6 +11938,7 @@ const FIXED_INDEX_PAGE = `
       if (!position) return;
       const byteOffset = position.chunk.byteStart;
       const charOffset = position.chunk.charStart;
+      const anchorRatio = position.anchorRatio;
       const progress = Number(state.meta.size || 0) > 0
         ? Math.max(0, Math.min(1, position.estimatedByteOffset / Number(state.meta.size)))
         : 0;
@@ -12117,7 +11947,7 @@ const FIXED_INDEX_PAGE = `
         const response = await fetch('/api/reader/bookmarks', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: state.path, charOffset, byteOffset, sourceEtag: state.meta.etag, progress, snippet })
+          body: JSON.stringify({ path: state.path, charOffset, byteOffset, anchorRatio, sourceEtag: state.meta.etag, progress, snippet })
         });
         const data = await response.json();
         if (!response.ok || !data.success) throw new Error(data.message || '添加书签失败');
@@ -12141,7 +11971,21 @@ const FIXED_INDEX_PAGE = `
             chunkByteOffset: Number(bookmark.byteOffset),
             chunkCharOffset: Number(bookmark.charOffset)
           });
-          if (jumped) jumped = await scrollReaderToByteOffset(state, Number(bookmark.byteOffset));
+          if (jumped) {
+            const chunk = findTxtChunkByByte(state, Number(bookmark.byteOffset));
+            let anchorRatio = bookmark.anchorRatio === null || bookmark.anchorRatio === undefined
+              ? NaN
+              : Number(bookmark.anchorRatio);
+            if (!Number.isFinite(anchorRatio) && chunk && chunk.byteEnd > chunk.byteStart) {
+              const estimatedByteOffset = Number(bookmark.progress || 0) * Number(state.meta.size || 0);
+              anchorRatio = (estimatedByteOffset - chunk.byteStart) / (chunk.byteEnd - chunk.byteStart);
+            }
+            jumped = await scrollReaderToByteOffset(
+              state,
+              Number(bookmark.byteOffset),
+              Number.isFinite(anchorRatio) ? Math.max(0, Math.min(1, anchorRatio)) : 0
+            );
+          }
         }
         if (!jumped) jumped = await scrollReaderToCharOffset(state, bookmark.charOffset);
         if (!jumped) scrollReaderToProgress(state, bookmark.progress);
