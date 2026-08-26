@@ -1,0 +1,32 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "edgestashpro",
+  "main": "src/index.js",
+  "compatibility_date": "2026-05-15",
+  "keep_vars": true,
+  "vars": {
+    "ENVIRONMENT": "self-hosted"
+  },
+  "secrets": {
+    "required": [
+      "ADMIN_PASSWORD",
+      "STORAGE_CONFIG_KEY"
+    ]
+  },
+  "kv_namespaces": [
+    {
+      "binding": "KV_STORE"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "D1_DB",
+      "database_name": "edgestashpro-db"
+    }
+  ],
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  }
+}

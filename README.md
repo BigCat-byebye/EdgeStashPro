@@ -1,14 +1,17 @@
 # EdgeStashPro
 
-EdgeStashPro 是一个单文件 Cloudflare Worker 网盘。核心代码在 `worker.js`，页面、样式、前端交互和后端逻辑都内嵌在这个 Worker 中；文件存储使用 Cloudflare R2，用户和管理员 OTP 状态使用 Workers KV，虚拟目录树、搜索索引、跨设备阅读进度、收藏、最近访问、分享、统计和文件任务使用 Cloudflare D1。
+EdgeStashPro 是一个运行在 Cloudflare Workers 上的多存储云盘。项目已经从早期的单文件 Worker 演进为多模块源码：Worker 入口、认证、D1 数据模型、S3 适配器、同步任务和页面模板分别维护。
 
-项目当前需要 R2、KV、D1 和 `ADMIN_PASSWORD`，不需要单独构建前端，也不需要额外的运行时服务。
+作者维护和验收使用隔离的 `-dev` 环境：
 
+- Worker：`edgestash-dev`
+- D1：`edgestash-d1-dev`
+- KV：`edgestash-kv-dev`
+- 可选的开发 R2 桶：`edgestash-storage-dev`
+
+公开自托管部署使用通用的 `wrangler.jsonc` 和 README 中的 Deploy to Cloudflare 按钮；它不会复用作者的 `-dev` 资源。生产 Worker、生产 D1、生产 KV 和生产存储不属于作者当前的验收部署路径。不要把任何真实生产资源 ID、Secret 或凭证写入仓库。
 
 ![预览图片](merged-images.png)
-
-### 备注
-Fork 来自 https://github.com/hhy-2021/EdgeStash，做了一些自己需要用的增强。
 
 ## 在线 Demo
 
@@ -18,481 +21,451 @@ Fork 来自 https://github.com/hhy-2021/EdgeStash，做了一些自己需要用�
 https://s3.zxhf.dev/
 ```
 
-测试用户：
+Demo credentials are intentionally not included in this repository. Use only credentials provided through the Demo's own onboarding channel, and never reuse them for a real deployment.
+
+## 重大架构变化
+
+### 旧结构
+
+早期版本主要依赖：
 
 ```txt
-账号：test@test.com
-密码：test@test.com
+worker.js
+wrangler.toml
+R2_BUCKET binding
 ```
 
-测试账号是普通授权用户，只能访问管理员授予的文件或目录，权限以 Demo 环境当前配置为准。
+后端、页面、样式和前端脚本全部嵌在一个 `worker.js` 中。
 
-## 产品特性
+### 当前结构
+
+现在的 Worker 入口是 `src/index.js`，不再存在根目录 `worker.js`，也不再使用 `wrangler.toml.example` 或生产部署脚本。
+
+```txt
+src/
+├── index.js                 Worker fetch/scheduled 入口、路由和业务 API
+├── common.js                路径、响应、JWT、密码哈希、OTP、MIME 等公共函数
+├── auth.js                  管理员/普通用户登录、OTP、JWT 会话
+├── admin.js                 管理员 API：用户、分享、统计和存储管理
+├── db/
+│   ├── schema.js            D1 运行时迁移和表结构
+│   └── catalog.js            D1 目录、搜索和资源模型
+├── storage/
+│   ├── s3.js                唯一的 S3 SigV4 适配器
+│   ├── credentials.js       存储凭证 AES-256-GCM 加解密
+│   ├── repository.js        动态存储连接仓库
+│   ├── service.js            存储连接业务操作
+│   └── sync.js               可恢复的远端扫描和同步任务
+└── pages/
+    ├── login.js              登录页模板和交互
+    ├── index.js              云盘首页模板和交互
+    ├── admin.js              管理后台模板和交互
+    ├── share.js              分享页模板和交互
+    ├── styles.js             共享样式
+    └── theme.js              主题初始化和切换
+
+scripts/
+├── provision-dev.mjs         创建/复用隔离的 -dev 资源并写入 wrangler.jsonc
+├── init-dev-secrets.mjs      首次生成 .dev.vars 中的开发 Secret
+├── assert-dev-config.mjs     部署前的 dev-only 安全门禁
+├── deploy-dev.mjs            初始化 Secret、检查配置并部署 edgestash-dev
+└── verify-dev.mjs            校验配置、版本、URL 和登录页
+
+test/
+├── regression.mjs            Worker、认证、权限、分享、TXT 和 D1 热路径回归
+├── storage.mjs               S3、加密、SigV4、Range 和流式 I/O 回归
+├── sync.mjs                  多存储同步隔离和分页回归
+├── lifecycle.mjs              迁移、存储生命周期和凭证安全回归
+└── explore-reader-jump.mjs   阅读器诊断脚本
+```
+
+页面仍然是原生 HTML/CSS/JavaScript 模板，不引入 React、Hono、TypeScript 或独立前端构建产物。
+
+## 产品能力
 
 - 文件管理：上传文件、上传文件夹、下载、删除、重命名、创建文件夹。
-- 批量操作：批量复制、移动、删除和打包下载；批量下载由浏览器原生下载 ZIP 压缩包。
-- 后台任务：上传、下载、复制、移动和批量删除会进入顶部任务状态栏，可查看进度、历史状态、停止或删除任务。
-- 目录浏览：支持中文路径、中文文件名；D1 是页面元数据的权威读模型，打开目录、搜索、收藏、最近访问、标签和分享信息都不扫描 R2。
-- 搜索：支持按名称、路径或标签即时搜索，可筛选全部、文件、文件夹。
-- 小说正文搜索：可在 TXT 阅读器内搜索当前小说正文，并直接跳转到匹配段落。
-- 标签：可为文件/文件夹维护标签，并在搜索结果、收藏、最近访问和目录列表中展示。
-- 收藏和最近访问：支持文件/文件夹收藏、最近访问列表。
-- 在线预览：图片、PDF、文本、Markdown、音视频、docx。
-- TXT 阅读：支持常见中文编码、字号调节、账号级跨设备阅读进度、IndexedDB 附近正文缓存、D1 索引快速打开和多书签跳转。
-- 日间/夜间模式：登录、云盘、管理后台和分享页面均可一键切换，并记住浏览器偏好。
-- 分享链接：支持单个或多个文件/目录公开分享、只读目录浏览、可选密码、过期时间、二维码、浏览和下载统计。
-- 用户体系：管理员账号和授权用户账号分离。
-- 路径权限：可按文件或目录给普通用户授权，支持查看、预览、下载、上传、修改、删除和分享。
-- 管理后台：查看统计、管理分享、添加、删除和编辑授权用户。
-- 授权选择器：添加或编辑用户时支持搜索文件/目录、多选资源和权限模板。
-- 管理员安全：管理员登录需要 `ADMIN_PASSWORD` 加 OTP 一次性验证码。
-- OTP 初始化：首次管理员登录会显示二维码和 Secret，二维码由登录页原生 Canvas 生成，不依赖外部 CDN。
+- 批量操作：复制、移动、删除、ZIP 打包下载和任务进度。
+- 多存储：管理员可以动态配置多个 S3 兼容存储，并在首页和后台切换当前存储。
+- 存储隔离：目录、搜索、标签、收藏、最近访问、TXT 阅读、分享和权限均带 `storage_id` 作用域。
+- S3 适配器：统一处理 ListObjectsV2、Head、Get、Range、Put、Copy、Delete 和 SigV4。
+- 远端同步：手工刷新和 Cron 扫描都进入可恢复的 D1 同步作业，不在目录浏览时直接扫描远端。
+- 搜索：按名称、路径、类型和标签搜索。
+- TXT 阅读：支持常见中文编码、正文索引、分片读取、跨设备阅读进度和书签。
+- 在线预览：图片、PDF、文本、Markdown、音视频和 docx。
+- 分享链接：支持多文件/目录、密码、过期时间、只读目录浏览、二维码、浏览和下载统计。
+- 用户权限：管理员可以按文件或目录授权普通用户，并配置查看、预览、下载、上传、修改、删除和分享权限。
+- 管理后台：统计、分享链接、授权用户、存储连接和同步任务。
+- 日间/夜间模式：登录页、云盘、后台和分享页均支持主题切换。
 
-## 文件结构
+## Cloudflare 资源和绑定
 
-```txt
-worker.js    # Cloudflare Worker 主文件，包含后端和内嵌页面
-README.md    # 部署和使用说明
-merged-images.png       # README 预览图
-wrangler.toml.example    # Wrangler 部署配置示例
-```
+当前 `wrangler.jsonc` 只声明 D1、KV 和 Cron，不声明 R2 binding：
 
-## Cloudflare 资源
+| 资源 | 名称 | Binding | 用途 |
+| --- | --- | --- | --- |
+| Worker | `edgestash-dev` | — | 单个 Worker 入口 `src/index.js` |
+| D1 | `edgestash-d1-dev` | `D1_DB` | 目录、搜索、权限、分享、任务和存储元数据 |
+| KV | `edgestash-kv-dev` | `KV_STORE` | 用户账号、管理员 OTP、旧阅读状态迁移 |
+| R2 | `edgestash-storage-dev` | 无 | 可作为 S3 兼容后端，由后台动态连接 |
 
-部署前需要准备三个 Cloudflare 资源：
+R2 不再通过 `R2_BUCKET` binding 直接访问。Cloudflare R2、AWS S3、阿里云 OSS、腾讯云 COS、MinIO 等服务都通过 S3 兼容接口配置到后台。
 
-| 资源 | Binding 名 | 用途 |
-| --- | --- | --- |
-| R2 Bucket | `R2_BUCKET` | 保存上传的文件 |
-| KV Namespace | `KV_STORE` | 保存用户、管理员 OTP，以及兼容旧版本阅读进度迁移 |
-| D1 Database | `D1_DB` | 保存虚拟目录树/资源搜索索引、TXT 正文分片索引、账号级阅读进度、收藏、最近访问、TXT 书签、分享链接、统计、用户路径权限和文件任务 |
+### Secret
 
-环境变量：
-
-| 变量名 | 用途 |
+| Secret | 用途 |
 | --- | --- |
-| `ADMIN_PASSWORD` | 管理员密码，也是当前 JWT 签名密钥 |
+| `ADMIN_PASSWORD` | 管理员密码，同时作为 JWT 签名密钥 |
+| `STORAGE_CONFIG_KEY` | AES-256-GCM 加密动态存储凭证 |
 
-Binding 名必须和代码一致。如果你改了 binding 名，需要同步改 `worker.js` 和 `wrangler.toml`。
+存储连接的 Access Key、Secret Key 和 Session Token 只保存加密后的密文；API、列表、日志和错误响应不会返回原始凭证。
 
-TXT 阅读进度、书签和正文分片索引直接使用 D1。同一账号同一本书只有一条全局阅读进度，手机、平板和电脑会接续最新版本；旧 KV 阅读进度会在首次读取时自动迁移。已建立正文索引的小说会从 D1 一次返回进度和附近正文，索引不可用时回退到 R2 Range。每台设备使用 IndexedDB 保存有限数量的附近正文分片，缓存只负责加速，不产生设备独立进度。正文索引只针对 `.txt` 文件：新上传的 `.txt` 会在上传完成后自动在后台建立索引；也可以在管理后台一次性批量重建全部小说索引；此外打开某本小说后首次搜索正文时，也会按需为该书建立索引并显示进度。主题和字号偏好保存在浏览器本地。这些功能不会创建 Durable Objects、Cron Trigger、Queue、Workflow 或其他 Cloudflare 资源。
+## 本地准备
 
-## Wrangler 部署流程
-
-推荐使用 Wrangler 部署。这样 Worker 代码和 R2/KV/D1 绑定会一起由 `wrangler.toml` 管理，后续更新不需要在 Dashboard 中手工粘贴代码。
-
-### 1. 安装并登录 Wrangler
+要求 Node.js 22 或更高版本：
 
 ```bash
-npm install -g wrangler
-wrangler login
-wrangler whoami
+npm ci
+npx wrangler login
+npx wrangler whoami
 ```
 
-如果已经在本机配置并认证好 Wrangler，可以跳过安装和登录。
-
-### 2. 创建 Cloudflare 资源
-
-可以在 Dashboard 中创建 R2 Bucket、KV Namespace 和 D1 Database，也可以用 Wrangler 创建：
+如果是首次配置开发环境，先创建或复用隔离资源：
 
 ```bash
-wrangler r2 bucket create YOUR_R2_BUCKET
-wrangler kv namespace create KV_STORE
-wrangler d1 create YOUR_D1_DATABASE
+npm run provision:dev
 ```
 
-记下输出中的 KV namespace ID、D1 database name 和 D1 database ID。
-
-### 3. 创建并修改 `wrangler.toml`
-
-仓库已包含 `wrangler.toml.example` 模板。先复制为 `wrangler.toml`，再替换其中的占位值：
-
-```bash
-cp wrangler.toml.example wrangler.toml
-```
-
-配置格式如下：
-
-```toml
-name = "your-worker-name"
-
-[[kv_namespaces]]
-binding = "KV_STORE"
-id = "YOUR_KV_NAMESPACE_ID"
-
-[[r2_buckets]]
-binding = "R2_BUCKET"
-bucket_name = "YOUR_R2_BUCKET"
-
-[[d1_databases]]
-binding = "D1_DB"
-database_name = "YOUR_D1_DATABASE"
-database_id = "YOUR_D1_DATABASE_ID"
-```
-
-`binding` 字段不要改，代码固定读取 `R2_BUCKET`、`KV_STORE`、`D1_DB`。`keep_vars = true` 建议保留，它可以避免 `wrangler deploy` 清掉 Dashboard 中配置的 `ADMIN_PASSWORD` 等变量。
-
-### 4. 设置管理员密码
-
-推荐使用 secret 保存管理员密码：
-
-```bash
-wrangler secret put ADMIN_PASSWORD
-```
-
-按提示输入强密码。`ADMIN_PASSWORD` 也是 JWT 签名密钥，修改后所有已登录会话都会失效。
-
-### 5. 预检并部署
-
-```bash
-node --check worker.js
-wrangler deploy --dry-run
-wrangler deploy
-```
-
-D1 表、字段和索引由 `worker.js` 在首次管理员登录或页面初始化时自动创建和升级，不需要额外执行迁移文件。
-
-`--dry-run` 输出中应该能看到这些绑定：
+该脚本只允许处理以下资源名：
 
 ```txt
-env.KV_STORE
-env.D1_DB
-env.R2_BUCKET
+edgestash-dev
+edgestash-d1-dev
+edgestash-kv-dev
+edgestash-storage-dev
 ```
 
-部署成功后，Wrangler 会输出 `workers.dev` 地址。如果你使用自定义域名，请在 Cloudflare Dashboard 中给该 Worker 配置 Route 或 Custom Domain。
+它会把 D1/KV ID 写入 `wrangler.jsonc`，不会删除或复用非 `-dev` 资源。
 
-### 6. 部署后验证
+## 开发和部署命令
+
+### 本地开发
+
+```bash
+npm run dev
+```
+
+该命令会在缺少 `.dev.vars` 时生成开发 Secret，然后启动 Wrangler 本地 Worker，并启用 scheduled 测试入口。默认使用本地 Wrangler 状态，不代表已经连接远端开发数据。
+
+### 配置检查
+
+```bash
+npm run check
+```
+
+`check` 会先执行 `scripts/assert-dev-config.mjs`，确认 Worker、D1、KV、环境变量和资源名均为 dev-only，然后执行 Wrangler dry-run。发现非 dev 资源、生产路由、Custom Domain、R2 binding 或缺少必要配置时会直接失败。
+
+### 测试
+
+```bash
+npm test
+```
+
+当前测试覆盖：
+
+- 认证、管理员 OTP 初始化、普通用户密码登录和 JWT 身份检查
+- 多存储路径隔离和 D1 作用域
+- 文件/目录权限、分享创建、分享下载和分享失效
+- S3 SigV4、Range、XML、流式上传下载和凭证加密
+- D1 迁移、存储生命周期、同步分页和失败恢复
+- TXT 编码识别、正文索引、阅读进度和书签
+- ZIP 文件数量限制和任务行为
+
+### 部署到开发环境
+
+```bash
+npm run deploy:dev
+```
+
+部署脚本固定执行：
+
+1. 初始化缺失的 `.dev.vars`
+2. 检查 dev-only 配置
+3. 使用 `wrangler.jsonc` 和 `.dev.vars` 部署 `edgestash-dev`
+4. 写入被忽略的 `.dev-deployment.json`
+
+部署成功后再运行：
+
+```bash
+npm run verify:dev
+```
+
+`verify:dev` 会重新检查配置，读取 `edgestash-dev` 最新版本，并确认部署 URL 的 `/login.html` 正常返回。
+
+仓库提供 `deploy` 作为通用自托管部署入口；`deploy:dev` 只用于本项目作者维护的隔离开发环境。
+
+## Dashboard 一键部署
+
+当前版本可以使用 Cloudflare 官方的 **Deploy to Cloudflare** 按钮，不需要用户手动安装 Wrangler CLI。
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/BigCat-byebye/EdgeStashPro)
+
+### 这个按钮会做什么
+
+Cloudflare 会：
+
+1. 克隆公开 GitHub/GitLab 仓库到用户自己的账号。
+2. 打开一次配置页面，让用户选择仓库名、Worker 名称和资源名称。
+3. 根据 `wrangler.jsonc` 自动创建并绑定 D1、KV 等支持的 Cloudflare 资源。
+4. 根据 `.env.example` 和 `package.json` 中的绑定说明收集必要的 Secret。
+5. 使用仓库中的 `deploy` 脚本构建并部署 Worker。
+
+官方文档：
+
+```txt
+https://developers.cloudflare.com/workers/platform/deploy-buttons/
+```
+
+### 普通用户操作步骤
+
+1. 点击上面的 **Deploy to Cloudflare** 按钮。
+2. 登录自己的 Cloudflare 和 GitHub/GitLab 账号。
+3. 在 Cloudflare 配置页确认 Worker 名称、D1 名称、KV 名称。
+4. 为以下两个 Secret 填写自己的值：
+   - `ADMIN_PASSWORD`：管理员密码。
+   - `STORAGE_CONFIG_KEY`：base64 编码的 32 字节随机密钥。
+5. 点击 Deploy，等待 Cloudflare 创建资源并完成部署。
+6. 打开部署后的 `/login.html`，使用管理员密码绑定 OTP。
+7. 进入管理后台的“存储”页面，配置自己的 S3/R2/OSS/COS/MinIO 连接。
+
+仓库中的 `.env.example` 只包含变量名和空值，不包含作者的任何 Secret。每个用户都应填写自己的密码、加密密钥和存储凭证。
+
+### 当前边界
+
+- 这个按钮适用于公开 GitHub/GitLab 的 Workers 应用，不适用于 Pages 应用。
+- 它不支持把多模块项目粘贴到 Dashboard 在线编辑器；不要只复制 `src/index.js`。
+- D1 和 KV 可以由 Cloudflare 根据 Wrangler 配置自动创建。
+- 本项目不声明 R2 binding；R2 通过 S3 API 动态连接，因此部署完成后仍需在管理后台填写 R2 的 S3 Endpoint、Bucket 和凭证。
+- Cloudflare R2 的 S3 API 凭证不会由按钮自动生成，不能把 R2 Access Key 写入仓库或 README。
+- 如果仓库设置为私有，Deploy to Cloudflare 按钮无法供其他用户使用。
+
+### 命令行部署仍然可用
+
+工程师可以继续使用：
+
+```bash
+npm ci
+npm run deploy
+```
+
+开发者维护本项目隔离环境时使用：
+
+```bash
+npm run provision:dev
+npm run deploy:dev
+npm run verify:dev
+```
+
+当前 `wrangler.jsonc` 是面向 Deploy to Cloudflare 的通用配置；作者自己的开发配置由 `provision:dev` 生成到被忽略的 `wrangler.dev.jsonc`，不会与开源一键部署混用。
+
+## 开源前安全检查
+
+当前仓库的开发 Secret 文件由 `.gitignore` 排除：
+
+```txt
+.dev.vars*
+.env* (except .env.example)
+.dev-deployment.json
+wrangler.dev.jsonc
+.wrangler/
+dist/
+```
+测试文件中的密码、Access Key 和 Secret Key 只是内存回归 fixture，不是线上凭证。README 不包含 Demo 登录密码。
+
+发布前仍需确认：
+
+- 不要提交 `.dev.vars`、`.env`、Cloudflare API Token、S3 凭证或 OTP Secret。
+- 不要提交 `wrangler.dev.jsonc`；它由 `provision-dev` 生成并包含当前账号的开发资源 ID。公开部署只使用通用的 `wrangler.jsonc`。
+- 为真实用户部署前，应把普通用户密码从无盐 SHA-256 升级为带随机盐的慢哈希，并增加登录限流/失败锁定。
+- 管理员密码必须是随机长密码，OTP 必须由每个部署者重新绑定。
+
+## 动态存储配置
+
+部署 Worker 后，管理员进入：
+
+```txt
+管理后台 -> 存储
+```
+
+添加 S3 兼容连接，需要填写：
+
+- 名称
+- S3 Endpoint
+- Region
+- Bucket
+- Path style 或 Virtual host style
+- Access Key ID
+- Secret Access Key
+- 可选 Session Token
+- 自动同步间隔
+
+保存前会通过 ListObjectsV2 测试连接。连接保存后可以：
+
+- 设为默认存储
+- 手动同步
+- 停用/启用
+- 编辑名称、计划和凭证
+- 删除连接
+
+首页右上角和管理后台使用同一个存储选择器。切换存储时，目录回到根目录，当前缓存、选中项、标签状态和视图数据都会按新存储重新加载。
+
+### 同步模型
+
+- 目录浏览、搜索、收藏、最近访问和权限资源搜索只读 D1，不自动 List/Head 远端。
+- 页面“刷新”会创建当前目录前缀的同步作业，接口立即返回，前端显示排队/同步/完成/失败状态。
+- Cron 每分钟检查到期存储并继续可恢复的扫描作业。
+- 扫描使用 continuation token、scan ID 和 lease，失败时保留旧目录，不执行危险的 stale sweep。
+- 最终清理只作用于当前 `storage_id` 和当前前缀。
+
+## D1 迁移和旧数据
+
+D1 迁移由 `src/db/schema.js` 在运行时执行，使用 `schema_migrations` 表，不需要手工运行仓库中的 SQL 文件。
+
+当前关键迁移：
+
+```txt
+007_multi_storage
+008_folder_object_rows
+```
+
+多存储迁移会：
+
+- 将旧表改造成带 `storage_id` 的存储作用域模型
+- 把旧数据迁移到 `legacy-default`
+- 保留旧路径、分享、收藏、最近访问、阅读进度、书签、权限和任务关系
+- 创建一个等待配置的旧默认存储占位连接
+
+没有旧存储的 S3 凭证时，不能声称旧对象已经完成迁移。连接占位会保持 `setup_required`，不会猜测 Endpoint、清空 D1 或恢复旧 R2 binding。
+
+首版不支持跨存储复制或移动；复制/移动的源和目标必须属于同一个存储。
+
+## 登录和 OTP
 
 打开：
 
 ```txt
-https://your-worker.your-subdomain.workers.dev/login.html
+https://edgestash-dev.crazytwo1794872727.workers.dev/login.html
 ```
 
-管理员首次登录会初始化 D1 表结构和 OTP。登录后进入首页，管理员应能看到 R2 根目录；普通用户只会看到管理员授权过的文件或目录。
+管理员登录使用：
 
-也可以用接口快速确认：
+1. `ADMIN_PASSWORD`
+2. 管理员 OTP
+3. 两者都正确后签发管理员 JWT
+
+首次没有 OTP 配置时，登录页会显示二维码和 Secret。使用 Google Authenticator、Microsoft Authenticator 或 1Password 扫码后输入 6 位验证码。
+
+普通用户由管理员在“管理后台 -> 授权用户”创建，使用邮箱和密码登录，不需要 OTP。
+
+当前版本没有开发环境登录绕过；错误密码不会创建会话，只有完成正常认证才会返回 JWT。
+
+### 旋转开发管理员密码
+
+`.dev.vars` 是被 `.gitignore` 忽略的本地开发 Secret 文件。修改其中的 `ADMIN_PASSWORD` 后重新部署：
 
 ```bash
-curl -i https://your-domain.example/api/auth/check
+npm run deploy:dev
 ```
 
-未登录时应返回：
+### 重置开发 OTP
 
-```json
-{"authenticated":false}
+下面的命令明确使用 `wrangler.jsonc` 中的 `KV_STORE` 绑定和远端开发 KV：
+
+```bash
+npx wrangler kv key delete --config wrangler.jsonc --remote --binding KV_STORE admin:otp:secret
+npx wrangler kv key delete --config wrangler.jsonc --remote --binding KV_STORE admin:otp:pending
 ```
 
-## Dashboard 部署流程
-
-如果不想使用 Wrangler，也可以在 Dashboard 中手动部署。
-
-1. 进入 Cloudflare Dashboard，创建一个 R2 Bucket。
-2. 创建一个 KV Namespace。
-3. 创建一个 Worker。
-4. 将 `worker.js` 的完整内容粘贴到 Worker 编辑器。
-5. 在 Worker 设置中添加 R2 binding：
-   - 类型：R2 Bucket
-   - Binding name：`R2_BUCKET`
-   - Bucket：选择刚创建的 R2 Bucket
-6. 添加 KV binding：
-   - 类型：KV Namespace
-   - Binding name：`KV_STORE`
-   - Namespace：选择刚创建的 KV Namespace
-7. 添加 D1 binding：
-   - 类型：D1 Database
-   - Binding name：`D1_DB`
-   - Database：选择刚创建的 D1 Database
-8. 添加环境变量或 Secret：
-   - `ADMIN_PASSWORD=你的强密码`
-9. 保存并部署 Worker。
-10. 访问 Worker 域名，例如：
-
-```txt
-https://your-worker.your-subdomain.workers.dev/
-```
-
-注意：手动粘贴部署时必须粘贴完整 `worker.js`。如果只复制了部分内容，或浏览器/编辑器改坏了内嵌脚本中的正则转义，首页脚本可能无法执行。
-
-## 首次初始化
-
-部署完成后：
-
-1. 打开 `/login.html`。
-2. 选择“管理员登录”。
-3. 输入 `ADMIN_PASSWORD`，OTP 先留空。
-4. Worker 会自动初始化 D1 表结构。如果缺少 `D1_DB` binding，登录会提示 D1 初始化失败。
-5. 登录页会显示 OTP 初始化二维码和 Secret。
-6. 使用 Google Authenticator、Microsoft Authenticator、1Password 等 App 扫码。
-7. 输入 App 中显示的 6 位 OTP，完成绑定并登录。
-8. 进入管理后台后，可以创建普通授权用户，并为用户选择可访问的文件或目录。
-9. 首次进入云盘时，系统会自动从 R2 建立一次 D1 虚拟目录树（无需手动刷新）；以后页面优先读取 D1。若在 Cloudflare 控制台或其他 S3 客户端直接改了 R2，请点击页面刷新按钮主动同步。TXT 正文搜索可在阅读器内直接使用；新上传的 `.txt` 会在后台自动建立正文索引，也可以在管理后台批量重建。
-
-普通用户登录不需要 OTP，只使用管理员创建的邮箱和密码。
+删除后重新打开 `/login.html`，输入管理员密码即可重新生成二维码。不要删除生产 KV，也不要把 Secret 写进 README、源码或命令历史。
 
 ## 用户权限
 
-普通用户不是全盘默认可见，而是只看到管理员授权的文件或目录。管理员在“管理后台 -> 授权用户”里添加或编辑用户时，可以搜索文件/目录、多选资源，并为每个资源设置权限模板或自定义权限。
-
-权限项：
+普通用户不是全盘默认可见，只能看到管理员授权范围内的资源。
 
 | 权限 | 作用 |
 | --- | --- |
-| 查看 | 进入目录、在列表和搜索中看到资源 |
-| 预览 | 在线打开图片、PDF、文本、Markdown、音视频、docx 等 |
-| 下载 | 下载文件或批量打包下载 |
+| 查看 | 在目录和搜索结果中看到资源 |
+| 预览 | 在线打开支持的文件 |
+| 下载 | 下载文件或批量下载 |
 | 上传 | 向目录上传文件或创建文件夹 |
-| 修改 | 重命名、移动，或执行需要改动原资源的操作 |
+| 修改 | 重命名、移动等修改操作 |
 | 删除 | 删除文件或目录 |
-| 分享 | 为文件或目录创建公开分享链接 |
+| 分享 | 创建公开分享链接 |
 
-内置模板：
-
-| 模板 | 包含权限 |
-| --- | --- |
-| 只读 | 查看、预览、下载 |
-| 可上传 | 查看、预览、下载、上传 |
-| 可编辑 | 查看、预览、下载、上传、修改 |
-| 完全管理 | 查看、预览、下载、上传、修改、删除、分享 |
-| 自定义 | 手动勾选具体权限 |
-
-授权规则：
-
-- 文件授权只作用于单个文件。
-- 目录授权会作用于该目录及其子目录。
-- 如果同一用户同时命中多个授权路径，路径更具体的授权优先生效。
-- 普通用户只会在目录、搜索、收藏和最近访问中看到有“查看”权限的资源。
-- 如果只授权了深层目录，用户登录后会在上级目录看到可进入的授权入口，不会暴露未授权资源。
-- 管理员不受路径权限限制。
-
-## 重置 OTP 和 D1 初始化状态
-
-如果管理员手机丢失、Authenticator 数据丢失，或需要重新绑定 OTP，需要删除 KV 中的管理员 OTP key。
-
-如果 D1 表结构曾经初始化失败、手动删改过 D1 表，或更换过 D1 数据库，也可以同时删除 D1 初始化标记，让 Worker 下次访问时重新检查并创建表结构。
-
-管理员 OTP 相关 key：
-
-```txt
-admin:otp:secret
-admin:otp:pending
-```
-
-D1 初始化标记 key：
-
-```txt
-d1:schema:v1
-d1:schema:v2-tags
-```
-
-说明：
-
-- `admin:otp:secret` 是已启用的管理员 OTP Secret。
-- `admin:otp:pending` 是首次初始化时的临时 Secret，有效期约 10 分钟。
-- 如果只删除 `admin:otp:secret`，但 `admin:otp:pending` 还存在，页面可能继续复用旧的临时初始化 Secret。
-- 删除 OTP key 后，旧 Authenticator 中的验证码会失效，下一次管理员密码登录会重新显示初始化二维码。
-- 项目名改为 EdgeStashPro 后，已绑定的 Authenticator 仍能正常生成验证码；如想让 App 里的条目名称也更新，可在管理后台重置 OTP 后重新扫码。
-- 删除 `d1:schema:v1` 不会删除 D1 数据，只会让 Worker 下次访问相关 API 时重新执行建表检查。
-- 删除 `d1:schema:v2-tags` 不会删除标签数据，只会让 Worker 下次访问相关 API 时重新检查 `search_items.tags` 列。
-
-### 在 Dashboard 里重置
-
-1. 打开 Cloudflare Dashboard。
-2. 进入 Workers KV。
-3. 选择绑定到 EdgeStashPro 的 KV Namespace。
-4. 按需要搜索并删除：
-   - `admin:otp:secret`
-   - `admin:otp:pending`
-   - `d1:schema:v1`
-   - `d1:schema:v2-tags`
-5. 如果重置了 OTP，回到 `/login.html`，输入管理员密码，重新扫码绑定。
-
-### 用 Wrangler 删除 KV key
-
-在有 `wrangler.toml` 且绑定名为 `KV_STORE` 的项目目录中执行：
-
-```bash
-wrangler kv key delete "admin:otp:secret" --binding KV_STORE
-wrangler kv key delete "admin:otp:pending" --binding KV_STORE
-wrangler kv key delete "d1:schema:v1" --binding KV_STORE
-wrangler kv key delete "d1:schema:v2-tags" --binding KV_STORE
-```
-
-如果你更习惯使用 KV namespace ID：
-
-```bash
-wrangler kv key delete "admin:otp:secret" --namespace-id YOUR_KV_NAMESPACE_ID
-wrangler kv key delete "admin:otp:pending" --namespace-id YOUR_KV_NAMESPACE_ID
-wrangler kv key delete "d1:schema:v1" --namespace-id YOUR_KV_NAMESPACE_ID
-wrangler kv key delete "d1:schema:v2-tags" --namespace-id YOUR_KV_NAMESPACE_ID
-```
-
-## 日常使用
-
-管理员可以：
-
-- 登录网盘首页。
-- 上传、下载、预览和整理文件。
-- 使用即时搜索、收藏和最近访问。
-- 选中一个或多个文件/目录创建同一个分享链接。
-- 进入管理后台查看统计和分享记录。
-- 创建、删除授权用户。
-- 为用户按文件或目录配置路径权限，支持搜索、多选和权限模板。
-
-普通用户可以：
-
-- 登录网盘首页。
-- 在授权范围内使用文件上传、下载、预览、即时搜索、收藏、最近访问和分享等网盘功能。
-- 不能进入管理后台。
-
-分享访问者可以：
-
-- 通过 `/s/<shareId>` 访问分享页。
-- 在分享未过期且密码正确时浏览只读分享目录。
-- 点击目录进入下一级，点击文件直接下载。
+授权支持文件或目录、多选资源、权限模板和自定义权限。目录授权会作用于子目录；普通用户不会看到未授权资源。
 
 ## 分享链接
 
-分享入口在文件列表的批量操作栏中。选中 1 个或多个文件/目录后点击“分享”，可以为这些项目创建同一个公开链接。
+首页选中一个或多个文件/目录后，在批量操作栏点击“分享”。分享支持：
 
-当前分享行为：
-
-- 分享页是只读文件视图，不允许访客上传、重命名、移动或删除。
-- 分享根目录会显示创建分享时选中的所有项目。
-- 分享文件时，访客点击文件直接下载。
-- 分享目录时，访客可以进入该目录及其子目录，并下载目录内文件。
-- 混合选择文件和目录时，根视图会同时显示这些文件和目录。
-- 密码保护和过期时间对浏览目录和下载文件都生效。
-- 下载接口会校验目标路径，只允许下载分享范围内的文件。
-- 旧版单文件分享链接仍会按一个分享项目自动兼容。
+- 只读目录浏览
+- 多个文件/目录共用一个分享链接
+- 可选密码
+- 过期时间
+- 浏览和下载统计
+- 分享二维码
 
 相关接口：
 
 | 接口 | 作用 |
 | --- | --- |
-| `POST /api/share` | 创建分享。支持新版 `{ items: [...] }`，也兼容旧版 `{ filePath }` |
-| `GET /api/share/:id` | 获取分享基础信息 |
-| `POST /api/share/:id/list` | 列出分享根目录或分享目录内项目 |
-| `POST /api/share/:id/download` | 下载分享范围内的指定文件 |
+| `POST /api/share` | 创建分享，支持 `items`，兼容旧 `filePath` |
+| `GET /api/share/:id` | 查询分享状态 |
+| `POST /api/share/:id/list` | 浏览分享目录 |
+| `POST /api/share/:id/download` | 下载分享范围内的文件 |
 
-## 后台任务和下载
-
-上传、下载、复制、移动和批量删除都会创建文件任务，任务记录保存在 D1 中。页面顶部会在“刷新 / 管理后台”旁显示任务状态入口，点击后可以查看最近任务、状态、失败原因，并对任务执行停止或删除。
-
-当前任务行为：
-
-- 上传：使用浏览器上传连接，前端通过 `XMLHttpRequest.upload.onprogress` 写入真实上传字节进度；默认同时上传 2 个文件，其余排队。
-- 下载：交给浏览器原生下载，不由前端先读完整文件再保存；任务状态只显示“处理中”或“已开始”，不显示浏览器下载栏里的字节进度。
-- 批量下载：浏览器原生下载 Worker 生成的 ZIP 压缩包；服务端会为 ZIP 响应写入 `Content-Length`。
-- 复制、移动和批量删除：先创建任务和任务项，再由前端后台分片调用服务端处理；任务面板显示已处理数量。
-- 停止任务：会把任务标记为已取消，并中止当前页面内仍在进行的上传连接；已经交给浏览器原生下载的文件下载由浏览器管理。
-- 删除任务：只删除任务记录和任务项，不删除已经上传、下载、复制/移动或删除完成的文件。
-
-注意事项：
-
-- D1 中的任务记录能在刷新页面后继续显示。
-- 浏览器关闭后，上传连接不会继续；旧的上传/下载任务会在超时后标记失败。
-- 复制、移动和批量删除任务可以在页面重新打开后继续由前端分片推进。
-
-## 缓存和刷新
-
-目录结构保存在 D1 的 `search_items` 表中，形成一棵“虚拟目录树”：打开目录只查询 D1，不会扫描 R2。搜索索引、收藏、最近访问、分享链接、统计、用户路径权限和文件任务同样保存在 D1。
-
-当前逻辑：
-
-- 打开目录时，直接查询 D1 中该目录的子项（`search_items` 按 `parent_path` 建索引）。
-- 新部署或 D1 被清空后，第一次打开任意目录会自动从 R2 全量重建一次虚拟目录树。
-- 上传、新建文件夹、删除、重命名、复制、移动会操作 R2，并增量更新 D1 中的目录树（新增/删除对应行），无需整树重建。
-- 搜索框输入、收藏、最近访问、添加或编辑用户授权时的资源搜索都只查询 D1，不会直接请求 R2。
-- 删除、重命名、移动会清理 D1 中旧路径对应的搜索、收藏、最近访问、TXT 索引和书签记录。
-
-页面右上角的“刷新”会把当前目录（根目录即整棵树）重新与 R2 对账：扫描对应前缀的对象，更新 D1 目录树，删除已不存在的条目。适合在绕过网盘直接改动 R2（例如用 Wrangler/控制台上传）之后手动使用；日常浏览、上传和搜索都不需要点击它。
-
-D1 表结构由 Worker 自动创建，当前会使用这些表：
+分享页地址格式：
 
 ```txt
-search_items
-favorites
-recent_items
-share_links
-share_items
-app_stats
-reader_bookmarks
-txt_index_files
-txt_index_chunks
-user_permissions
-file_tasks
-file_task_items
+/s/<shareId>
 ```
 
-首次访问相关 API 时会初始化表结构，并在 KV 写入 `d1:schema:v3-path-bindings` 作为已初始化标记。
+## 运行时页面和 API
 
-## 运维建议
-
-- `ADMIN_PASSWORD` 请使用强随机密码。
-- 请妥善保存管理员 OTP 的恢复方式；丢失后需要 Cloudflare 后台或 Wrangler 权限才能重置。
-- 定期清理过期或不再需要的分享链接。
-- 大量文件操作后，如果目录或搜索结果显示异常，再使用页面刷新功能。
-- R2 请求会产生 Cloudflare 用量。目录浏览、即时搜索、全文搜索、收藏、最近访问主要走 D1；刷新（与 R2 对账）、新部署后首次打开目录、上传/删除/移动/重命名本身、预览和下载会访问 R2。
-- 如果开放给多人上传，建议对 Markdown/docx 预览内容做额外安全审查。
-- R2 和 KV 都会产生 Cloudflare 用量，请根据实际文件规模和访问量关注账单。
+| 路径 | 作用 |
+| --- | --- |
+| `/login.html` | 管理员/普通用户登录 |
+| `/` | 云盘首页 |
+| `/admin.html` | 管理后台 |
+| `/s/<shareId>` | 公开分享页 |
+| `/api/auth/check` | 检查当前 JWT 会话 |
+| `/api/storages` | 当前用户可访问的存储列表 |
+| `/api/admin/storages` | 管理员存储连接管理 |
+| `/api/admin/users` | 管理员授权用户管理 |
+| `/api/admin/shares` | 管理员分享链接管理 |
 
 ## 常见问题
 
-### 为什么第一次管理员登录需要 OTP？
+### 为什么看不到存储或目录？
 
-管理员账号拥有用户管理、分享管理和统计查看权限。当前版本要求管理员密码和 OTP 同时正确，降低密码泄露后的风险。
+先确认管理员已经在后台配置至少一个启用的 S3 存储，并完成连接测试。普通用户还必须在当前存储上获得权限。
 
-### 二维码不显示怎么办？
+### 为什么日常浏览不会立即请求 S3？
 
-当前版本二维码由登录页原生 Canvas 生成，不依赖外部 CDN。若页面仍未显示二维码，请确认已经部署最新版 `worker.js`，并强制刷新浏览器缓存。页面也会同时显示 Secret，可以在 Authenticator 中手动输入 Secret 添加。
+D1 是目录和搜索的热路径。只有首次建索引、手工刷新、同步作业、上传、删除、移动、重命名、预览和下载等操作才访问 S3。
 
-### 删除 `admin:otp:secret` 后为什么没有出现新的二维码？
+### 什么时候需要点击“刷新”？
 
-请同时删除 `admin:otp:pending`。临时初始化 Secret 可能仍在 10 分钟有效期内。
+如果文件是通过其他 S3 客户端或云厂商控制台直接修改的，点击刷新让 D1 与远端重新对账。正常通过网页上传、删除、移动和重命名会立即更新 D1，不需要每次刷新。
 
-### 当前目录不显示文件，控制台报 `Unexpected token` 或 `switchMainView is not defined` 怎么办？
+### OTP 忘记了怎么办？
 
-这通常是首页内嵌脚本没有成功执行。常见原因是线上 Worker 仍在运行旧版页面模板，或手动粘贴部署时改坏了内嵌脚本中的正则转义。先确认 Cloudflare Worker 中部署的是当前仓库的完整 `worker.js`，保存后强制刷新浏览器缓存。
+删除当前开发环境 KV 中的 `admin:otp:secret` 和 `admin:otp:pending`，然后重新用管理员密码登录并扫码。生产环境请只通过拥有权限的 Cloudflare 管理员操作。
 
-如果你在旧代码里看到类似这一行：
+### 普通用户为什么看不到根目录全部文件？
 
-```js
-normalized = normalized.replace(//+/g, '/');
-```
-
-需要改成：
-
-```js
-normalized = normalized.replace(/[/]+/g, '/');
-```
-
-如果控制台报 `switchMainView is not defined`，说明页面脚本在定义函数前已经因为语法错误中断。请使用当前仓库版本重新部署，并确认浏览器强刷后线上 HTML 中不再包含被破坏的正则，例如 `^data:image/(?:...)`。
-
-当前仓库版本已修复这些转义问题；如果重新部署当前 `worker.js` 后仍然目录为空，再检查 `R2_BUCKET`、`KV_STORE`、`D1_DB` binding 是否配置正确，以及普通用户是否已经授权了可访问目录。
-
-### 普通用户登录后根目录为什么只看到几个目录，或看不到根目录文件？
-
-普通用户不是全盘默认可见。根目录会显示管理员授权资源的入口，例如授权了 `/public` 时，用户在根目录只会看到 `public`，进入后才能看到该目录内允许查看的文件。要让普通用户看到全盘内容，需要在管理后台给该用户授权 `/` 文件夹的“查看”权限，并按需要勾选预览、下载、上传等权限。
-
-### 需要 D1 吗？
-
-需要。当前版本使用 D1 保存搜索索引、收藏、最近访问、分享链接、统计、用户路径权限和文件任务，binding 名固定为 `D1_DB`。相关表由 `worker.js` 首次访问相关 API 时自动创建。
-
-### 搜索会不会频繁请求 R2？
-
-目录/文件搜索和目录浏览查询的都是 D1 虚拟目录树，不会请求 R2。TXT 全文搜索在正文索引就绪后只查询 D1：新上传的 `.txt` 会在后台自动建立索引，也可在管理后台批量重建；打开小说后首次搜索正文时也会按需为该书续建。
-
-### 为什么刷新会消耗更多请求？
-
-“刷新”会把当前目录（在根目录刷新则是整棵树）与 R2 重新对账，需要通过 R2 `list` 扫描对应前缀下的对象，文件越多请求越多。日常上传、删除、重命名、复制、移动都会增量更新 D1 目录树，通常不需要手动刷新；只有在绕过网盘直接改动 R2 后才建议刷新。
-
-### 搜索结果不更新怎么办？
-
-正常通过网盘上传、删除、重命名、移动时，D1 目录树会增量保持同步，无需手动操作。如果是绕过网盘直接改动了 R2，可点击页面右上角“刷新”对账。TXT 正文索引会根据文件 ETag 自动失效，文件变化后下次搜索时会从头续建，避免返回旧内容。
+这是权限模型设计。管理员需要在当前存储上授予 `/` 或具体目录的“查看”权限，普通用户才会看到对应资源。
 
 ## 参考
 
-- Cloudflare Wrangler `deploy` 命令： https://developers.cloudflare.com/workers/wrangler/commands/workers/#deploy
-- Cloudflare Wrangler 文档： https://developers.cloudflare.com/workers/wrangler/
+- Cloudflare Workers Wrangler：https://developers.cloudflare.com/workers/wrangler/
+- Wrangler Workers deploy：https://developers.cloudflare.com/workers/wrangler/commands/workers/#deploy

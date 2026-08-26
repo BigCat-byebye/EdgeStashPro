@@ -2,7 +2,48 @@
   "name": "edgestashpro-regression-harness",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
-    "test": "node test/regression.mjs"
+    "dev": "node scripts/init-dev-secrets.mjs && wrangler dev --config wrangler.dev.jsonc --test-scheduled",
+    "check": "node scripts/assert-dev-config.mjs && wrangler deploy --config wrangler.dev.jsonc --dry-run --outdir dist",
+    "deploy": "wrangler deploy --config wrangler.jsonc",
+    "provision:dev": "node scripts/provision-dev.mjs",
+    "deploy:dev": "node scripts/deploy-dev.mjs",
+    "verify:dev": "node scripts/verify-dev.mjs",
+    "test": "node test/regression.mjs && node test/storage.mjs && node test/sync.mjs && node test/lifecycle.mjs"
+  },
+
+  "cloudflare": {
+    "label": "EdgeStashPro",
+    "products": ["Workers", "D1", "KV"],
+    "categories": ["storage"],
+    "docs_url": "https://github.com/BigCat-byebye/EdgeStashPro",
+    "bindings": {
+      "D1_DB": {
+        "description": "A D1 database for the directory catalog, permissions, shares, tasks, and storage metadata."
+      },
+      "KV_STORE": {
+        "description": "A KV namespace for user accounts, administrator OTP state, and legacy reader migration."
+      },
+      "ADMIN_PASSWORD": {
+        "description": "Choose a long random administrator password. It is also used to sign sessions."
+      },
+      "STORAGE_CONFIG_KEY": {
+        "description": "Provide a base64-encoded 32-byte key used to encrypt S3 credentials."
+      }
+    }
+  },
+  "dependencies": {
+    "aws4fetch": "1.0.20",
+    "fast-xml-parser": "5.11.0"
+  },
+  "devDependencies": {
+    "wrangler": "4.125.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "workerd@1.20260820.1": true
   }
 }

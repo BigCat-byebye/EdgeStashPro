@@ -2,7 +2,7 @@
 // then verify that the server's indexed-search charOffset matches the reader's
 // decoded character offsets. Not part of the harness — a diagnostic tool.
 import { readFile } from 'node:fs/promises';
-import worker from '../worker.js';
+import worker from '../src/index.js';
 
 const encoder = new TextEncoder();
 
@@ -143,7 +143,7 @@ async function main() {
   const record = { bytes, etag: '"novel-v1"' };
   const env = {
     ADMIN_PASSWORD: 'secret',
-    R2_BUCKET: makeR2(record),
+    STORAGE: makeR2(record),
     KV_STORE: new KV(),
     D1_DB: new MemD1()
   };

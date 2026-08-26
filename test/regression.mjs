@@ -1,9 +1,20 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import worker from '../worker.js';
+import worker from '../src/index.js';
+import { generateTotp } from '../src/common.js';
+
 
 const encoder = new TextEncoder();
-const workerSource = await readFile(new URL('../worker.js', import.meta.url), 'utf8');
+const workerSource = (await Promise.all([
+  '../src/index.js',
+  '../src/db/schema.js',
+  '../src/pages/styles.js',
+  '../src/pages/theme.js',
+  '../src/pages/login.js',
+  '../src/pages/index.js',
+  '../src/pages/admin.js',
+  '../src/pages/share.js'
+].map(path => readFile(new URL(path, import.meta.url), 'utf8')))).join('\n');
 
 function toBase64Url(value) {
   const bytes = value instanceof Uint8Array ? value : encoder.encode(value);
@@ -153,6 +164,12 @@ function makeR2(objects) {
       const etag = '"txt-v' + generation + '-' + key + '"';
       store.set(key, { bytes, etag, options });
       return { ...makeObject(key, bytes, etag), body: undefined };
+    },
+    async copy(sourceKey, targetKey) {
+      const source = store.get(sourceKey);
+      if (!source) return null;
+      const copied = await this.put(targetKey, source.bytes, source.options || {});
+      return { ...copied, key: targetKey };
     },
     async delete(keys) {
       for (const key of (Array.isArray(keys) ? keys : [keys])) store.delete(key);
@@ -307,50 +324,41 @@ class MemoryD1 {
       if (table === 'search_items') {
         row.updated_at = row.sync_status;
         row.sync_status = 'ready';
-        const existing = this.tables.get(table).find(item => item.path === row.path);
+        const existing = this.tables.get(table).find(item => item.storage_id === row.storage_id && item.path === row.path);
         if (existing) Object.assign(existing, row);
         else this.tables.get(table).push(row);
       } else if (table === 'user_permissions') {
         row.id = this.nextPermissionId++;
-        const existing = this.tables.get(table).find(item => item.email === row.email && item.path === row.path && item.item_type === row.item_type);
+        const existing = this.tables.get(table).find(item => item.email === row.email
+          && item.storage_id === row.storage_id && item.path === row.path && item.item_type === row.item_type);
         if (existing) Object.assign(existing, row);
         else this.tables.get(table).push(row);
       } else if (table === 'share_links') {
         const existing = this.tables.get(table).find(item => item.share_id === row.share_id);
         if (!existing) this.tables.get(table).push(row);
       } else if (table === 'share_items') {
-        const existing = this.tables.get(table).find(item => item.share_id === row.share_id && item.item_path === row.item_path);
+        const existing = this.tables.get(table).find(item => item.share_id === row.share_id
+          && item.storage_id === row.storage_id && item.item_path === row.item_path);
         if (!existing) this.tables.get(table).push(row);
       } else if (table === 'reader_bookmarks') {
         this.tables.get(table).push(row);
       } else if (table === 'reader_progress') {
-        const progressRow = {
-          owner_key: args[0],
-          path: args[1],
-          source_etag: args[2],
-          char_offset: args[3],
-          byte_offset: args[4],
-          anchor_char_offset: args[5],
-          anchor_byte_offset: args[6],
-          anchor_ratio: args[7],
-          progress: args[8],
-          scroll_top: args[9],
-          scroll_height: args[10],
-          revision: 1,
-          updated_at: args[11]
-        };
-        const existing = this.tables.get(table).find(item => item.owner_key === progressRow.owner_key && item.path === progressRow.path);
-        if (!existing) this.tables.get(table).push(progressRow);
+        row.revision = 1;
+        row.updated_at = args.at(-1);
+        const existing = this.tables.get(table).find(item => item.owner_key === row.owner_key
+          && item.storage_id === row.storage_id && item.path === row.path);
+        if (!existing) this.tables.get(table).push(row);
       } else if (table === 'app_stats') {
-        const existing = this.tables.get(table).find(item => item.key === row.key);
+        const existing = this.tables.get(table).find(item => item.storage_id === row.storage_id && item.key === row.key);
         if (existing) Object.assign(existing, row);
         else this.tables.get(table).push(row);
       } else if (table === 'txt_index_files') {
-        const existing = this.tables.get(table).find(item => item.path === row.path);
+        const existing = this.tables.get(table).find(item => item.storage_id === row.storage_id && item.path === row.path);
         if (existing) Object.assign(existing, row);
         else this.tables.get(table).push(row);
       } else if (table === 'txt_index_chunks') {
-        const existing = this.tables.get(table).find(item => item.path === row.path && item.chunk_no === row.chunk_no);
+        const existing = this.tables.get(table).find(item => item.storage_id === row.storage_id
+          && item.path === row.path && item.chunk_no === row.chunk_no);
         if (existing) Object.assign(existing, row);
         else this.tables.get(table).push(row);
       } else {
@@ -364,45 +372,38 @@ class MemoryD1 {
       const rows = this.tables.get(table) || [];
       const original = rows.length;
       if (table === 'user_permissions' && compact.includes('email = ?') && !compact.includes('path = ?')) {
-        this.tables.set(table, rows.filter(row => row.email !== args[0]));
+        const hasStorage = compact.includes('storage_id = ?');
+        this.tables.set(table, rows.filter(row => row.email !== args[0] || (hasStorage && row.storage_id !== args[1])));
       } else if (table === 'user_permissions' && compact.includes('id = ?')) {
         this.tables.set(table, rows.filter(row => row.id !== args[0]));
       } else if (table === 'user_permissions' && compact.includes('path = ?')) {
-        const root = args[0];
-        this.tables.set(table, rows.filter(row => !(row.path === root || pathMatchesRoot(root, row.path))));
-      } else if (table === 'share_items' && compact.includes('share_id = ?')) {
-        this.tables.set(table, rows.filter(row => row.share_id !== args[0]));
+        const storageId = args[0];
+        const root = args[1];
+        this.tables.set(table, rows.filter(row => row.storage_id !== storageId || !(row.path === root || pathMatchesRoot(root, row.path))));
       } else if (table === 'share_items' && compact.includes('item_path = ?')) {
-        this.tables.set(table, rows.filter(row => !(row.item_path === args[0] || pathMatchesRoot(args[0], row.item_path))));
+        const storageId = args[0];
+        const root = args[1];
+        this.tables.set(table, rows.filter(row => row.storage_id !== storageId
+          || !(row.item_path === root || pathMatchesRoot(root, row.item_path))));
+      } else if (table === 'share_items' && compact.includes('share_id = ?')) {
+        this.tables.set(table, rows.filter(row => row.share_id !== args[0] || row.storage_id !== args[1]));
       } else if (table === 'share_links' && compact.includes('share_id = ?')) {
-        this.tables.set(table, rows.filter(row => row.share_id !== args[0]));
+        this.tables.set(table, rows.filter(row => row.share_id !== args[0] || row.storage_id !== args[1]));
       } else if (table === 'reader_bookmarks' && compact.includes('id = ?')) {
-        this.tables.set(table, rows.filter(row => !(row.id === args[0] && row.owner_key === args[1])));
+        this.tables.set(table, rows.filter(row => !(row.id === args[0] && row.owner_key === args[1]
+          && (!compact.includes('storage_id = ?') || row.storage_id === args[2]))));
       } else if (table === 'reader_bookmarks' && compact.includes('owner_key = ?')) {
         this.tables.set(table, rows.filter(row => row.owner_key !== args[0]));
       } else if (table === 'reader_progress' && compact.includes('owner_key = ?') && !compact.includes('path = ?')) {
         this.tables.set(table, rows.filter(row => row.owner_key !== args[0]));
-      } else if ((table === 'txt_index_files' || table === 'txt_index_chunks') && compact.includes('path = ?')) {
-        const root = args[0];
-        this.tables.set(table, rows.filter(row => !(row.path === root || pathMatchesRoot(root, row.path))));
+      } else if (compact.includes('storage_id = ?') && compact.includes('path = ?')
+        && ['search_items', 'favorites', 'recent_items', 'reader_bookmarks', 'reader_progress', 'txt_index_files', 'txt_index_chunks'].includes(table)) {
+        const storageId = args[0];
+        const root = args[1];
+        this.tables.set(table, rows.filter(row => row.storage_id !== storageId || !(row.path === root || pathMatchesRoot(root, row.path))));
       } else if (table === 'search_items' || table === 'favorites' || table === 'recent_items' || table === 'reader_bookmarks' || table === 'reader_progress') {
         const root = args[0];
-        if (table === 'search_items' && compact.includes('indexed_at != ?')) {
-          const indexedAt = args[args.length - 1];
-          if (compact.includes('path = ?')) {
-            // Subtree reconcile: drop stale rows under the subtree only.
-            this.tables.set(table, rows.filter(row => {
-              const inSubtree = row.path === root || pathMatchesRoot(root, row.path);
-              return !inSubtree || row.indexed_at === indexedAt;
-            }));
-          } else {
-            // Full rebuild: keep only rows stamped during this reconcile.
-            this.tables.set(table, rows.filter(row => row.indexed_at === indexedAt));
-          }
-        } else {
-          const owner = table === 'reader_bookmarks' ? null : null;
-          this.tables.set(table, rows.filter(row => !(row.path === root || pathMatchesRoot(root, row.path)) && (!owner || row.owner_key !== owner)));
-        }
+        this.tables.set(table, rows.filter(row => !(row.path === root || pathMatchesRoot(root, row.path))));
       }
       return { success: true, changes: original - this.tables.get(table).length };
     }
@@ -426,9 +427,10 @@ class MemoryD1 {
           row.resource_etag = args[2];
         }
       } else if (table === 'txt_index_files') {
+        const storageId = args[args.length - 3];
         const path = args[args.length - 2];
         const sourceEtag = args[args.length - 1];
-        const row = rows.find(item => item.path === path && item.source_etag === sourceEtag);
+        const row = rows.find(item => item.storage_id === storageId && item.path === path && item.source_etag === sourceEtag);
         if (row) {
           if (compact.includes("set status = 'ready'")) {
             row.status = 'ready';
@@ -454,8 +456,9 @@ class MemoryD1 {
         }
       } else if (table === 'reader_progress') {
         const row = rows.find(item => item.owner_key === args[10]
-          && item.path === args[11]
-          && Number(item.revision) === Number(args[12]));
+          && item.storage_id === args[11]
+          && item.path === args[12]
+          && Number(item.revision) === Number(args[13]));
         if (row) {
           row.source_etag = args[0];
           row.char_offset = args[1];
@@ -471,20 +474,22 @@ class MemoryD1 {
         }
         return { success: true, meta: { changes: row ? 1 : 0 } };
       } else if (table === 'share_links') {
-        const shareId = args[args.length - 1];
-        const row = rows.find(item => item.share_id === shareId);
+        const shareId = compact.includes('where file_path = ?') ? null : args[args.length - 2];
+        const storageId = compact.includes('where file_path = ?') ? args[0] : args[args.length - 1];
+        const row = rows.find(item => item.share_id === shareId && item.storage_id === storageId);
         if (row) {
           if (compact.includes('view_count = view_count + 1')) row.view_count = Number(row.view_count || 0) + 1;
           if (compact.includes('download_count = download_count + 1')) row.download_count = Number(row.download_count || 0) + 1;
           if (compact.includes('items_initialized = 1')) row.items_initialized = 1;
         }
         if (compact.includes('where file_path = ?')) {
-          const filePath = args[0];
-          rows.filter(item => item.file_path === filePath).forEach(item => { item.items_initialized = 1; });
+          const filePath = args[1];
+          rows.filter(item => item.storage_id === args[0] && item.file_path === filePath).forEach(item => { item.items_initialized = 1; });
         }
       } else if (table === 'app_stats') {
+        const storageId = args[args.length - 2];
         const key = args[args.length - 1];
-        const row = rows.find(item => item.key === key);
+        const row = rows.find(item => item.storage_id === storageId && item.key === key);
         if (row) row.value = Math.max(0, Number(row.value || 0) + Number(args[0] || 0));
       }
       return { success: true };
@@ -503,72 +508,83 @@ class MemoryD1 {
     }
     const table = tableNameFromSql(text);
     const rows = this.tables.get(table) || [];
+    const scopedRows = storageId => rows.filter(row => row.storage_id === storageId);
     if (compact.includes('count(*) as value')) {
-      if (table === 'share_links') return { results: [{ value: rows.length }] };
+      const candidates = compact.includes('storage_id = ?') ? scopedRows(args[0]) : rows;
+      if (table === 'share_links') return { results: [{ value: candidates.length }] };
       return { results: [{ value: 0 }] };
     }
-    if (compact.includes('coalesce(sum(view_count)')) return { results: [{ value: rows.reduce((sum, row) => sum + Number(row.view_count || 0), 0) }] };
-    if (compact.includes('coalesce(sum(download_count)')) return { results: [{ value: rows.reduce((sum, row) => sum + Number(row.download_count || 0), 0) }] };
+    if (compact.includes('coalesce(sum(view_count)')) return { results: [{ value: scopedRows(args[0]).reduce((sum, row) => sum + Number(row.view_count || 0), 0) }] };
+    if (compact.includes('coalesce(sum(download_count)')) return { results: [{ value: scopedRows(args[0]).reduce((sum, row) => sum + Number(row.download_count || 0), 0) }] };
     if (table === 'user_permissions') {
       if (compact.includes('where email = ?') && compact.includes('path = ? or')) {
         const email = args[0];
-        const target = args[1];
-        return { results: rows.filter(row => row.email === email && (row.path === target || (row.item_type === 'folder' && (row.path === '/' || target.startsWith(row.path + '/'))))) };
+        const storageId = args[1];
+        const target = args[2];
+        return { results: rows.filter(row => row.email === email && row.storage_id === storageId
+          && (row.path === target || (row.item_type === 'folder' && (row.path === '/' || target.startsWith(row.path + '/'))))) };
       }
-      return { results: rows.filter(row => row.email === args[0]) };
+      return { results: rows.filter(row => row.email === args[0] && (!compact.includes('storage_id = ?') || row.storage_id === args[1])) };
     }
-    if (table === 'share_links') return { results: rows.filter(row => row.share_id === args[0]) };
-    if (table === 'share_items') {
-      if (compact.includes('distinct share_id')) {
-        const root = args[0];
-        return { results: rows.filter(row => row.item_path === root || pathMatchesRoot(root, row.item_path)).map(row => ({ share_id: row.share_id })) };
-      }
+    if (table === 'share_links') {
+      if (compact.includes('where storage_id = ?')) return { results: scopedRows(args[0]) };
       return { results: rows.filter(row => row.share_id === args[0]) };
     }
-    if (table === 'app_stats') return { results: rows.filter(row => row.key === args[0]) };
+    if (table === 'share_items') {
+      if (compact.includes('distinct share_id')) {
+        const storageId = args[0];
+        const root = args[1];
+        return { results: rows.filter(row => row.storage_id === storageId
+          && (row.item_path === root || pathMatchesRoot(root, row.item_path))).map(row => ({ share_id: row.share_id })) };
+      }
+      return { results: rows.filter(row => row.share_id === args[0] && row.storage_id === args[1]) };
+    }
+    if (table === 'app_stats') return { results: rows.filter(row => row.storage_id === args[0] && row.key === args[1]) };
     if (table === 'reader_bookmarks') {
       if (compact.includes('select id') && compact.includes('coalesce(anchor_ratio')) {
         return {
           results: rows.filter(row => row.owner_key === args[0]
-            && row.path === args[1]
-            && Math.abs(Number(row.char_offset || 0) - Number(args[2] || 0)) <= 2
-            && Math.abs(Number(row.anchor_ratio || 0) - Number(args[3] || 0)) <= 0.002)
+            && row.storage_id === args[1]
+            && row.path === args[2]
+            && Math.abs(Number(row.char_offset || 0) - Number(args[3] || 0)) <= 2
+            && Math.abs(Number(row.anchor_ratio || 0) - Number(args[4] || 0)) <= 0.002)
         };
       }
       return {
         results: rows.filter(row => row.owner_key === args[0]
-          && row.path === args[1]
-          && (!compact.includes('source_etag') || row.source_etag === null || row.source_etag === args[2]))
+          && row.storage_id === args[1]
+          && row.path === args[2]
+          && (!compact.includes('source_etag') || row.source_etag === null || row.source_etag === args[3]))
       };
     }
     if (table === 'reader_progress') {
-      return { results: rows.filter(row => row.owner_key === args[0] && row.path === args[1]) };
+      return { results: rows.filter(row => row.owner_key === args[0] && row.storage_id === args[1] && row.path === args[2]) };
     }
-    if (table === 'txt_index_files' && compact.includes('where path = ?')) {
-      return { results: rows.filter(row => row.path === args[0]) };
+    if (table === 'txt_index_files' && compact.includes('where storage_id = ? and path = ?')) {
+      return { results: rows.filter(row => row.storage_id === args[0] && row.path === args[1]) };
     }
     if (table === 'txt_index_files' && compact.includes("status = 'ready'")) {
-      const startPath = String(args[0] || '');
-      const limit = Number(args[1] || 500);
+      const storageId = args[0];
+      const startPath = String(args[1] || '');
+      const limit = Number(args[2] || 500);
       return {
         results: rows
-          .filter(row => row.status === 'ready' && row.path >= startPath)
+          .filter(row => row.storage_id === storageId && row.status === 'ready' && row.path >= startPath)
           .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
           .slice(0, limit)
       };
     }
     if (table === 'txt_index_chunks' && compact.includes('content like ?')) {
-      const pattern = String(args[3] || '');
-      const inner = pattern.startsWith('%') && pattern.endsWith('%')
-        ? pattern.slice(1, -1)
-        : pattern;
+      const pattern = String(args[4] || '');
+      const inner = pattern.startsWith('%') && pattern.endsWith('%') ? pattern.slice(1, -1) : pattern;
       const literal = inner.replace(/\\([\\%_])/g, '$1');
-      const startChunk = Number(args[2] || 0);
-      const limit = Number(args[4] || 100);
+      const startChunk = Number(args[3] || 0);
+      const limit = Number(args[5] || 100);
       return {
         results: rows
-          .filter(row => row.path === args[0]
-            && row.source_etag === args[1]
+          .filter(row => row.storage_id === args[0]
+            && row.path === args[1]
+            && row.source_etag === args[2]
             && Number(row.chunk_no) >= startChunk
             && String(row.content || '').includes(literal))
           .sort((a, b) => Number(a.chunk_no) - Number(b.chunk_no))
@@ -576,11 +592,12 @@ class MemoryD1 {
       };
     }
     if (table === 'txt_index_chunks' && compact.includes('byte_start <= ?') && compact.includes('byte_end > ?')) {
-      const target = Number(args[2]);
+      const target = Number(args[3]);
       return {
         results: rows
-          .filter(row => row.path === args[0]
-            && row.source_etag === args[1]
+          .filter(row => row.storage_id === args[0]
+            && row.path === args[1]
+            && row.source_etag === args[2]
             && Number(row.byte_start) <= target
             && Number(row.byte_end) > target)
           .sort((a, b) => Number(b.chunk_no) - Number(a.chunk_no))
@@ -591,10 +608,11 @@ class MemoryD1 {
     if (table === 'txt_index_chunks' && compact.includes('chunk_no between ? and ?')) {
       return {
         results: rows
-          .filter(row => row.path === args[0]
-            && row.source_etag === args[1]
-            && Number(row.chunk_no) >= Number(args[2])
-            && Number(row.chunk_no) <= Number(args[3]))
+          .filter(row => row.storage_id === args[0]
+            && row.path === args[1]
+            && row.source_etag === args[2]
+            && Number(row.chunk_no) >= Number(args[3])
+            && Number(row.chunk_no) <= Number(args[4]))
           .sort((a, b) => Number(a.chunk_no) - Number(b.chunk_no))
           .slice(0, 4)
       };
@@ -602,7 +620,7 @@ class MemoryD1 {
     if (table === 'txt_index_chunks' && compact.includes('select chunk_no, byte_start')) {
       return {
         results: rows
-          .filter(row => row.path === args[0] && row.source_etag === args[1])
+          .filter(row => row.storage_id === args[0] && row.path === args[1] && row.source_etag === args[2])
           .sort((a, b) => Number(a.chunk_no) - Number(b.chunk_no))
           .map(row => ({ chunk_no: row.chunk_no, byte_start: row.byte_start }))
           .slice(0, 1)
@@ -610,51 +628,59 @@ class MemoryD1 {
     }
     if (table === 'txt_index_chunks' && compact.includes('chunk_no = ?')) {
       return {
-        results: rows.filter(row => row.path === args[0]
-          && row.source_etag === args[1]
-          && Number(row.chunk_no) === Number(args[2]))
+        results: rows.filter(row => row.storage_id === args[0]
+          && row.path === args[1]
+          && row.source_etag === args[2]
+          && Number(row.chunk_no) === Number(args[3]))
       };
     }
     if (table === 'user_permissions' && compact.includes('select id')) return { results: [] };
     if (table === 'search_items') {
       if (compact.includes('count(*) as count')) {
+        const candidates = compact.includes('storage_id = ?') ? scopedRows(args[0]) : rows;
         if (compact.includes("lower(path) like '%.txt'")) {
-          const count = rows.filter(row => row.item_type === 'file' && String(row.path).toLowerCase().endsWith('.txt')).length;
+          const count = candidates.filter(row => row.item_type === 'file' && String(row.path).toLowerCase().endsWith('.txt')).length;
           return { results: [{ count }] };
         }
-        return { results: [{ count: rows.length }] };
+        return { results: [{ count: candidates.length }] };
       }
-      if (compact.includes('where parent_path = ?')) {
+      if (compact.includes('where storage_id = ? and parent_path = ?')) {
         return {
-          results: rows
-            .filter(row => row.parent_path === args[0])
+          results: scopedRows(args[0])
+            .filter(row => row.parent_path === args[1])
             .sort((a, b) => {
               if (a.item_type !== b.item_type) return a.item_type === 'folder' ? -1 : 1;
               return String(a.name).localeCompare(String(b.name));
             })
         };
       }
-      if (compact.includes('where path in (')) {
-        const wanted = new Set(args);
-        return { results: rows.filter(row => wanted.has(row.path)) };
+      if (compact.includes('path in (')) {
+        const wanted = new Set(args.slice(1));
+        return { results: scopedRows(args[0]).filter(row => wanted.has(row.path)) };
       }
-      if (compact.includes('where path = ?')) {
-        return { results: rows.filter(row => row.path === args[0] && row.sync_status !== 'stale') };
+      if (compact.includes("path = ? and item_type = 'folder'")) {
+        return { results: scopedRows(args[0]).filter(row => row.path === args[1] && row.item_type === 'folder') };
       }
-      if (compact.includes("where path = ? and item_type = 'folder'")) {
-        return { results: rows.filter(row => row.path === args[0] && row.item_type === 'folder') };
+      if (compact.includes('storage_id = ? and path = ?')) {
+        return { results: scopedRows(args[0]).filter(row => row.path === args[1] && row.sync_status !== 'stale') };
       }
       if (compact.includes("lower(path) like '%.txt'") && compact.includes('path > ?')) {
-        const limit = Number(args[1] || 0);
+        const limit = Number(args[2] || 0);
         return {
-          results: rows
-            .filter(row => row.item_type === 'file' && String(row.path).toLowerCase().endsWith('.txt') && row.path > args[0])
+          results: scopedRows(args[0])
+            .filter(row => row.item_type === 'file' && String(row.path).toLowerCase().endsWith('.txt') && row.path > args[1])
             .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
             .slice(0, limit)
         };
       }
-      if (compact.includes("where item_type = 'folder'")) {
-        return { results: rows.filter(row => row.item_type === 'folder') };
+      if (compact.includes("storage_id = ? and item_type = 'folder'")) {
+        return { results: scopedRows(args[0]).filter(row => row.item_type === 'folder') };
+      }
+      if (compact.includes('storage_id = ?')) {
+        let candidates = scopedRows(args[0]);
+        if (compact.includes("item_type = 'file'")) candidates = candidates.filter(row => row.item_type === 'file');
+        if (compact.includes("item_type = 'folder'")) candidates = candidates.filter(row => row.item_type === 'folder');
+        return { results: candidates };
       }
       return { results: rows };
     }
@@ -664,11 +690,63 @@ class MemoryD1 {
 
 function makeEnv(bytes, options = {}) {
   const objects = options.objects || [{ key: 'notes.txt', bytes, etag: '"txt-v1"' }];
+  const d1 = options.d1 || null;
+  if (d1 && options.seedCatalog !== false) {
+    const table = d1.ensureTable('search_items');
+    const rows = d1.tables.get(table);
+    for (const object of objects) {
+      const key = String(object.key || '').replace(/^\/+/, '');
+      const parts = key.split('/').filter(Boolean);
+      const isMarker = parts.at(-1) === '.folder';
+      const folderParts = parts.slice(0, -1);
+      for (let depth = 1; depth <= folderParts.length; depth += 1) {
+        const path = '/' + folderParts.slice(0, depth).join('/');
+        if (!rows.some(row => row.storage_id === 'legacy-default' && row.path === path)) {
+          rows.push({
+            storage_id: 'legacy-default',
+            path,
+            name: folderParts[depth - 1],
+            item_type: 'folder',
+            parent_path: depth === 1 ? '/' : '/' + folderParts.slice(0, depth - 1).join('/'),
+            size: 0,
+            size_formatted: '',
+            preview_type: '',
+            tags: '[]',
+            indexed_at: Date.now(),
+            resource_key: folderParts.slice(0, depth).join('/') + '/',
+            sync_status: 'ready',
+            updated_at: Date.now()
+          });
+        }
+      }
+      if (isMarker) continue;
+      const path = '/' + parts.join('/');
+      rows.push({
+        storage_id: 'legacy-default',
+        path,
+        name: parts.at(-1),
+        item_type: 'file',
+        parent_path: parts.length === 1 ? '/' : '/' + parts.slice(0, -1).join('/'),
+        size: object.bytes?.byteLength ?? encoder.encode(String(object.bytes || '')).byteLength,
+        size_formatted: '',
+        preview_type: 'text',
+        last_modified: '2026-08-03T00:00:00.000Z',
+        tags: '[]',
+        indexed_at: Date.now(),
+        resource_key: key,
+        resource_version: object.etag || '\"txt-v1\"',
+        resource_etag: object.etag || '\"txt-v1\"',
+        sync_status: 'ready',
+        updated_at: Date.now()
+      });
+    }
+  }
   return {
     ADMIN_PASSWORD: 'regression-secret',
-    R2_BUCKET: makeR2(objects),
+    STORAGE_ID: 'legacy-default',
+    STORAGE: makeR2(objects),
     KV_STORE: options.kv || new MemoryKV(),
-    D1_DB: options.d1 || null
+    D1_DB: d1
   };
 }
 
@@ -681,6 +759,89 @@ async function request(path, env, cookie, init = {}) {
   });
   await Promise.all(pending);
   return response;
+}
+
+async function testLoginFlows() {
+  const d1 = new MemoryD1();
+  const kv = new MemoryKV();
+  const env = makeEnv(encoder.encode('login fixture'), {
+    d1,
+    kv,
+    seedCatalog: false
+  });
+
+  async function login(body) {
+    return request('/api/login', env, null, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+  }
+
+  const wrongAdmin = await login({ isAdmin: true, password: 'wrong-password' });
+  assert.equal(wrongAdmin.status, 401);
+
+  const setupResponse = await login({ isAdmin: true, password: env.ADMIN_PASSWORD });
+  assert.equal(setupResponse.status, 200);
+  const setupBody = await setupResponse.json();
+  assert.equal(setupBody.requiresOtpSetup, true);
+  assert.ok(setupBody.otpSecret);
+  assert.ok(setupBody.otpUri.startsWith('otpauth://totp/'));
+  assert.equal(await kv.get('admin:otp:pending'), setupBody.otpSecret);
+
+  const invalidSetupOtp = await login({
+    isAdmin: true,
+    password: env.ADMIN_PASSWORD,
+    otp: '000000'
+  });
+  assert.equal(invalidSetupOtp.status, 401);
+  assert.equal((await invalidSetupOtp.json()).requiresOtpSetup, true);
+
+  const setupOtp = await generateTotp(setupBody.otpSecret);
+  const adminLogin = await login({
+    isAdmin: true,
+    password: env.ADMIN_PASSWORD,
+    otp: setupOtp
+  });
+  assert.equal(adminLogin.status, 200);
+  assert.equal((await adminLogin.json()).role, 'admin');
+  assert.equal(await kv.get('admin:otp:secret'), setupBody.otpSecret);
+  assert.equal(await kv.get('admin:otp:pending'), null);
+
+  const adminCookie = adminLogin.headers.get('set-cookie').split(';')[0];
+  const adminAuthCheck = await request('/api/auth/check', env, adminCookie);
+  assert.equal(adminAuthCheck.status, 200);
+  assert.equal((await adminAuthCheck.json()).role, 'admin');
+
+  const userEmail = 'login-user@example.test';
+  await kv.put(`user:${userEmail}`, JSON.stringify({
+    email: userEmail,
+    passwordHash: await sha256Hex('user-password'),
+    role: 'user',
+    createdAt: Date.now()
+  }));
+
+  const wrongUser = await login({
+    isAdmin: false,
+    email: userEmail,
+    password: 'wrong-password'
+  });
+  assert.equal(wrongUser.status, 401);
+
+  const userLogin = await login({
+    isAdmin: false,
+    email: userEmail,
+    password: 'user-password'
+  });
+  assert.equal(userLogin.status, 200);
+  const userBody = await userLogin.json();
+  assert.equal(userBody.role, 'user');
+  assert.equal(userBody.email, userEmail);
+
+  const userCookie = userLogin.headers.get('set-cookie').split(';')[0];
+  const userAuthCheck = await request('/api/auth/check', env, userCookie);
+  assert.equal(userAuthCheck.status, 200);
+  assert.equal((await userAuthCheck.json()).email, userEmail);
 }
 
 async function testTxtRoutes() {
@@ -746,7 +907,7 @@ async function testTxtRoutes() {
   const searchBody = await search.json();
   assert.deepEqual(searchBody.results.map(result => result.byteOffset), [0, 2, 15]);
   assert.ok(searchBody.results.every(result => !('text' in result)), 'search must not return full text');
-  assert.ok(env.R2_BUCKET.ranges.some(range => range.length <= 1_048_576), 'search reads must be bounded R2 ranges');
+  assert.ok(env.STORAGE.ranges.some(range => range.length <= 1_048_576), 'search reads must be bounded R2 ranges');
 
   const caseSensitive = await request('/api/txt/search?path=%2Fnotes.txt&q=ABA', env, cookie);
   assert.deepEqual((await caseSensitive.json()).results, [], 'TXT search must remain case-sensitive');
@@ -775,7 +936,7 @@ async function testTxtSearchPagingAndBoundaries() {
   const wrongPath = await request('/api/txt/search?path=%2Fother.txt&q=aa&limit=50&cursor=' + encodeURIComponent(firstBody.nextCursor), pagedEnv, pagedCookie);
   assert.equal(wrongPath.status, 404, 'the path must be resolved before a cursor can be reused');
 
-  await pagedEnv.R2_BUCKET.put('notes.txt', encoder.encode('a'.repeat(70)));
+  await pagedEnv.STORAGE.put('notes.txt', encoder.encode('a'.repeat(70)));
   await request('/api/txt/meta?path=%2Fnotes.txt', pagedEnv, pagedCookie);
   const changedCursor = await request('/api/txt/search?path=%2Fnotes.txt&q=aa&limit=50&cursor=' + encodeURIComponent(firstBody.nextCursor), pagedEnv, pagedCookie);
   assert.equal(changedCursor.status, 400, 'a cursor must be invalid after the source ETag changes');
@@ -812,6 +973,7 @@ async function testTxtIndexedSearchLifecycle() {
 
   const initialMeta = await request('/api/txt/meta?path=%2Fnotes.txt', env, cookie);
   const initialMetaBody = await initialMeta.json();
+  assert.ok(initialMetaBody.index, JSON.stringify(initialMetaBody));
   assert.equal(initialMetaBody.index.status, 'stale', 'a TXT file without an index must report a stale/missing index');
 
   const built = await buildTxtIndex(env, cookie);
@@ -819,7 +981,7 @@ async function testTxtIndexedSearchLifecycle() {
   assert.equal(built.index.totalChars, boundaryText.length);
   assert.equal(built.index.encoding, 'utf-8');
 
-  const rangesBeforeSearch = env.R2_BUCKET.ranges.length;
+  const rangesBeforeSearch = env.STORAGE.ranges.length;
   const search = await request('/api/txt/search?path=%2Fnotes.txt&q=abcde&limit=50', env, cookie);
   assert.equal(search.status, 200);
   const searchBody = await search.json();
@@ -829,15 +991,15 @@ async function testTxtIndexedSearchLifecycle() {
   assert.equal(searchBody.results[0].chunkCharOffset, 0, 'a boundary-spanning result must use the previous indexed character base');
   assert.equal(searchBody.results[0].match, 'abcde');
   assert.ok(searchBody.results[0].progressPercent > 0);
-  assert.equal(env.R2_BUCKET.ranges.length, rangesBeforeSearch, 'a ready index search must not rescan R2 content');
+  assert.equal(env.STORAGE.ranges.length, rangesBeforeSearch, 'a ready index search must not rescan R2 content');
 
-  const rangesBeforeOpen = env.R2_BUCKET.ranges.length;
+  const rangesBeforeOpen = env.STORAGE.ranges.length;
   const opened = await request('/api/txt/open?path=%2Fnotes.txt', env, cookie);
   assert.equal(opened.status, 200);
   const openedBody = await opened.json();
   assert.equal(openedBody.windowSource, 'd1', 'an indexed novel must open from the D1 text read model');
   assert.ok(openedBody.chunks.length >= 2, 'the open response must include nearby indexed chunks');
-  assert.equal(env.R2_BUCKET.ranges.length, rangesBeforeOpen, 'a ready D1 text window must not read R2');
+  assert.equal(env.STORAGE.ranges.length, rangesBeforeOpen, 'a ready D1 text window must not read R2');
   const cachedOpen = await request('/api/txt/open?path=%2Fnotes.txt&cachedEtag='
     + encodeURIComponent(openedBody.meta.etag)
     + '&cached=' + openedBody.chunks[0].byteStart, env, cookie);
@@ -855,7 +1017,7 @@ async function testTxtIndexedSearchLifecycle() {
   const metaAfterBuild = await request('/api/txt/meta?path=%2Fnotes.txt', env, cookie);
   assert.equal((await metaAfterBuild.json()).index.status, 'ready');
 
-  await env.R2_BUCKET.put('notes.txt', encoder.encode('new body needle')); 
+  await env.STORAGE.put('notes.txt', encoder.encode('new body needle'));
   const staleMeta = await request('/api/txt/meta?path=%2Fnotes.txt', env, cookie);
   assert.equal((await staleMeta.json()).index.status, 'stale', 'changing the R2 ETag must invalidate the TXT index');
   const staleSearch = await request('/api/txt/search?path=%2Fnotes.txt&q=needle', env, cookie);
@@ -1005,7 +1167,7 @@ async function testReaderProgressAndBookmarks() {
   });
   assert.equal(secondBookmark.status, 201, 'different positions in the same large TXT chunk must allow separate bookmarks');
 
-  await env.R2_BUCKET.put('notes.txt', encoder.encode('changed text'));
+  await env.STORAGE.put('notes.txt', encoder.encode('changed text'));
   await request('/api/txt/meta?path=%2Fnotes.txt', env, cookie);
   const staleProgress = await request('/api/reader/progress?path=%2Fnotes.txt', env, cookie);
   assert.equal(staleProgress.status, 200);
@@ -1085,7 +1247,7 @@ async function testPathBoundPermissionsAndShares() {
   const renamedPermission = await request('/api/download/renamed.txt', env, userCookie);
   assert.equal(renamedPermission.status, 403, 'rename must not grant the new path implicitly');
 
-  await env.R2_BUCKET.put('notes.txt', encoder.encode('reused path'));
+  await env.STORAGE.put('notes.txt', encoder.encode('reused path'));
   const reusedPath = await request('/api/download/notes.txt', env, userCookie);
   assert.equal(reusedPath.status, 403, 'a reused path must not resurrect an invalidated permission');
 
@@ -1124,7 +1286,7 @@ async function testPathBoundPermissionsAndShares() {
   const orphanedInfo = await request('/api/share/' + share.shareId, env);
   assert.equal(orphanedInfo.status, 410, 'a share with no valid roots must be gone');
 
-  await env.R2_BUCKET.put('renamed.txt', encoder.encode('reused share path'));
+  await env.STORAGE.put('renamed.txt', encoder.encode('reused share path'));
   const resurrectedShare = await request('/api/share/' + share.shareId, env);
   assert.equal(resurrectedShare.status, 410, 'reusing a deleted share path must not revive the share');
 }
@@ -1141,10 +1303,10 @@ async function testCachedAdminDirectoryNavigationAvoidsPerItemR2Checks() {
   const initial = await request('/api/files/mybox/novel', env, cookie);
   assert.equal(initial.status, 200);
   const initialData = await initial.json();
-  assert.equal(initialData.files.length, 2, 'first listing must reconcile the virtual tree from R2');
+  assert.equal(initialData.files.length, 2, 'directory listing must use the pre-synchronized D1 catalog');
 
-  env.R2_BUCKET.heads.length = 0;
-  env.R2_BUCKET.lists.length = 0;
+  env.STORAGE.heads.length = 0;
+  env.STORAGE.lists.length = 0;
   const cached = await request('/api/files/mybox/novel', env, cookie);
   assert.equal(cached.status, 200);
   const cachedData = await cached.json();
@@ -1153,8 +1315,8 @@ async function testCachedAdminDirectoryNavigationAvoidsPerItemR2Checks() {
     ['first.txt', 'second.txt'],
     'repeat navigation must be served from the virtual directory tree'
   );
-  assert.equal(env.R2_BUCKET.heads.length, 0, 'virtual-directory navigation must not HEAD every displayed item');
-  assert.equal(env.R2_BUCKET.lists.length, 0, 'virtual-directory navigation must not list every displayed folder');
+  assert.equal(env.STORAGE.heads.length, 0, 'virtual-directory navigation must not HEAD every displayed item');
+  assert.equal(env.STORAGE.lists.length, 0, 'virtual-directory navigation must not list every displayed folder');
 }
 
 async function testVirtualDirectoryIncrementalAndGlobalTxtSearch() {
@@ -1233,19 +1395,19 @@ async function testD1ReadModelHotPaths() {
   const bootstrapBody = await bootstrap.json();
   assert.equal(bootstrapBody.success, true);
   assert.equal(bootstrapBody.listing.files[0].path, '/notes.txt');
-  assert.ok(env.R2_BUCKET.lists.length > 0, 'the first bootstrap must import R2 metadata once');
+  assert.equal(env.STORAGE.lists.length, 0, 'bootstrap must not scan remote storage during a page read');
 
   function resetR2Calls() {
-    env.R2_BUCKET.heads.length = 0;
-    env.R2_BUCKET.lists.length = 0;
-    env.R2_BUCKET.gets.length = 0;
-    env.R2_BUCKET.ranges.length = 0;
+    env.STORAGE.heads.length = 0;
+    env.STORAGE.lists.length = 0;
+    env.STORAGE.gets.length = 0;
+    env.STORAGE.ranges.length = 0;
   }
 
   function assertNoR2MetadataReads(message) {
-    assert.equal(env.R2_BUCKET.heads.length, 0, message + ': no R2 HEAD');
-    assert.equal(env.R2_BUCKET.lists.length, 0, message + ': no R2 LIST');
-    assert.equal(env.R2_BUCKET.gets.length, 0, message + ': no R2 GET');
+    assert.equal(env.STORAGE.heads.length, 0, message + ': no R2 HEAD');
+    assert.equal(env.STORAGE.lists.length, 0, message + ': no R2 LIST');
+    assert.equal(env.STORAGE.gets.length, 0, message + ': no R2 GET');
   }
 
   resetR2Calls();
@@ -1264,14 +1426,14 @@ async function testD1ReadModelHotPaths() {
   resetR2Calls();
   const preview = await request('/api/preview/notes.txt', env, cookie);
   assert.equal(preview.status, 200);
-  assert.equal(env.R2_BUCKET.gets.length, 1, 'preview must issue one exact R2 GET');
-  assert.equal(env.R2_BUCKET.heads.length, 0, 'preview must not issue a separate R2 HEAD');
-  assert.equal(env.R2_BUCKET.lists.length, 0, 'preview must not issue an R2 LIST');
+  assert.equal(env.STORAGE.gets.length, 1, 'preview must issue one exact R2 GET');
+  assert.equal(env.STORAGE.heads.length, 0, 'preview must not issue a separate R2 HEAD');
+  assert.equal(env.STORAGE.lists.length, 0, 'preview must not issue an R2 LIST');
 
   resetR2Calls();
   const txtMeta = await request('/api/txt/meta?path=%2Fnotes.txt', env, cookie);
   assert.equal(txtMeta.status, 200);
-  assert.equal(env.R2_BUCKET.gets.length, 1, 'TXT metadata must use one bounded R2 GET');
+  assert.equal(env.STORAGE.gets.length, 1, 'TXT metadata must use one bounded R2 GET');
   resetR2Calls();
   assert.equal((await request('/api/reader/progress?path=%2Fnotes.txt', env, cookie)).status, 200);
   assertNoR2MetadataReads('reader progress must use the D1 source identity');
@@ -1294,23 +1456,23 @@ async function testD1ReadModelHotPaths() {
     body: JSON.stringify({ path: '/notes.txt' })
   });
   assert.equal(shareDownload.status, 200);
-  assert.equal(env.R2_BUCKET.gets.length, 1, 'share download must issue one exact R2 GET');
-  assert.equal(env.R2_BUCKET.heads.length, 0);
-  assert.equal(env.R2_BUCKET.lists.length, 0);
+  assert.equal(env.STORAGE.gets.length, 1, 'share download must issue one exact R2 GET');
+  assert.equal(env.STORAGE.heads.length, 0);
+  assert.equal(env.STORAGE.lists.length, 0);
 
   const emptyEnv = makeEnv(null, { d1: new MemoryD1(), objects: [] });
   const emptyCookie = await signAdminCookie(emptyEnv.ADMIN_PASSWORD);
   assert.equal((await request('/api/bootstrap', emptyEnv, emptyCookie)).status, 200);
-  emptyEnv.R2_BUCKET.lists.length = 0;
+  emptyEnv.STORAGE.lists.length = 0;
   assert.equal((await request('/api/files/', emptyEnv, emptyCookie)).status, 200);
-  assert.equal(emptyEnv.R2_BUCKET.lists.length, 0, 'an initialized empty bucket must not be rescanned');
+  assert.equal(emptyEnv.STORAGE.lists.length, 0, 'an initialized empty bucket must not be rescanned');
 }
 
 function testStaticContracts() {
-  const schemaStart = workerSource.indexOf('async function ensureD1Schema(env)');
-  const schemaEnd = workerSource.indexOf('\nconst USER_PERMISSIONS_DDL', schemaStart);
+  const schemaStart = workerSource.indexOf('const TABLES = {');
+  const schemaEnd = workerSource.indexOf('\nconst STORAGE_TABLES', schemaStart);
   const schemaSource = workerSource.slice(schemaStart, schemaEnd);
-  const standaloneSchemaTables = [
+  const storageScopedTables = [
     'search_items',
     'favorites',
     'recent_items',
@@ -1320,14 +1482,17 @@ function testStaticContracts() {
     'reader_bookmarks',
     'reader_progress',
     'txt_index_files',
-    'txt_index_chunks'
+    'txt_index_chunks',
+    'user_permissions',
+    'file_tasks',
+    'file_task_items'
   ];
-  assert.ok(schemaStart >= 0 && schemaEnd > schemaStart, 'the standalone Worker must expose runtime D1 initialization');
-  for (const table of standaloneSchemaTables) {
-    assert.match(schemaSource, new RegExp('CREATE TABLE IF NOT EXISTS\\s+' + table + '\\b'), `runtime D1 initialization must create ${table}`);
+  assert.ok(schemaStart >= 0 && schemaEnd > schemaStart, 'the Worker bundle must include runtime multi-storage D1 initialization');
+  for (const table of storageScopedTables) {
+    assert.match(schemaSource, new RegExp('CREATE TABLE ' + table + '\\b'), `runtime D1 initialization must create ${table}`);
   }
-  assert.match(workerSource, /const USER_PERMISSIONS_DDL = \[/, 'the standalone Worker must bundle user permission schema');
-  assert.match(workerSource, /const FILE_TASKS_DDL = \[/, 'the standalone Worker must bundle file task schema');
+  assert.match(workerSource, /CREATE TABLE IF NOT EXISTS storage_connections/, 'runtime schema must include encrypted storage connections');
+  assert.match(workerSource, /CREATE TABLE IF NOT EXISTS storage_sync_jobs/, 'runtime schema must include resumable storage sync jobs');
 
   const txtBranchStart = workerSource.indexOf("if (ext === 'txt')");
   const txtBranchEnd = workerSource.indexOf('await renderTxtReader(content, path, options && options.txtJump);', txtBranchStart)
@@ -1366,7 +1531,8 @@ function testStaticContracts() {
   assert.match(workerSource, /\.preview-actions\s*>\s*\.btn\s*\{\s*display:\s*none;/, 'mobile styles must hide only direct desktop actions');
   assert.doesNotMatch(workerSource, /\.preview-actions\s+\.btn\s*\{\s*display:\s*none;/, 'mobile styles must not hide search and bookmark panel buttons');
   assert.doesNotMatch(workerSource, /id="globalTxtSearchToggle"/, 'the main search toolbar must not expose the obsolete TXT full-text toggle');
-  assert.match(workerSource, /\.view-toolbar\s*\{[^}]*align-items:\s*flex-start;[^}]*flex-wrap:\s*nowrap;/s, 'desktop view tabs and search tools must share one top-aligned row');
+  assert.match(workerSource, /\.view-toolbar\s*\{[^}]*align-items:\s*flex-start;[^}]*flex-wrap:\s*wrap;/s, 'desktop view controls and search tools must wrap instead of stretching past the viewport');
+  assert.match(workerSource, /\.view-controls\s*\{[^}]*display:\s*flex;[^}]*gap:\s*8px;/s, 'view tabs and list-grid controls must share a compact control group');
   assert.match(workerSource, /\.search-tools \.form-input\s*\{[^}]*height:\s*36px;/s, 'desktop search controls must match the view-tab control height');
   assert.match(workerSource, /\.search-tools \.tag-filter\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*flex-start;/s, 'the tag-filter wrapper must not baseline-shift its trigger below adjacent controls');
   assert.match(workerSource, /\.tag-filter-trigger\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*center;[^}]*vertical-align:\s*top;/s, 'the tag-filter trigger must fill and top-align within its toolbar slot');
@@ -1376,8 +1542,14 @@ function testStaticContracts() {
   assert.match(workerSource, /indexedDB\.open\(TXT_CACHE_DB_NAME/, 'TXT content must use a persistent device-local IndexedDB cache');
   assert.match(workerSource, /READER_PROGRESS_CONFLICT/, 'global reading progress must reject stale device revisions');
   assert.match(workerSource, /baseRevision/, 'reader saves must carry the last synchronized global revision');
-  assert.match(workerSource, /windowSource = 'd1'/, 'ready TXT indexes must serve nearby text from D1 before R2');
-
+  assert.match(workerSource, /const DISPLAY_MODE_STORAGE_KEY = 'edgestash:file-display-mode:v1'/, 'file display mode must have a persisted storage key');
+  assert.match(workerSource, /let displayMode = localStorage\.getItem\(DISPLAY_MODE_STORAGE_KEY\) === 'grid' \? 'grid' : 'list'/, 'list mode must be the default display');
+  assert.match(workerSource, /data-display-mode="list"/, 'the UI must expose list mode');
+  assert.match(workerSource, /function createFileRow\(item\)/, 'the filesystem-style row renderer must exist');
+  assert.match(workerSource, /file-list-header/, 'list mode must expose column headers');
+  assert.match(workerSource, /正在同步存储结构到 D1/, 'list mode must expose synchronization state');
+  assert.match(workerSource, /\.view-tabs\s*\{[^}]*width:\s*max-content;/s, 'mobile view tabs must stay compact instead of stretching across the viewport');
+  assert.match(workerSource, /\.view-tab\s*\{[^}]*flex:\s*0 0 auto;/s, 'view tabs must preserve intrinsic button widths');
   const readerScrollStart = workerSource.indexOf('function scrollTxtReaderElementIntoView(');
   const readerScrollEnd = workerSource.indexOf('\n    async function scrollReaderToByteOffset', readerScrollStart);
   const readerScrollSource = workerSource.slice(readerScrollStart, readerScrollEnd);
@@ -1391,6 +1563,28 @@ function testStaticContracts() {
   assert.match(workerSource, /row\.setAttribute\('role', 'button'\)/, 'in-reader result rows must expose their click behavior');
 }
 
+async function testZipEntryLimit() {
+  const objects = [];
+  const d1 = new MemoryD1();
+  for (let index = 0; index < 41; index += 1) {
+    const key = 'bulk/file-' + String(index).padStart(2, '0') + '.txt';
+    objects.push({ key, bytes: encoder.encode('content ' + index) });
+  }
+  const env = makeEnv(null, { d1, objects, seedCatalog: true });
+  const cookie = await signAdminCookie(env.ADMIN_PASSWORD);
+  const response = await request('/api/batch/download', env, cookie, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ path: '/bulk' }] })
+  });
+  assert.equal(response.status, 422, 'a batch ZIP over 40 files must be rejected');
+  const body = await response.json();
+  assert.equal(body.code, 'ZIP_ENTRY_LIMIT');
+  assert.equal(env.STORAGE.gets.length, 0, 'the ZIP limit must be enforced without any object GET');
+  assert.equal(env.STORAGE.lists.length, 0, 'the ZIP limit must be enforced without any object LIST');
+}
+
+await testLoginFlows();
 await testTxtRoutes();
 await testTxtSearchPagingAndBoundaries();
 await testTxtIndexedSearchLifecycle();
@@ -1399,5 +1593,6 @@ await testPathBoundPermissionsAndShares();
 await testCachedAdminDirectoryNavigationAvoidsPerItemR2Checks();
 await testVirtualDirectoryIncrementalAndGlobalTxtSearch();
 await testD1ReadModelHotPaths();
+await testZipEntryLimit();
 testStaticContracts();
 console.log('regression: TXT, reader, D1 read model, path-bound permission/share, virtual-directory and global-search contracts passed');

@@ -3,3 +3,13 @@
 
 # Node 依赖
 node_modules/
+
+# Development-only secrets and deployment metadata
+.dev.vars*
+.env*
+.dev-deployment.json
+!.env.example
+wrangler.dev.jsonc
+
+# Wrangler dry-run output
+dist/
