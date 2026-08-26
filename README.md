@@ -249,6 +249,29 @@ https://developers.cloudflare.com/workers/platform/deploy-buttons/
 7. 进入管理后台的“存储”页面，配置自己的 S3/R2/OSS/COS/MinIO 连接。
 
 仓库中的 `.env.example` 只包含变量名和空值，不包含作者的任何 Secret。每个用户都应填写自己的密码、加密密钥和存储凭证。
+### 配置页中的 Build / Deploy command
+
+- **Build command：留空。** 当前项目没有前端构建步骤，页面模板由 Worker 在部署时直接打包。
+- **Deploy command：填写 `npm run deploy`。** `package.json` 已提供该脚本，实际执行 `wrangler deploy --config wrangler.jsonc`。如果 Cloudflare 自动填入 `npx wrangler deploy`，也可以使用，因为它会读取根目录的通用 `wrangler.jsonc`。
+
+### `STORAGE_CONFIG_KEY` 是否需要记住？
+
+它不是登录密码，也不是每天需要输入的验证码；它是存储凭证的**长期加密主密钥**。每次保存 S3 凭证时，系统使用它加密后写入 D1，之后读取凭证时仍必须使用同一个 key 解密。
+
+因此：
+
+- 第一次部署时生成并填写一次即可。
+- 后续重新部署必须继续使用同一个值，不能每次随机生成新值。
+- 不需要每天记住，建议保存在密码管理器或 Cloudflare Secret 中。
+- 如果丢失，旧的 S3 凭证无法解密，需要在管理后台重新输入各存储凭证。
+- 它不能安全地由 Worker 每次启动自动随机生成；那样会导致重启或重新部署后旧凭证全部失效。
+
+可以使用密码管理器生成 32 字节随机值，或者本地执行：
+
+```bash
+openssl rand -base64 32
+```
+
 
 ### 当前边界
 
