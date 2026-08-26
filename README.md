@@ -65,7 +65,8 @@ src/
     └── theme.js              主题初始化和切换
 
 scripts/
-├── provision-dev.mjs         创建/复用隔离的 -dev 资源并写入 wrangler.jsonc
+├── provision-dev.mjs         创建/复用隔离的 -dev 资源并写入 wrangler.dev.jsonc
+
 ├── init-dev-secrets.mjs      首次生成 .dev.vars 中的开发 Secret
 ├── assert-dev-config.mjs     部署前的 dev-only 安全门禁
 ├── deploy-dev.mjs            初始化 Secret、检查配置并部署 edgestash-dev
@@ -99,14 +100,23 @@ test/
 
 ## Cloudflare 资源和绑定
 
-当前 `wrangler.jsonc` 只声明 D1、KV 和 Cron，不声明 R2 binding：
+`wrangler.jsonc` 是面向 Deploy to Cloudflare 的通用配置，只声明 D1、KV 和 Cron，不声明 R2 binding：
 
-| 资源 | 名称 | Binding | 用途 |
+| 资源 | 默认名称/来源 | Binding | 用途 |
 | --- | --- | --- | --- |
-| Worker | `edgestash-dev` | — | 单个 Worker 入口 `src/index.js` |
-| D1 | `edgestash-d1-dev` | `D1_DB` | 目录、搜索、权限、分享、任务和存储元数据 |
-| KV | `edgestash-kv-dev` | `KV_STORE` | 用户账号、管理员 OTP、旧阅读状态迁移 |
-| R2 | `edgestash-storage-dev` | 无 | 可作为 S3 兼容后端，由后台动态连接 |
+| Worker | 部署配置页选择 | — | 单个 Worker 入口 `src/index.js` |
+| D1 | `edgestashpro-db` | `D1_DB` | 目录、搜索、权限、分享、任务和存储元数据 |
+| KV | Cloudflare 自动创建 | `KV_STORE` | 用户账号、管理员 OTP、旧阅读状态迁移 |
+| R2 | 不自动绑定 | 无 | 通过管理后台作为 S3 兼容后端配置 |
+
+作者开发和验收使用单独的资源：
+
+| 资源 | 名称 | Binding |
+| --- | --- | --- |
+| Worker | `edgestash-dev` | — |
+| D1 | `edgestash-d1-dev` | `D1_DB` |
+| KV | `edgestash-kv-dev` | `KV_STORE` |
+| R2 | `edgestash-storage-dev` | 无，作为 S3 后端 |
 
 R2 不再通过 `R2_BUCKET` binding 直接访问。Cloudflare R2、AWS S3、阿里云 OSS、腾讯云 COS、MinIO 等服务都通过 S3 兼容接口配置到后台。
 
@@ -144,7 +154,8 @@ edgestash-kv-dev
 edgestash-storage-dev
 ```
 
-它会把 D1/KV ID 写入 `wrangler.jsonc`，不会删除或复用非 `-dev` 资源。
+它会把 D1/KV ID 写入被忽略的 `wrangler.dev.jsonc`，不会删除或复用非 `-dev` 资源。
+
 
 ## 开发和部署命令
 
@@ -190,7 +201,7 @@ npm run deploy:dev
 
 1. 初始化缺失的 `.dev.vars`
 2. 检查 dev-only 配置
-3. 使用 `wrangler.jsonc` 和 `.dev.vars` 部署 `edgestash-dev`
+3. 使用 `wrangler.dev.jsonc` 和 `.dev.vars` 部署 `edgestash-dev`
 4. 写入被忽略的 `.dev-deployment.json`
 
 部署成功后再运行：
