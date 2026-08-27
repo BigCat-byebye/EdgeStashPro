@@ -10,6 +10,8 @@ node_modules/
 .dev-deployment.json
 !.env.example
 wrangler.dev.jsonc
+.prod.vars*
+wrangler.prod.jsonc
 
 # Wrangler dry-run output
 dist/
