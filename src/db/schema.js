@@ -294,6 +294,12 @@ export async function ensureD1Schema(env) {
   await db.prepare('CREATE TABLE IF NOT EXISTS schema_migrations (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)').run();
   const applied = await db.prepare('SELECT id FROM schema_migrations WHERE id = ?').bind(MULTI_STORAGE_MIGRATION).first();
   if (applied) {
+    // Repair databases that recorded the migration markers before the
+    // storage tables existed (fresh installs before this fix).
+    await db.batch([
+      ...STORAGE_TABLES.map(createSql => db.prepare(createSql)),
+      ...INDEXES.map(indexSql => db.prepare(indexSql))
+    ]);
     const repaired = await db.prepare('SELECT id FROM schema_migrations WHERE id = ?').bind(FOLDER_OBJECT_REPAIR_MIGRATION).first();
     if (repaired) return false;
     await db.batch([
@@ -320,10 +326,21 @@ export async function ensureD1Schema(env) {
       statements.push(db.prepare(LEGACY_COPY[table]));
       statements.push(db.prepare(`DROP TABLE ${table}_legacy_v6`));
     }
+    for (const createSql of STORAGE_TABLES) {
+      statements.push(db.prepare(createSql));
+    }
   } else {
     for (const [table, createSql] of Object.entries(TABLES)) {
       statements.push(db.prepare(createSql.replace(`CREATE TABLE ${table}`, `CREATE TABLE IF NOT EXISTS ${table}`)));
     }
+  }
+
+  for (const createSql of STORAGE_TABLES) {
+    statements.push(db.prepare(createSql));
+  }
+
+  for (const indexSql of INDEXES) {
+    statements.push(db.prepare(indexSql));
   }
   statements.push(db.prepare(`
     UPDATE search_items
