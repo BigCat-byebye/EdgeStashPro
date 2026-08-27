@@ -1961,7 +1961,10 @@ async function findAvailableDestinationKey(env, desiredKey, isFolder) {
   const parent = slashIndex >= 0 ? desiredKey.slice(0, slashIndex + 1) : '';
   const name = slashIndex >= 0 ? desiredKey.slice(slashIndex + 1) : desiredKey;
 
-  for (let index = 1; index <= 999; index++) {
+  // Each probe is a Class B HEAD + a Class A LIST against the storage
+  // backend; cap retries so pathological name collisions cannot fan out
+  // into thousands of billed operations.
+  for (let index = 1; index <= 10; index++) {
     const candidate = parent + copyNameCandidate(name, index);
     if (!(await destinationExists(env, candidate, isFolder))) {
       return candidate;
@@ -1981,8 +1984,7 @@ async function findAvailableDestinationKeyReserved(env, desiredKey, isFolder, re
   const slashIndex = desiredKey.lastIndexOf('/');
   const parent = slashIndex >= 0 ? desiredKey.slice(0, slashIndex + 1) : '';
   const name = slashIndex >= 0 ? desiredKey.slice(slashIndex + 1) : desiredKey;
-
-  for (let index = 1; index <= 999; index++) {
+  for (let index = 1; index <= 10; index++) {
     const candidate = parent + copyNameCandidate(name, index);
     if (!reserved.has(candidate) && !(await destinationExists(env, candidate, isFolder))) {
       reserved.add(candidate);
@@ -4405,18 +4407,10 @@ async function recordShareMetric(env, shareId, metric) {
     const shareUpdate = isDownload
       ? env.D1_DB.prepare('UPDATE share_links SET download_count = download_count + 1 WHERE share_id = ? AND storage_id = ?').bind(shareId, env.STORAGE_ID)
       : env.D1_DB.prepare('UPDATE share_links SET view_count = view_count + 1 WHERE share_id = ? AND storage_id = ?').bind(shareId, env.STORAGE_ID);
-    await env.D1_DB.batch([
-      shareUpdate,
-      env.D1_DB.prepare(`
-        INSERT OR IGNORE INTO app_stats (storage_id, key, value, updated_at)
-        VALUES (?, ?, ?, ?)
-      `).bind(env.STORAGE_ID, statKey, 0, now),
-      env.D1_DB.prepare(`
-        UPDATE app_stats
-        SET value = value + 1, updated_at = ?
-        WHERE storage_id = ? AND key = ?
-      `).bind(now, env.STORAGE_ID, statKey)
-    ]);
+    // Single UPDATE: app_stats totals are derived on demand by
+    // reconcileD1StatsMinimums, so per-event aggregate writes are wasted D1
+    // rows. One row written per share view/download instead of three.
+    await shareUpdate.run();
   } catch (error) {
     console.warn('Share metric update failed:', error.message);
   }
@@ -5203,6 +5197,7 @@ function summarizePermissionFlags(row) {
 }
 
 async function replaceUserPermissions(env, email, permissions) {
+  permissionRowsCache.delete(permissionCacheKey(env, email));
   const normalized = Array.isArray(permissions) ? permissions.map(normalizeUserPermissionEntry) : [];
   const bound = [];
   for (const item of normalized) {
@@ -5263,7 +5258,20 @@ async function replaceUserPermissions(env, email, permissions) {
   }
 }
 
+// Permission grants change rarely but are consulted on every user request.
+// Cache per isolate keyed by email+storage; the TTL bounds staleness and
+// replaceUserPermissions drops the entry on writes.
+const permissionRowsCache = new Map();
+const PERMISSION_CACHE_TTL_MS = 60_000;
+
+function permissionCacheKey(env, email) {
+  return `${env.STORAGE_ID}:${email}`;
+}
+
 async function getUserPermissionRows(env, email) {
+  const cacheKey = permissionCacheKey(env, email);
+  const cached = permissionRowsCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < PERMISSION_CACHE_TTL_MS) return cached.rows;
   const result = await env.D1_DB.prepare(`
     SELECT * FROM user_permissions
     WHERE email = ? AND storage_id = ?
@@ -5282,6 +5290,7 @@ async function getUserPermissionRows(env, email) {
     if (!current || binding === false) continue;
     valid.push(row);
   }
+  permissionRowsCache.set(cacheKey, { rows: valid, at: Date.now() });
   return valid;
 }
 
@@ -5486,7 +5495,25 @@ function normalizeTags(input) {
   return tags.sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
 }
 
+const TAG_CACHE_TTL_SECONDS = 60;
+
+function tagCacheKey(storageId, ownerKey) {
+  return `tags:${storageId}:${ownerKey}`;
+}
+
 async function listTagOptionsForAuth(env, auth) {
+  // Tag aggregation reads every tagged catalog row; D1 bills per row read.
+  // Cache per user+storage in KV for a minute and invalidate on tag writes.
+  const ownerKey = ownerKeyFromAuth(auth);
+  const cacheKey = tagCacheKey(env.STORAGE_ID, ownerKey);
+  if (env.KV_STORE) {
+    try {
+      const cached = await env.KV_STORE.get(cacheKey, 'json');
+      if (Array.isArray(cached)) return cached;
+    } catch {
+      // Cache failures must not break the listing path.
+    }
+  }
   const rows = await env.D1_DB.prepare(`
     SELECT path, item_type, tags FROM search_items
     WHERE storage_id = ? AND tags IS NOT NULL AND tags != '[]'
@@ -5514,9 +5541,17 @@ async function listTagOptionsForAuth(env, auth) {
       counts.set(tag, (counts.get(tag) || 0) + 1);
     }
   }
-  return Array.from(counts.entries())
+  const options = Array.from(counts.entries())
     .map(([tag, count]) => ({ tag, count }))
     .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag, 'zh-Hans-CN'));
+  if (env.KV_STORE && options.length > 0) {
+    try {
+      await env.KV_STORE.put(cacheKey, JSON.stringify(options), { expirationTtl: TAG_CACHE_TTL_SECONDS });
+    } catch {
+      // Cache write failures are non-fatal.
+    }
+  }
+  return options;
 }
 
 async function handleListTags(request, env) {
@@ -5568,6 +5603,10 @@ async function handleUpdateTags(request, env) {
       JSON.stringify(tags),
       existing?.indexed_at || now
     ).run();
+    // Invalidate cached tag options so the next listing reflects this write.
+    if (env.KV_STORE) {
+      try { await env.KV_STORE.delete(tagCacheKey(env.STORAGE_ID, ownerKeyFromAuth(auth))); } catch {}
+    }
     return jsonResponse({ success: true, storageId: env.STORAGE_ID, path, tags });
   } catch (e) {
     return jsonResponse({ success: false, message: '保存标签失败: ' + e.message }, 500);
@@ -5631,6 +5670,9 @@ async function invalidatePathReferences(env, rawPath) {
   if (!normalized || normalized === '/') return;
   await cleanupD1ItemPath(env, normalized);
   await deleteReaderProgressForPath(env, normalized);
+  // Permissions were just deleted below; drop any cached grant rows so the
+  // next request re-reads authoritative state instead of the stale cache.
+  permissionRowsCache.clear();
   if (!env.D1_DB) return;
 
   try {
@@ -5996,19 +6038,18 @@ async function handleFavorites(request, env) {
 }
 
 async function pruneRecentItems(env, ownerKey, keepCount = 100) {
-  const oldRows = await env.D1_DB.prepare(`
-    SELECT path FROM recent_items
-    WHERE owner_key = ? AND storage_id = ?
-    ORDER BY visited_at DESC
-    LIMIT 1000 OFFSET ?
-  `).bind(ownerKey, env.STORAGE_ID, keepCount).all();
-
-  const paths = (oldRows.results || []).map(row => row.path);
-  if (paths.length === 0) return;
-  const statement = env.D1_DB.prepare('DELETE FROM recent_items WHERE owner_key = ? AND storage_id = ? AND path = ?');
-  for (let index = 0; index < paths.length; index += 50) {
-    await env.D1_DB.batch(paths.slice(index, index + 50).map(path => statement.bind(ownerKey, env.STORAGE_ID, path)));
-  }
+  // Single-statement prune: D1 bills per row scanned and per row written,
+  // so the previous read-up-to-1000-then-delete-in-batches approach cost
+  // ~1 write per browse. A subquery delete touches only the cutoff row.
+  await env.D1_DB.prepare(`
+    DELETE FROM recent_items
+    WHERE owner_key = ? AND storage_id = ? AND visited_at < (
+      SELECT visited_at FROM recent_items
+      WHERE owner_key = ? AND storage_id = ?
+      ORDER BY visited_at DESC
+      LIMIT 1 OFFSET ?
+    )
+  `).bind(ownerKey, env.STORAGE_ID, ownerKey, env.STORAGE_ID, keepCount).run();
 }
 
 async function saveRecentItem(env, auth, item) {
@@ -6024,7 +6065,9 @@ async function saveRecentItem(env, auth, item) {
       preview_type = excluded.preview_type,
       visited_at = excluded.visited_at
   `).bind(ownerKey, env.STORAGE_ID, item.path, item.name, item.itemType, item.sizeFormatted, item.previewType, now).run();
-  await pruneRecentItems(env, ownerKey, 100);
+  // Prune only on ~2% of writes: rows beyond the cap are harmless and a
+  // full prune per visit multiplied D1 write volume by the visit count.
+  if (Math.random() < 0.02) await pruneRecentItems(env, ownerKey, 100);
   return now;
 }
 

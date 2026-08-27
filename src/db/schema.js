@@ -288,12 +288,18 @@ async function tableColumns(db, table) {
   }
 }
 
+// D1 bills every statement, including idempotent DDL. Cache successful
+// initialization per isolate so repeated API requests skip the ~24
+// CREATE TABLE/INDEX statements entirely.
+const schemaInitializedDatabases = new WeakSet();
+
 export async function ensureD1Schema(env) {
   if (!env.D1_DB) throw new Error('D1_DB binding 未配置');
   const db = env.D1_DB;
   await db.prepare('CREATE TABLE IF NOT EXISTS schema_migrations (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)').run();
   const applied = await db.prepare('SELECT id FROM schema_migrations WHERE id = ?').bind(MULTI_STORAGE_MIGRATION).first();
   if (applied) {
+    if (schemaInitializedDatabases.has(db)) return false;
     // Repair databases that recorded the migration markers before the
     // storage tables existed (fresh installs before this fix).
     await db.batch([
@@ -301,6 +307,7 @@ export async function ensureD1Schema(env) {
       ...INDEXES.map(indexSql => db.prepare(indexSql))
     ]);
     const repaired = await db.prepare('SELECT id FROM schema_migrations WHERE id = ?').bind(FOLDER_OBJECT_REPAIR_MIGRATION).first();
+    schemaInitializedDatabases.add(db);
     if (repaired) return false;
     await db.batch([
       db.prepare(`
@@ -367,6 +374,7 @@ export async function ensureD1Schema(env) {
   statements.push(db.prepare('INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)').bind(FOLDER_OBJECT_REPAIR_MIGRATION, Date.now()));
   await db.batch(statements);
 
+  schemaInitializedDatabases.add(db);
   if (env.KV_STORE) {
     await Promise.allSettled([
       env.KV_STORE.delete('d1:schema:v6-bookmark-anchor'),

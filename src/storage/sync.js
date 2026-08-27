@@ -168,12 +168,28 @@ export async function processNextStorageSyncPage(env) {
     });
     const rows = buildCatalogRowsFromObjects(job.storage_id, page.objects, job.scan_id, now);
     const existing = await loadExistingRows(env, job.storage_id, rows.map(row => row.path));
+    // Only write rows whose identity or content actually changed: the
+    // previous unconditional upsert rewrote the whole catalog on every scan
+    // and D1 bills each ON CONFLICT DO UPDATE as a row write.
+    const changedRows = [];
     for (const row of rows) {
-      if (identityChanged(existing.get(row.path), row)) {
-        await invalidateStoragePathReferences(env, job.storage_id, row.path);
+      const previous = existing.get(row.path);
+      if (!previous) {
+        changedRows.push(row);
+        continue;
       }
+      if (identityChanged(previous, row)) {
+        await invalidateStoragePathReferences(env, job.storage_id, row.path);
+        changedRows.push(row);
+        continue;
+      }
+      // Unchanged identity: refresh only the cheap bookkeeping columns so
+      // sweep pruning still sees a fresh last_seen_scan_id.
+      await env.D1_DB.prepare(
+        'UPDATE search_items SET last_seen_scan_id = ?, updated_at = ? WHERE storage_id = ? AND path = ?'
+      ).bind(row.last_seen_scan_id || null, now, job.storage_id, row.path).run();
     }
-    await upsertCatalogRows(env, rows);
+    if (changedRows.length > 0) await upsertCatalogRows(env, changedRows);
 
     const done = !page.truncated || !page.cursor;
     if (done) await sweepMissingRows(env, job);

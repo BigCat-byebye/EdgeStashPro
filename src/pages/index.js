@@ -1204,7 +1204,11 @@ const FIXED_INDEX_PAGE = `
     }
 
     function handleSearchInput() {
-      scheduleGlobalSearch(250);
+      // Each keystroke triggers a server-side catalog scan; D1 bills scanned
+      // rows. Longer debounce plus a 2-char minimum keeps cost bounded.
+      const query = document.getElementById('globalSearchInput').value.trim();
+      if (query.length === 1) return;
+      scheduleGlobalSearch(400);
     }
 
     function handleSearchTypeChange() {
